@@ -3290,6 +3290,7 @@ def clm_offload_train_one_batch(
             model_path=getattr(args, "model_path", ""),
             batch_size=bsz,
             paper_stage_metrics=_paper_stage_metrics,
+            double_buffer=_double_buffer_gpu,
             log_file=log_file,
         )
     if _perf_log:
