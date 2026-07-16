@@ -45,8 +45,9 @@ def validate_tide_runtime_args(args: Any) -> None:
     _require_lower(args, "ssd_execution_mode", "paper")
     _require_lower(args, "paper_block_reader_backend", "tiered_cache")
     _require_lower(args, "paper_optimizer_backend", "gpu_resident")
-    _require_lower(args, "paper_optimizer_state_mode", "resident_blocks")
+    _require_lower(args, "paper_optimizer_state_mode", "none")
     _require_lower(args, "paper_optimizer_deferred_mode", "off")
+    _require_attr(args, "sparse_adam", False)
     _require_attr(args, "paper_free_unified_params", True)
     _require_attr(args, "disable_auto_densification", True)
 
@@ -508,13 +509,12 @@ def initialize_paper_mode_runtime_state(
         raise RuntimeError("Paper SSD release path requires --paper_optimizer_deferred_mode off.")
 
     paper_optimizer_state_mode = str(
-        getattr(args, "paper_optimizer_state_mode", "resident_blocks")
+        getattr(args, "paper_optimizer_state_mode", "none")
     ).lower()
-    if paper_optimizer_state_mode != "resident_blocks":
-        raise RuntimeError("Paper SSD release path requires --paper_optimizer_state_mode resident_blocks.")
+    if paper_optimizer_state_mode != "none":
+        raise RuntimeError("Paper SSD release path requires --paper_optimizer_state_mode none.")
 
     gaussians._paper_optimizer_state_mode = paper_optimizer_state_mode
-    gaussians._paper_optimizer_block_size = int(getattr(args, "gaussian_block_size", 4096))
     gaussians._paper_optimizer_backend = paper_optimizer_backend
     if not hasattr(gaussians, "_paper_pending_writeback"):
         gaussians._paper_pending_writeback = None
@@ -543,6 +543,10 @@ def initialize_paper_mode_runtime_state(
         )
         write_paper_phase1_log(
             f"[PAPER MODE] paper_optimizer_state_mode={paper_optimizer_state_mode}\n",
+            log_file=log_file,
+        )
+        write_paper_phase1_log(
+            "[PAPER OPTIMIZER] update_rule=normalized_sgd persistent_state_bytes=0\n",
             log_file=log_file,
         )
 
@@ -1540,66 +1544,28 @@ def load_paper_stage1_working_set(
     return gpu_tensors, retention_stats, used_prefetch_buffer, load_source
 
 
-def configure_gpu_resident_optimizer_state(
-    *,
-    gaussians,
-    args,
-    actual_current_resident_blocks: List[int],
-    iteration: int,
-    get_gpu_resident_optimizer_fn: Callable,
-    log_file=None,
-) -> None:
-    if getattr(gaussians, "_paper_optimizer_state_mode", "full_cpu") != "resident_blocks":
-        return
-    if args.stop_update_param:
-        return
-
-    resident_state_optimizer = get_gpu_resident_optimizer_fn(gaussians, args.bsz)
-    resident_state_optimizer.set_resident_blocks(actual_current_resident_blocks)
-    if iteration == 1:
-        write_paper_phase1_log(
-            "[PAPER OPTIMIZER STATE] gpu_resident backend enabled: optimizer moments "
-            "exist only for resident blocks on GPU and cold-restart on block re-admission.\n",
-            log_file=log_file,
-        )
-
-
-def run_gpu_resident_adam_step(
+def run_gpu_stateless_optimizer_step(
     *,
     gaussians,
     args,
     iteration: int,
-    total_n_gaussians: int,
-    sparse_visibility_indices,
     sparse_grad_local_ids,
     sparse_grad_components,
-    get_gpu_resident_optimizer_fn: Callable,
-    ensure_local_to_global_mapping_fn: Callable,
+    get_gpu_stateless_optimizer_fn: Callable,
     log_prefix: str = "[PAPER SSD MODE]",
     log_file=None,
 ) -> Dict[str, Any]:
     write_paper_phase1_log(
-        f"{log_prefix} Using GPU resident Adam for optimization\n",
+        f"{log_prefix} Using GPU stateless normalized SGD for optimization\n",
         log_file=log_file,
     )
     if args.stop_update_param:
         return {}
 
-    torch.cuda.nvtx.range_push("Paper SSD: GPU Resident Adam")
+    torch.cuda.nvtx.range_push("Paper SSD: GPU Stateless Normalized SGD")
     try:
-        gpu_resident_optimizer = get_gpu_resident_optimizer_fn(gaussians, args.bsz)
-        optimizer_updated_global_indices = sparse_visibility_indices
-        if optimizer_updated_global_indices is None and sparse_grad_local_ids is not None:
-            local_to_global = ensure_local_to_global_mapping_fn(
-                gaussians,
-                total_n_gaussians,
-                log_file=log_file,
-                context=f"gpu_resident_optimizer_iter_{iteration}",
-            )
-            optimizer_updated_global_indices = local_to_global[sparse_grad_local_ids].cpu()
-        _ = optimizer_updated_global_indices
-
-        step_stats = gpu_resident_optimizer.step(
+        gpu_optimizer = get_gpu_stateless_optimizer_fn(gaussians, args.bsz)
+        step_stats = gpu_optimizer.step(
             iteration=iteration,
             gaussians=gaussians,
             sparse_grad_local_ids=sparse_grad_local_ids,
@@ -1607,9 +1573,8 @@ def run_gpu_resident_adam_step(
         )
         gaussians._paper_last_gpu_optimizer_step = dict(step_stats)
         write_paper_phase1_log(
-            f"{log_prefix} GPU resident Adam updated {step_stats['touched_rows']} rows "
-            f"across {step_stats['updated_blocks']} resident blocks "
-            f"(cold_rows={step_stats['cold_rows']})\n",
+            f"{log_prefix} GPU stateless normalized SGD updated "
+            f"{step_stats['touched_rows']} rows (state_bytes=0)\n",
             log_file=log_file,
         )
         return dict(step_stats)

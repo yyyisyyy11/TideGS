@@ -87,13 +87,8 @@ class SelectiveAdam(torch.optim.Adam):
             )
 
 
-class ResidentAdamContext:
-    """Metadata context for the paper-mode resident-block Adam updater.
-
-    This class intentionally does not perform Adam updates or own optimizer
-    moments. The real update path is GPUResidentAdam; it reads this context for
-    parameter groups, Adam hyperparameters, and per-column learning rates.
-    """
+class SSDOptimizerContext:
+    """Metadata context for the Paper SSD stateless GPU optimizer."""
 
     def __init__(
         self,
@@ -101,43 +96,31 @@ class ResidentAdamContext:
         columns_sizes,
         columns_lr,
         lr=1e-3,
-        bias_correction=True,
-        betas=(0.9, 0.999),
         eps=1e-15,
         weight_decay=0,
-        amsgrad=False,
-        adamw_mode=False,
-        fp32_optimizer_states=True,
-        fused=False,
-        sparse=False,
     ):
         if len(params) != 1 or params[0].get("name") != "unified_params":
             raise RuntimeError(
-                "ResidentAdamContext expects the single unified_params metadata group "
+                "SSDOptimizerContext expects the single unified_params metadata group "
                 "used by the Pure SSD/Tide release path."
             )
 
         group = dict(params[0])
         param_list = list(group.get("params", []))
         if len(param_list) != 1:
-            raise RuntimeError("ResidentAdamContext expects one metadata tensor.")
+            raise RuntimeError("SSDOptimizerContext expects one metadata tensor.")
 
         metadata_tensor = param_list[0]
         if metadata_tensor.is_cuda:
             raise AssertionError(
-                "ResidentAdamContext metadata tensor must stay on CPU; resident "
-                "blocks are materialized separately for GPUResidentAdam."
+                "SSDOptimizerContext metadata tensor must stay on CPU; working-set "
+                "blocks are materialized separately for the GPU optimizer."
             )
 
         group["params"] = param_list
         group.setdefault("lr", lr)
-        group.setdefault("bias_correction", bias_correction)
-        group.setdefault("betas", betas)
         group.setdefault("eps", eps)
         group.setdefault("weight_decay", weight_decay)
-        group.setdefault("amsgrad", amsgrad)
-        group.setdefault("adamw_mode", adamw_mode)
-        group.setdefault("fp32_optimizer_states", fp32_optimizer_states)
 
         self.param_groups = [group]
         self.state = {}
@@ -148,10 +131,6 @@ class ResidentAdamContext:
             else columns_lr
         )
         self.is_ssd_offload_mode = True
-        self.cpu_adam = None
-        self.gpu_adam = None
-        self.fused = fused
-        self.sparse = sparse
 
     def get_all_states(self):
         return []

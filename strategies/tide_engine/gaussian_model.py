@@ -9,7 +9,7 @@ from simple_knn._C import distCUDA2
 from plyfile import PlyData, PlyElement
 from utils.graphics_utils import BasicPointCloud
 import utils.general_utils as utils
-from optimizer import ResidentAdamContext
+from optimizer import SSDOptimizerContext
 import numba.cuda
 
 from strategies.base_gaussian_model import BaseGaussianModel
@@ -835,20 +835,13 @@ class TideGaussianModel(BaseGaussianModel):
             log_file.write("✅ [LEGACY SPLIT-FEATURE] 4 params on CUDA, 1 param on CPU (pinned)\n")
         log_file.write(f"{'='*60}\n\n")
         
-        self.optimizer = ResidentAdamContext(
+        self.optimizer = SSDOptimizerContext(
             l,
             column_sizes,
             column_lrs,
             lr=0.0,
-            bias_correction=True,  # This True is required.
-            betas=(0.9, 0.999),
             eps=1e-15,
             weight_decay=0,
-            amsgrad=False,
-            adamw_mode=False,
-            fp32_optimizer_states=True,
-            fused=True,
-            sparse=self.args.sparse_adam,
         )
 
         # Scale learning rates according to bsz.
@@ -859,16 +852,9 @@ class TideGaussianModel(BaseGaussianModel):
                 param_group["lr"] *= lr_scale
             elif training_args.lr_scale_mode == "sqrt":
                 lr_scale = np.sqrt(bsz)
-                param_group["lr"] *= lr_scale # TODO: 这里的param_group["lr"] 用到了吗？ 不是用的是 columns_lr 吗？
-                if "eps" in param_group:  # Adam
+                param_group["lr"] *= lr_scale
+                if "eps" in param_group:
                     param_group["eps"] /= lr_scale
-                    param_group["betas"] = [beta**bsz for beta in param_group["betas"]]
-                    log_file.write(
-                        param_group["name"]
-                        + " betas: "
-                        + str(param_group["betas"])
-                        + "\n"
-                    )
             elif training_args.lr_scale_mode == "accumu":
                 lr_scale = 1
             else:
@@ -876,8 +862,7 @@ class TideGaussianModel(BaseGaussianModel):
                     False
                 ), f"lr_scale_mode {training_args.lr_scale_mode} not supported."
 
-        # Scale the per-column learning rates consumed by GPUResidentAdam.
-        # Scale column-wise learning rates when the optimizer exposes them.
+        # Scale the per-column learning rates consumed by the stateless optimizer.
         if hasattr(self.optimizer, 'columns_lr') and self.optimizer.columns_lr is not None:
             if training_args.lr_scale_mode == "linear":
                 lr_scale_cols = bsz
@@ -929,13 +914,6 @@ class TideGaussianModel(BaseGaussianModel):
                         cols_lr[0] = lr
                     elif isinstance(cols_lr, list):
                         cols_lr[0] = lr
-                    # Also update the underlying cpu_adam's columns_lr if it exists
-                    if hasattr(self.optimizer, 'cpu_adam') and self.optimizer.cpu_adam is not None:
-                        cpu_cols_lr = self.optimizer.cpu_adam.columns_lr
-                        if isinstance(cpu_cols_lr, torch.Tensor):
-                            cpu_cols_lr[0] = lr
-                        elif isinstance(cpu_cols_lr, list):
-                            cpu_cols_lr[0] = lr
                 return lr
         
         return lr  # fallback (should not reach here)

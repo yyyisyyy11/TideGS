@@ -113,8 +113,8 @@ def _validate_pure_ssd_runtime(args, gaussians, storage_adapter, resolved_backen
         raise RuntimeError("[PURE SSD CHECK] _paper_unified_params_freed marker is missing")
     if getattr(args, "paper_optimizer_backend", "cpu") != "gpu_resident":
         raise RuntimeError("[PURE SSD CHECK] optimizer backend must be gpu_resident")
-    if getattr(args, "paper_optimizer_state_mode", "full_cpu") != "resident_blocks":
-        raise RuntimeError("[PURE SSD CHECK] optimizer state mode must be resident_blocks")
+    if getattr(args, "paper_optimizer_state_mode", "full_cpu") != "none":
+        raise RuntimeError("[PURE SSD CHECK] optimizer state mode must be none")
 
     total_gaussians = getattr(gaussians, "_paper_unified_params_num_total", None)
     total_desc = f"{int(total_gaussians):,}" if total_gaussians is not None else "unknown"
@@ -129,8 +129,8 @@ def _validate_pure_ssd_runtime(args, gaussians, storage_adapter, resolved_backen
     message = (
         "[PURE SSD CHECK] Runtime path verified: "
         f"gaussians={total_desc} blocks={num_blocks} "
-        f"block_reader=TieredCacheBlockReader optimizer=GPUResidentAdam "
-        f"state=resident_blocks init={init_state} ram_cache_limit={cache_limit_gb:.2f}GB\n"
+        f"block_reader=TieredCacheBlockReader optimizer=GPUStatelessNormalizedSGD "
+        f"state=none init={init_state} ram_cache_limit={cache_limit_gb:.2f}GB\n"
     )
     log_file.write(message)
     utils.print_rank_0(message.strip())
@@ -281,7 +281,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         _validate_pure_ssd_runtime(args, gaussians, storage_adapter, resolved_backend, log_file)
 
         if pure_ssd_resume_manifest is not None:
-            msg = "[PURE SSD RESUME] GPUResidentAdam cold-started; Adam moments are not restored"
+            msg = "[PURE SSD RESUME] Stateless optimizer resumed; no optimizer state is required"
             utils.print_rank_0(msg)
             log_file.write(msg + "\n")
 
@@ -327,77 +327,10 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     ema_loss_for_log = 0
     last_iteration = None
 
-    optimizer_churn_tsv = None
-    optimizer_churn_state = {
-        'current_epoch': None,
-        'last_optimizer_rows_total': 0,
-        'last_cold_rows_total': 0,
-        'last_cold_restarts_total': 0,
-        'last_state_evictions_total': 0,
-    }
-
-    def _snapshot_optimizer_churn_counters():
-        gpu_resident_optimizer = getattr(gaussians, '_paper_gpu_resident_optimizer', None)
-        if gpu_resident_optimizer is None:
-            return None
-        stats = gpu_resident_optimizer.get_stats()
-        if stats.get('state_mode', 'full_cpu') != 'resident_blocks':
-            return None
-        return {
-            'optimizer_rows_touched_total': int(stats.get('optimizer_rows_touched_total', 0)),
-            'cold_restarted_rows_touched_total': int(stats.get('cold_restarted_rows_touched_total', 0)),
-            'cold_restarts_total': int(stats.get('cold_restarts', 0)),
-            'state_evictions_total': int(stats.get('state_evictions', 0)),
-            'mean_resident_streak': float(stats.get('mean_resident_streak', 0.0)),
-        }
-
-    def _write_optimizer_churn_epoch(epoch_zero_based: int, iteration_end: int):
-        if optimizer_churn_tsv is None:
-            return
-        stats = _snapshot_optimizer_churn_counters()
-        if stats is None:
-            return
-
-        epoch_optimizer_rows = max(0, stats['optimizer_rows_touched_total'] - optimizer_churn_state['last_optimizer_rows_total'])
-        epoch_cold_rows = max(0, stats['cold_restarted_rows_touched_total'] - optimizer_churn_state['last_cold_rows_total'])
-        epoch_cold_restarts = max(0, stats['cold_restarts_total'] - optimizer_churn_state['last_cold_restarts_total'])
-        epoch_state_evictions = max(0, stats['state_evictions_total'] - optimizer_churn_state['last_state_evictions_total'])
-        epoch_cold_ratio_pct = 100.0 * epoch_cold_rows / max(1, epoch_optimizer_rows)
-
-        optimizer_churn_tsv.write(
-            f"{epoch_zero_based + 1}\t{iteration_end}\t{epoch_optimizer_rows}\t{epoch_cold_rows}\t"
-            f"{epoch_cold_ratio_pct:.6f}\t{epoch_cold_restarts}\t{epoch_state_evictions}\t"
-            f"{stats['mean_resident_streak']:.6f}\n"
-        )
-        log_file.write(
-            f"[OPTIMIZER CHURN] Epoch {epoch_zero_based + 1}: rows={epoch_optimizer_rows}, "
-            f"cold_rows={epoch_cold_rows}, cold_ratio={epoch_cold_ratio_pct:.4f}%, "
-            f"cold_restarts={epoch_cold_restarts}, state_evictions={epoch_state_evictions}, "
-            f"mean_streak={stats['mean_resident_streak']:.4f}\n"
-        )
-
-        optimizer_churn_state['last_optimizer_rows_total'] = stats['optimizer_rows_touched_total']
-        optimizer_churn_state['last_cold_rows_total'] = stats['cold_restarted_rows_touched_total']
-        optimizer_churn_state['last_cold_restarts_total'] = stats['cold_restarts_total']
-        optimizer_churn_state['last_state_evictions_total'] = stats['state_evictions_total']
-
-    def _enable_optimizer_churn_logging(reason: str):
-        nonlocal optimizer_churn_tsv
-        if optimizer_churn_tsv is not None:
-            return
-        churn_tsv_path = os.path.join(args.model_path, 'optimizer_state_churn_by_epoch.tsv')
-        optimizer_churn_tsv = open(churn_tsv_path, 'w', buffering=1)
-        optimizer_churn_tsv.write(
-            'epoch\titeration_end\toptimizer_rows_updated\tcold_restarted_rows_updated\t'
-            'cold_restarted_row_ratio_pct\tcold_restarts\tstate_evictions\tmean_resident_streak\n'
-        )
-        log_file.write(f"[OPTIMIZER CHURN] Per-epoch churn logging enabled: {churn_tsv_path} ({reason})\n")
-        log_file.flush()
-
-    gaussians._paper_optimizer_state_mode = str(getattr(args, 'paper_optimizer_state_mode', 'resident_blocks')).lower()
-    gaussians._paper_optimizer_block_size = int(getattr(args, 'gaussian_block_size', 4096))
+    gaussians._paper_optimizer_state_mode = str(
+        getattr(args, 'paper_optimizer_state_mode', 'none')
+    ).lower()
     gaussians._paper_optimizer_backend = 'gpu_resident'
-    _enable_optimizer_churn_logging("pure_ssd_gpu_resident")
     # ============================================================================
     # STAGE 2: MAIN TRAINING LOOP
     # ============================================================================
@@ -462,14 +395,6 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         # ------------------------------------------------------------------------
         timers.start("dataloader: load the next image from disk and decode")
 
-        if (
-            optimizer_churn_tsv is None
-            and getattr(args, 'pure_ssd_offload', False)
-            and str(getattr(args, 'paper_optimizer_backend', '')).lower() == 'gpu_resident'
-            and str(getattr(args, 'paper_optimizer_state_mode', '')).lower() == 'resident_blocks'
-        ):
-            _enable_optimizer_churn_logging("pure_ssd_gpu_resident")
-
         schedule_info = get_camera_batch_schedule(
             training_schedule=ssd_training_schedule,
             iteration=iteration,
@@ -481,16 +406,6 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         within_epoch_idx = schedule_info.within_epoch_idx
         n_batches = schedule_info.num_batches
         epoch_camera_offset = schedule_info.epoch_camera_offset
-
-        if optimizer_churn_tsv is not None:
-            if optimizer_churn_state['current_epoch'] is None:
-                optimizer_churn_state['current_epoch'] = epoch
-            elif epoch != optimizer_churn_state['current_epoch']:
-                _write_optimizer_churn_epoch(
-                    epoch_zero_based=optimizer_churn_state['current_epoch'],
-                    iteration_end=max(start_from_this_iteration, iteration - args.bsz),
-                )
-                optimizer_churn_state['current_epoch'] = epoch
 
         batched_cameras = [train_dataset[idx] for idx in batch_indices]
 
@@ -704,14 +619,6 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 
         utils.memory_report("at the end of the iteration")
         log_file.flush()
-
-    if optimizer_churn_tsv is not None and optimizer_churn_state['current_epoch'] is not None:
-        _write_optimizer_churn_epoch(
-            epoch_zero_based=optimizer_churn_state['current_epoch'],
-            iteration_end=last_iteration if last_iteration is not None else opt_args.iterations,
-        )
-        optimizer_churn_tsv.close()
-        optimizer_churn_tsv = None
 
     # ============================================================================
     # STAGE 3: POST-TRAINING CLEANUP AND REPORTING

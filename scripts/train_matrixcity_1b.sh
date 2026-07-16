@@ -243,7 +243,6 @@ append_train_command() {
     printf '  --debug_camera_sample_mode %q \\\n' "${DEBUG_CAMERA_SAMPLE_MODE}"
     printf '  --debug_camera_sample_start %q \\\n' "${DEBUG_CAMERA_SAMPLE_START}"
     printf '  --disable_auto_densification \\\n'
-    printf '  --sparse_adam \\\n'
     printf '  --enable_timer \\\n'
     printf '  --check_gpu_memory \\\n'
     printf '  --check_cpu_memory \\\n'
@@ -265,7 +264,7 @@ append_train_command() {
     printf '  --tide_resident_recency_decay %q \\\n' "${resident_decay}"
     printf '  --tide_balanced_seed_fraction %q \\\n' "${balanced_seed_fraction}"
     printf '  --tide_resident_capacity_blocks %q \\\n' "${capacity}"
-    printf '  --tide_optimizer_state_mode resident_blocks \\\n'
+    printf '  --tide_optimizer_state_mode none \\\n'
     printf '  --projection_max_cameras_per_chunk %q \\\n' "${PROJECTION_CHUNK}"
     printf '  --pure_ssd_checkpoint_mode %q \\\n' "${CHECKPOINT_MODE}"
     if [[ "${DEBUG_LOGGING}" == "1" ]]; then

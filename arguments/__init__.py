@@ -199,7 +199,7 @@ class AuxiliaryParams(ParamGroup):
         self.paper_resident_recency_decay = 0.95  # multiplicative aging factor for resident recency
         self.paper_balanced_seed_fraction = 0.25  # topc_balanced camera-seed capacity fraction
         self.paper_resident_capacity_blocks = 2048  # resident capacity in blocks
-        self.paper_optimizer_state_mode = "full_cpu"  # {full_cpu, resident_blocks}; optimizer-state placement
+        self.paper_optimizer_state_mode = "full_cpu"  # {full_cpu, resident_blocks, none}; optimizer-state placement
         self.paper_optimizer_backend = "cpu"  # {cpu, gpu_resident}; optimizer update backend
         self.paper_block_reader_backend = "auto"  # {auto, unified_params, tiered_cache}; source for per-iteration block reads
         self.paper_free_unified_params = False  # release _unified_params after init to unlock >100GB scenes; requires paper_block_reader_backend != unified_params and paper_optimizer_backend=gpu_resident
@@ -424,10 +424,9 @@ def _apply_pure_ssd_release_defaults(args):
     if str(getattr(args, "paper_optimizer_backend", "cpu")).lower() == "cpu":
         args.paper_optimizer_backend = "gpu_resident"
     if str(getattr(args, "paper_optimizer_state_mode", "full_cpu")).lower() == "full_cpu":
-        args.paper_optimizer_state_mode = "resident_blocks"
+        args.paper_optimizer_state_mode = "none"
     args.paper_free_unified_params = True
     args.disable_auto_densification = True
-    args.sparse_adam = True
 
 
 def _apply_tide_aliases(args):
@@ -520,19 +519,15 @@ def init_args(args):
 
     if hasattr(args, "paper_optimizer_state_mode"):
         args.paper_optimizer_state_mode = str(args.paper_optimizer_state_mode).lower()
-        assert args.paper_optimizer_state_mode in {"full_cpu", "resident_blocks"}, (
+        assert args.paper_optimizer_state_mode in {"full_cpu", "resident_blocks", "none"}, (
             "Invalid paper_optimizer_state_mode="
-            f"{args.paper_optimizer_state_mode!r}; expected one of full_cpu, resident_blocks"
+            f"{args.paper_optimizer_state_mode!r}; expected one of full_cpu, resident_blocks, none"
         )
         if args.paper_optimizer_state_mode == "resident_blocks":
-            assert getattr(args, "sparse_adam", False), (
-                "paper_optimizer_state_mode=resident_blocks currently requires --sparse_adam"
-            )
-            assert getattr(args, "disable_auto_densification", False), (
-                "paper_optimizer_state_mode=resident_blocks currently requires --disable_auto_densification"
-            )
-            assert getattr(args, "paper_optimizer_deferred_mode", "off") == "off", (
-                "paper_optimizer_state_mode=resident_blocks currently requires --paper_optimizer_deferred_mode off"
+            raise AssertionError(
+                "paper_optimizer_state_mode=resident_blocks is unsupported; "
+                "GPUResidentAdam has been replaced by stateless normalized SGD. "
+                "Use --paper_optimizer_state_mode none"
             )
 
     if hasattr(args, "paper_block_reader_backend"):
@@ -571,11 +566,8 @@ def init_args(args):
             f"{args.paper_optimizer_backend!r}; expected one of cpu, gpu_resident"
         )
         if args.paper_optimizer_backend == "gpu_resident":
-            assert getattr(args, "paper_optimizer_state_mode", "full_cpu") == "resident_blocks", (
-                "paper_optimizer_backend=gpu_resident currently requires --paper_optimizer_state_mode resident_blocks"
-            )
-            assert getattr(args, "sparse_adam", False), (
-                "paper_optimizer_backend=gpu_resident currently requires --sparse_adam"
+            assert getattr(args, "paper_optimizer_state_mode", "full_cpu") == "none", (
+                "paper_optimizer_backend=gpu_resident requires --paper_optimizer_state_mode none"
             )
             assert getattr(args, "disable_auto_densification", False), (
                 "paper_optimizer_backend=gpu_resident currently requires --disable_auto_densification"
@@ -661,17 +653,17 @@ def init_args(args):
         assert getattr(args, "paper_optimizer_backend", "cpu") == "gpu_resident", (
             "pure SSD offload requires --paper_optimizer_backend gpu_resident"
         )
-        assert getattr(args, "paper_optimizer_state_mode", "full_cpu") == "resident_blocks", (
-            "pure SSD offload requires --paper_optimizer_state_mode resident_blocks"
+        assert getattr(args, "paper_optimizer_state_mode", "full_cpu") == "none", (
+            "pure SSD offload requires --paper_optimizer_state_mode none"
+        )
+        assert not getattr(args, "sparse_adam", False), (
+            "pure SSD offload uses stateless normalized SGD and does not support --sparse_adam"
         )
         assert getattr(args, "paper_free_unified_params", False), (
             "pure SSD offload requires --paper_free_unified_params so the full CPU parameter table is released"
         )
         assert getattr(args, "disable_auto_densification", False), (
             "pure SSD offload requires --disable_auto_densification; current densification uses full-scene tensors"
-        )
-        assert getattr(args, "sparse_adam", False), (
-            "pure SSD offload requires --sparse_adam for resident-block optimizer updates"
         )
         assert not getattr(args, "use_block_scheduler", False), (
             "pure SSD offload is incompatible with --use_block_scheduler"

@@ -8,36 +8,27 @@ import torch.nn as nn
 import gc
 from typing import Optional, List, Dict, Tuple
 
-from strategies.tide_engine.gpu_resident_optimizer import GPUResidentAdam
+from strategies.tide_engine.gpu_resident_optimizer import GPUStatelessNormalizedSGD
 
-def get_gpu_resident_optimizer(gaussians, batch_size):
-    desired_block_size = int(
-        getattr(
-            gaussians,
-            '_paper_optimizer_block_size',
-            getattr(getattr(gaussians, 'args', None), 'gaussian_block_size', 4096),
-        )
-    )
-    current_optimizer = getattr(gaussians, '_paper_gpu_resident_optimizer', None)
+def get_gpu_stateless_optimizer(gaussians, batch_size):
+    current_optimizer = getattr(gaussians, '_paper_gpu_stateless_optimizer', None)
     needs_recreate = (
         current_optimizer is None
         or getattr(current_optimizer, 'batch_size', None) != batch_size
-        or getattr(current_optimizer, 'block_size', desired_block_size) != desired_block_size
     )
     if needs_recreate:
-        gaussians._paper_gpu_resident_optimizer = GPUResidentAdam(
+        gaussians._paper_gpu_stateless_optimizer = GPUStatelessNormalizedSGD(
             batch_size=batch_size,
-            block_size=desired_block_size,
             device='cuda',
         )
-    return gaussians._paper_gpu_resident_optimizer
+    return gaussians._paper_gpu_stateless_optimizer
 
 
-def shutdown_gpu_resident_optimizer(gaussians=None):
+def shutdown_gpu_stateless_optimizer(gaussians=None):
     if gaussians is None:
         return
-    if hasattr(gaussians, '_paper_gpu_resident_optimizer'):
-        gaussians._paper_gpu_resident_optimizer = None
+    if hasattr(gaussians, '_paper_gpu_stateless_optimizer'):
+        gaussians._paper_gpu_stateless_optimizer = None
 
 
 def get_total_gaussians_count(gaussians, storage_adapter=None):
@@ -140,7 +131,6 @@ from strategies.tide_engine.runtime import (
     apply_paper_writeback_payload as _apply_paper_writeback_payload,
     collect_camera_visible_blocks as _collect_camera_visible_blocks,
     collect_paper_updated_block_ids as _collect_paper_updated_block_ids,
-    configure_gpu_resident_optimizer_state as _configure_gpu_resident_optimizer_state,
     compute_paper_block_sets as _compute_paper_block_sets,
     initialize_paper_mode_runtime_state as _initialize_paper_mode_runtime_state,
     log_batch_kt_metrics as _log_batch_kt_metrics,
@@ -176,7 +166,7 @@ from strategies.tide_engine.runtime import (
     resolve_current_iteration_resident_blocks as _resolve_current_iteration_resident_blocks,
     resolve_stage2_loaded_gaussian_ids as _resolve_stage2_loaded_gaussian_ids,
     run_stage0_schedule_interaction as _run_stage0_schedule_interaction,
-    run_gpu_resident_adam_step as _run_gpu_resident_adam_step,
+    run_gpu_stateless_optimizer_step as _run_gpu_stateless_optimizer_step,
     seed_paper_active_buffer_from_manager as _seed_paper_active_buffer_from_manager,
     write_paper_phase1_log as _write_paper_phase1_log,
 )
@@ -1306,14 +1296,6 @@ def clm_offload_train_one_batch(
                                 requested=len(stream_in_for_next),
                                 log_file=log_file,
                             )
-                    _configure_gpu_resident_optimizer_state(
-                        gaussians=gaussians,
-                        args=args,
-                        actual_current_resident_blocks=actual_current_resident_blocks,
-                        iteration=iteration,
-                        get_gpu_resident_optimizer_fn=get_gpu_resident_optimizer,
-                        log_file=log_file,
-                    )
                     if should_log_paper_sets:
                         _log_paper_block_sets(
                             log_file=log_file,
@@ -2884,19 +2866,16 @@ def clm_offload_train_one_batch(
             raise RuntimeError("Pure SSD release path requires --ssd_execution_mode paper.")
         if paper_optimizer_backend != 'gpu_resident':
             raise RuntimeError(
-                "Paper SSD release path only supports GPUResidentAdam. "
+                "Paper SSD release path only supports the GPU stateless optimizer. "
                 "Set --paper_optimizer_backend gpu_resident."
             )
-        _run_gpu_resident_adam_step(
+        _run_gpu_stateless_optimizer_step(
             gaussians=gaussians,
             args=args,
             iteration=iteration,
-            total_n_gaussians=total_n_gaussians,
-            sparse_visibility_indices=sparse_visibility_indices,
             sparse_grad_local_ids=sparse_grad_local_ids,
             sparse_grad_components=sparse_grad_components,
-            get_gpu_resident_optimizer_fn=get_gpu_resident_optimizer,
-            ensure_local_to_global_mapping_fn=ensure_local_to_global_mapping,
+            get_gpu_stateless_optimizer_fn=get_gpu_stateless_optimizer,
             log_prefix="[PAPER SSD MODE]",
             log_file=log_file,
         )

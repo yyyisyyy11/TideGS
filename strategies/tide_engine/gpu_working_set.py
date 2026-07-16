@@ -526,7 +526,7 @@ class GPUWorkingSet:
         # already guarantees they will not read stale data — no explicit sync needed.
         #
         # Earlier CPU-side optimizer experiments could race with DMA reads from
-        # pinned pages. The release path uses GPUResidentAdam and staged
+        # pinned pages. The release path uses the stateless GPU optimizer and staged
         # writeback, so the CPU unified table is not updated concurrently here.
         #
         # torch.cuda.synchronize() is therefore NOT needed for correctness and
