@@ -2862,6 +2862,7 @@ def clm_offload_train_one_batch(
     optimizer_updated_global_indices = None
     optimizer_omega_wait_ms = 0.0
     optimizer_submit_ms = 0.0
+    adam_lifecycle_accounting_ms = 0.0
     optimizer_cuda_events = None
 
     assert microbatch_idx == bsz, f"microbatch_idx should be equal to bsz. Got {microbatch_idx} vs {bsz}"
@@ -2918,6 +2919,15 @@ def clm_offload_train_one_batch(
             _time.perf_counter() - optimizer_submit_start
         ) * 1000.0
         optimizer_cuda_end.record()
+        lifecycle_accounting_start = _time.perf_counter()
+        gpu_resident_optimizer = getattr(
+            gaussians, '_paper_gpu_resident_optimizer', None
+        )
+        if gpu_resident_optimizer is not None:
+            gpu_resident_optimizer.apply_pending_usage_events()
+        adam_lifecycle_accounting_ms = (
+            _time.perf_counter() - lifecycle_accounting_start
+        ) * 1000.0
     else:
             # ================================================================
             # Non-SSD GPU-resident Adam optimization.
@@ -3258,6 +3268,7 @@ def clm_offload_train_one_batch(
             omega_wait_ms=optimizer_omega_wait_ms,
             optimizer_submit_ms=optimizer_submit_ms,
             optimizer_cuda_ms=optimizer_cuda_ms,
+            adam_lifecycle_accounting_ms=adam_lifecycle_accounting_ms,
             touched_rows=optimizer_touched_rows,
             total_gaussians=total_n_gaussians,
             session_row_updates_total=optimizer_session_row_updates,
@@ -3269,6 +3280,7 @@ def clm_offload_train_one_batch(
                 f"omega_wait={optimizer_omega_wait_ms:.3f}ms "
                 f"submit={optimizer_submit_ms:.3f}ms "
                 f"cuda={optimizer_cuda_ms:.3f}ms "
+                f"lifecycle_accounting={adam_lifecycle_accounting_ms:.3f}ms "
                 f"touched_rows={optimizer_timing_row['touched_rows']} "
                 f"session_mean_adam_uses_per_gaussian="
                 f"{optimizer_timing_row['session_mean_updates_per_gaussian']:.6f}\n"

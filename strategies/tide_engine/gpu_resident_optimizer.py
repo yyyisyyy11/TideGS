@@ -4,6 +4,11 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
 
+from utils.adam_lifecycle_metrics import (
+    AdamLifecycleHistogram,
+    increment_usage_counts,
+)
+
 
 class GPUResidentAdam:
     """Resident-block GPU Adam state keyed by block_id.
@@ -34,6 +39,9 @@ class GPUResidentAdam:
         self._resident_streaks: Dict[int, int] = {}
         self._completed_streak_total = 0
         self._completed_streak_count = 0
+        self._lifecycle_histogram = AdamLifecycleHistogram()
+        self._pending_usage_batch = None
+        self._pending_finalized_usage_counts = []
         self._stats = {
             'state_mode': 'resident_blocks',
             'resident_target_blocks': 0,
@@ -44,19 +52,23 @@ class GPUResidentAdam:
             'optimizer_rows_touched_total': 0,
             'cold_restarted_rows_touched_total': 0,
             'mean_resident_streak': 0.0,
+            'adam_lifecycle_counter_bytes': 0,
         }
 
     def _update_state_stats(self) -> None:
         bytes_total = 0
+        counter_bytes = 0
         for state in self._resident_block_states.values():
             for name, _, _, _ in self.COMPONENT_SPECS:
                 exp_avg = state['exp_avg'][name]
                 exp_avg_sq = state['exp_avg_sq'][name]
                 bytes_total += int(exp_avg.numel() * exp_avg.element_size())
                 bytes_total += int(exp_avg_sq.numel() * exp_avg_sq.element_size())
+            counter_bytes += int(state['usage_count'].nbytes)
         self._stats['resident_target_blocks'] = len(self._resident_blocks)
         self._stats['resident_state_blocks'] = len(self._resident_block_states)
         self._stats['resident_state_bytes'] = int(bytes_total)
+        self._stats['adam_lifecycle_counter_bytes'] = int(counter_bytes)
         streak_total = self._completed_streak_total + sum(self._resident_streaks.values())
         streak_count = self._completed_streak_count + len(self._resident_streaks)
         self._stats['mean_resident_streak'] = float(streak_total) / max(1, streak_count)
@@ -100,6 +112,7 @@ class GPUResidentAdam:
             'step': 0,
             'exp_avg': {},
             'exp_avg_sq': {},
+            'usage_count': np.zeros((row_count,), dtype=np.uint32),
         }
         for name, _, width, _ in self.COMPONENT_SPECS:
             state['exp_avg'][name] = torch.zeros((row_count, width), dtype=torch.float32, device=self.device)
@@ -110,6 +123,7 @@ class GPUResidentAdam:
         return state
 
     def set_resident_blocks(self, block_ids: List[int]) -> None:
+        self.apply_pending_usage_events()
         next_resident = {int(block_id) for block_id in block_ids}
         previous_resident = set(self._resident_blocks)
         evicted_from_residency = previous_resident - next_resident
@@ -130,7 +144,9 @@ class GPUResidentAdam:
             if block_id not in next_resident
         ]
         for block_id in evicted_blocks:
-            self._resident_block_states.pop(block_id, None)
+            state = self._resident_block_states.pop(block_id, None)
+            if state is not None:
+                self._pending_finalized_usage_counts.append(state['usage_count'])
         self._stats['state_evictions'] += len(evicted_blocks)
         self._resident_blocks = next_resident
         self._update_state_stats()
@@ -142,6 +158,10 @@ class GPUResidentAdam:
         sparse_grad_local_ids: torch.Tensor,
         sparse_grad_components: Dict[str, torch.Tensor],
     ) -> Dict[str, int]:
+        if self._pending_usage_batch is not None:
+            raise RuntimeError(
+                '[GPUResidentAdam] Lifecycle accounting from the previous step is pending'
+            )
         if sparse_grad_local_ids is None or sparse_grad_components is None:
             return {'updated_blocks': 0, 'touched_rows': 0, 'cold_rows': 0}
         if sparse_grad_local_ids.numel() == 0:
@@ -175,6 +195,7 @@ class GPUResidentAdam:
 
         updated_blocks = 0
         cold_rows = 0
+        usage_events = []
 
         with torch.no_grad():
             for block_id in manager.loaded_blocks:
@@ -203,6 +224,15 @@ class GPUResidentAdam:
                 else:
                     state = None
                     step = 1
+
+                usage_events.append(
+                    (
+                        int(block_id) if persistent_state else None,
+                        int(block_slice.start),
+                        int(left),
+                        int(right),
+                    )
+                )
 
                 bias_correction1 = 1.0 - (beta1 ** step)
                 bias_correction2 = 1.0 - (beta2 ** step)
@@ -237,6 +267,7 @@ class GPUResidentAdam:
                     param_block = param_views[name].data[block_slice]
                     param_block[block_local_rows] -= update
 
+        self._pending_usage_batch = (local_ids_np, usage_events)
         self._update_state_stats()
         return {
             'updated_blocks': int(updated_blocks),
@@ -244,6 +275,48 @@ class GPUResidentAdam:
             'cold_rows': int(cold_rows),
         }
 
+    def apply_pending_usage_events(self) -> int:
+        finalized_counts = self._pending_finalized_usage_counts
+        self._pending_finalized_usage_counts = []
+        for counts in finalized_counts:
+            self._lifecycle_histogram.finalize(counts)
+
+        pending = self._pending_usage_batch
+        self._pending_usage_batch = None
+        if pending is None:
+            return 0
+
+        local_ids_np, usage_events = pending
+        accounted_rows = 0
+        for block_id, block_start, left, right in usage_events:
+            count = int(right - left)
+            if count <= 0:
+                continue
+            accounted_rows += count
+            if block_id is None:
+                self._lifecycle_histogram.record_one_shot(count)
+                continue
+            state = self._resident_block_states.get(int(block_id))
+            if state is None:
+                raise RuntimeError(
+                    '[GPUResidentAdam] Resident state disappeared before lifecycle accounting: '
+                    f'block_id={block_id}'
+                )
+            block_rows = np.asarray(
+                local_ids_np[left:right] - int(block_start),
+                dtype=np.intp,
+            )
+            increment_usage_counts(state['usage_count'], block_rows)
+        return accounted_rows
+
     def get_stats(self) -> Dict[str, Any]:
+        self.apply_pending_usage_events()
         self._update_state_stats()
-        return dict(self._stats)
+        stats = dict(self._stats)
+        stats.update(
+            self._lifecycle_histogram.snapshot(
+                state['usage_count']
+                for state in self._resident_block_states.values()
+            )
+        )
+        return stats

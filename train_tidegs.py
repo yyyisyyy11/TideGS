@@ -349,6 +349,18 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             'cold_restarts_total': int(stats.get('cold_restarts', 0)),
             'state_evictions_total': int(stats.get('state_evictions', 0)),
             'mean_resident_streak': float(stats.get('mean_resident_streak', 0.0)),
+            'adam_lifecycle_samples': int(stats.get('adam_lifecycle_samples', 0)),
+            'adam_lifecycle_updates_total': int(stats.get('adam_lifecycle_updates_total', 0)),
+            'adam_lifecycle_mean_uses': float(stats.get('adam_lifecycle_mean_uses', 0.0)),
+            'adam_lifecycle_max_uses': int(stats.get('adam_lifecycle_max_uses', 0)),
+            'adam_lifecycle_p50_uses': int(stats.get('adam_lifecycle_p50_uses', 0)),
+            'adam_lifecycle_p90_uses': int(stats.get('adam_lifecycle_p90_uses', 0)),
+            'adam_lifecycle_p95_uses': int(stats.get('adam_lifecycle_p95_uses', 0)),
+            'adam_lifecycle_p99_uses': int(stats.get('adam_lifecycle_p99_uses', 0)),
+            'adam_lifecycle_one_shot_pct': float(stats.get('adam_lifecycle_one_shot_pct', 0.0)),
+            'adam_lifecycle_reuse_ge2_pct': float(stats.get('adam_lifecycle_reuse_ge2_pct', 0.0)),
+            'adam_lifecycle_reuse_ge5_pct': float(stats.get('adam_lifecycle_reuse_ge5_pct', 0.0)),
+            'adam_lifecycle_counter_bytes': int(stats.get('adam_lifecycle_counter_bytes', 0)),
         }
 
     def _write_optimizer_churn_epoch(epoch_zero_based: int, iteration_end: int):
@@ -367,13 +379,34 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         optimizer_churn_tsv.write(
             f"{epoch_zero_based + 1}\t{iteration_end}\t{epoch_optimizer_rows}\t{epoch_cold_rows}\t"
             f"{epoch_cold_ratio_pct:.6f}\t{epoch_cold_restarts}\t{epoch_state_evictions}\t"
-            f"{stats['mean_resident_streak']:.6f}\n"
+            f"{stats['mean_resident_streak']:.6f}\t{stats['adam_lifecycle_samples']}\t"
+            f"{stats['adam_lifecycle_updates_total']}\t{stats['adam_lifecycle_mean_uses']:.6f}\t"
+            f"{stats['adam_lifecycle_max_uses']}\t{stats['adam_lifecycle_p50_uses']}\t"
+            f"{stats['adam_lifecycle_p90_uses']}\t{stats['adam_lifecycle_p95_uses']}\t"
+            f"{stats['adam_lifecycle_p99_uses']}\t{stats['adam_lifecycle_one_shot_pct']:.6f}\t"
+            f"{stats['adam_lifecycle_reuse_ge2_pct']:.6f}\t"
+            f"{stats['adam_lifecycle_reuse_ge5_pct']:.6f}\t"
+            f"{stats['adam_lifecycle_counter_bytes']}\n"
         )
         log_file.write(
             f"[OPTIMIZER CHURN] Epoch {epoch_zero_based + 1}: rows={epoch_optimizer_rows}, "
             f"cold_rows={epoch_cold_rows}, cold_ratio={epoch_cold_ratio_pct:.4f}%, "
             f"cold_restarts={epoch_cold_restarts}, state_evictions={epoch_state_evictions}, "
             f"mean_streak={stats['mean_resident_streak']:.4f}\n"
+        )
+        log_file.write(
+            f"[ADAM LIFETIME] Epoch {epoch_zero_based + 1}: "
+            f"samples={stats['adam_lifecycle_samples']}, "
+            f"mean={stats['adam_lifecycle_mean_uses']:.4f}, "
+            f"max={stats['adam_lifecycle_max_uses']}, "
+            f"p50={stats['adam_lifecycle_p50_uses']}, "
+            f"p90={stats['adam_lifecycle_p90_uses']}, "
+            f"p95={stats['adam_lifecycle_p95_uses']}, "
+            f"p99={stats['adam_lifecycle_p99_uses']}, "
+            f"one_shot={stats['adam_lifecycle_one_shot_pct']:.2f}%, "
+            f"reuse_ge2={stats['adam_lifecycle_reuse_ge2_pct']:.2f}%, "
+            f"reuse_ge5={stats['adam_lifecycle_reuse_ge5_pct']:.2f}%, "
+            f"counter_mb={stats['adam_lifecycle_counter_bytes'] / (1024 ** 2):.2f}\n"
         )
 
         optimizer_churn_state['last_optimizer_rows_total'] = stats['optimizer_rows_touched_total']
@@ -389,7 +422,13 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         optimizer_churn_tsv = open(churn_tsv_path, 'w', buffering=1)
         optimizer_churn_tsv.write(
             'epoch\titeration_end\toptimizer_rows_updated\tcold_restarted_rows_updated\t'
-            'cold_restarted_row_ratio_pct\tcold_restarts\tstate_evictions\tmean_resident_streak\n'
+            'cold_restarted_row_ratio_pct\tcold_restarts\tstate_evictions\tmean_resident_streak\t'
+            'adam_lifecycle_samples_cumulative\tadam_lifecycle_updates_cumulative\t'
+            'adam_lifecycle_mean_uses_cumulative\tadam_lifecycle_max_uses_cumulative\t'
+            'adam_lifecycle_p50_uses_cumulative\tadam_lifecycle_p90_uses_cumulative\t'
+            'adam_lifecycle_p95_uses_cumulative\tadam_lifecycle_p99_uses_cumulative\t'
+            'adam_lifecycle_one_shot_pct_cumulative\tadam_lifecycle_reuse_ge2_pct_cumulative\t'
+            'adam_lifecycle_reuse_ge5_pct_cumulative\tadam_lifecycle_counter_bytes\n'
         )
         log_file.write(f"[OPTIMIZER CHURN] Per-epoch churn logging enabled: {churn_tsv_path} ({reason})\n")
         log_file.flush()
