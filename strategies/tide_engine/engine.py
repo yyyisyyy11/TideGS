@@ -9,6 +9,7 @@ import gc
 from typing import Optional, List, Dict, Tuple
 
 from strategies.tide_engine.gpu_resident_optimizer import GPUResidentAdam
+from utils.optimizer_metrics import write_optimizer_timing_metrics
 
 def get_gpu_resident_optimizer(gaussians, batch_size):
     desired_block_size = int(
@@ -2859,6 +2860,9 @@ def clm_offload_train_one_batch(
     _ts('stage5_optim_start')
 
     optimizer_updated_global_indices = None
+    optimizer_omega_wait_ms = 0.0
+    optimizer_submit_ms = 0.0
+    optimizer_cuda_events = None
 
     assert microbatch_idx == bsz, f"microbatch_idx should be equal to bsz. Got {microbatch_idx} vs {bsz}"
 
@@ -2866,12 +2870,16 @@ def clm_offload_train_one_batch(
     # 5.1: Optimizer step (mode-dependent)
     # ------------------------------------------------------------------------
     if is_paper_ssd_mode and paper_async_prefetch_started and paper_block_sets is not None:
+        optimizer_omega_wait_start = _time.perf_counter()
         double_buffer = get_double_buffer_gpu(
             num_total=total_n_gaussians,
             block_size=args.gaussian_block_size,
             device='cuda',
         )
         double_buffer.wait_for_paper_omega_before_update(iteration + bsz)
+        optimizer_omega_wait_ms = (
+            _time.perf_counter() - optimizer_omega_wait_start
+        ) * 1000.0
 
     if not gaussians.use_gpu_features:
         raise RuntimeError("Pure SSD release path requires GPU working-set features.")
@@ -2887,6 +2895,12 @@ def clm_offload_train_one_batch(
                 "Paper SSD release path only supports GPUResidentAdam. "
                 "Set --paper_optimizer_backend gpu_resident."
             )
+        optimizer_cuda_start = torch.cuda.Event(enable_timing=True)
+        optimizer_cuda_end = torch.cuda.Event(enable_timing=True)
+        optimizer_cuda_events = (optimizer_cuda_start, optimizer_cuda_end)
+        gaussians._paper_last_gpu_optimizer_step = {}
+        optimizer_cuda_start.record()
+        optimizer_submit_start = _time.perf_counter()
         _run_gpu_resident_adam_step(
             gaussians=gaussians,
             args=args,
@@ -2900,6 +2914,10 @@ def clm_offload_train_one_batch(
             log_prefix="[PAPER SSD MODE]",
             log_file=log_file,
         )
+        optimizer_submit_ms = (
+            _time.perf_counter() - optimizer_submit_start
+        ) * 1000.0
+        optimizer_cuda_end.record()
     else:
             # ================================================================
             # Non-SSD GPU-resident Adam optimization.
@@ -3217,6 +3235,44 @@ def clm_offload_train_one_batch(
     # ------------------------------------------------------------------------
     torch.cuda.synchronize()
     _ts('stage5_sync_done')
+
+    if is_paper_ssd_mode and optimizer_cuda_events is not None:
+        optimizer_cuda_start, optimizer_cuda_end = optimizer_cuda_events
+        optimizer_cuda_ms = float(
+            optimizer_cuda_start.elapsed_time(optimizer_cuda_end)
+        )
+        optimizer_step_stats = getattr(
+            gaussians, '_paper_last_gpu_optimizer_step', {}
+        )
+        optimizer_touched_rows = int(optimizer_step_stats.get('touched_rows', 0))
+        optimizer_session_row_updates = int(
+            getattr(gaussians, '_paper_optimizer_session_row_updates', 0)
+        ) + optimizer_touched_rows
+        gaussians._paper_optimizer_session_row_updates = optimizer_session_row_updates
+        optimizer_timing_row = write_optimizer_timing_metrics(
+            model_path=getattr(args, 'model_path', ''),
+            iteration=iteration,
+            batch_size=bsz,
+            update_rule='resident_adam',
+            updates_enabled=not args.stop_update_param,
+            omega_wait_ms=optimizer_omega_wait_ms,
+            optimizer_submit_ms=optimizer_submit_ms,
+            optimizer_cuda_ms=optimizer_cuda_ms,
+            touched_rows=optimizer_touched_rows,
+            total_gaussians=total_n_gaussians,
+            session_row_updates_total=optimizer_session_row_updates,
+            log_file=log_file,
+        )
+        if _perf_log:
+            log_file.write(
+                f"[OPTIMIZER TIMING] Iter {iteration}: rule=resident_adam "
+                f"omega_wait={optimizer_omega_wait_ms:.3f}ms "
+                f"submit={optimizer_submit_ms:.3f}ms "
+                f"cuda={optimizer_cuda_ms:.3f}ms "
+                f"touched_rows={optimizer_timing_row['touched_rows']} "
+                f"session_mean_adam_uses_per_gaussian="
+                f"{optimizer_timing_row['session_mean_updates_per_gaussian']:.6f}\n"
+            )
     
     # ============================================================================
     # [MEMORY CLEANUP] Periodic cleanup to prevent memory accumulation

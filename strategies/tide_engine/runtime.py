@@ -1583,7 +1583,9 @@ def run_gpu_resident_adam_step(
         log_file=log_file,
     )
     if args.stop_update_param:
-        return {}
+        step_stats = {'touched_rows': 0, 'state_bytes': 0}
+        gaussians._paper_last_gpu_optimizer_step = dict(step_stats)
+        return step_stats
 
     torch.cuda.nvtx.range_push("Paper SSD: GPU Resident Adam")
     try:
