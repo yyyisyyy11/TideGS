@@ -42,6 +42,7 @@ BALANCED_SEED_FRACTION_LIST="0.25"
 BSZ_LIST="16"
 CAPACITY_LIST="2048"
 CHECKPOINT_ITER=500
+CHECKPOINT_ITER_SET=0
 RESUME_TO_ITER=1000
 START_CHECKPOINT=""
 
@@ -85,7 +86,7 @@ Options:
   --resident-decay-list "LIST"  resident recency decay values for sweeps (default: "${RESIDENT_DECAY_LIST}")
   --balanced-seed-fraction-list "LIST"
                               topc_balanced seed-capacity fractions (default: "${BALANCED_SEED_FRACTION_LIST}")
-  --checkpoint-iter N         Checkpoint iteration for checkpoint mode (default: ${CHECKPOINT_ITER})
+  --checkpoint-iter N         Checkpoint iteration; also applies to train mode when explicitly set
   --resume-to-iter N          Final iteration for resume mode (default: ${RESUME_TO_ITER})
   --start-checkpoint DIR      Checkpoint dir for resume mode
   --debug-logging             Enable detailed TideGS runtime logs while keeping terminal quiet
@@ -136,7 +137,7 @@ while [[ $# -gt 0 ]]; do
     --resident-decay-list) RESIDENT_DECAY_LIST="$2"; shift 2 ;;
     --balanced-seed-fraction) BALANCED_SEED_FRACTION_LIST="$2"; shift 2 ;;
     --balanced-seed-fraction-list) BALANCED_SEED_FRACTION_LIST="$2"; shift 2 ;;
-    --checkpoint-iter) CHECKPOINT_ITER="$2"; shift 2 ;;
+    --checkpoint-iter) CHECKPOINT_ITER="$2"; CHECKPOINT_ITER_SET=1; shift 2 ;;
     --resume-to-iter) RESUME_TO_ITER="$2"; shift 2 ;;
     --start-checkpoint) START_CHECKPOINT="$2"; shift 2 ;;
     --debug-logging) DEBUG_LOGGING=1; shift ;;
@@ -205,18 +206,6 @@ append_train_command() {
   local start_checkpoint="${10}"
   local model_path="${RUN_ROOT}/${run_name}"
   local cache_dir="${CACHE_ROOT}/${RUN_TAG}/${run_name}"
-  local checkpoint_args=()
-  local resume_args=()
-  local prebuilt_args=()
-
-  if [[ -n "${checkpoint_iter}" ]]; then
-    checkpoint_args=(--checkpoint_iterations "${checkpoint_iter}")
-  fi
-  if [[ -n "${start_checkpoint}" ]]; then
-    resume_args=(--start_checkpoint "${start_checkpoint}")
-  elif [[ -n "${MANIFEST}" ]]; then
-    prebuilt_args=(--pure_ssd_prebuilt_manifest "${MANIFEST}")
-  fi
 
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "${mode}" "${run_name}" "${bsz}" "${capacity}" "${resident_lambda}" "${resident_decay}" "${balanced_seed_fraction}" "${iterations}" "${checkpoint_iter}" \
@@ -232,8 +221,12 @@ append_train_command() {
     printf '  -s %q \\\n' "${SRC}"
     printf '  --model_path %q \\\n' "${model_path}"
     printf '  --iterations %q \\\n' "${iterations}"
-    for arg in "${checkpoint_args[@]}"; do printf '  %q \\\n' "${arg}"; done
-    for arg in "${resume_args[@]}"; do printf '  %q \\\n' "${arg}"; done
+    if [[ -n "${checkpoint_iter}" ]]; then
+      printf '  --checkpoint_iterations %q \\\n' "${checkpoint_iter}"
+    fi
+    if [[ -n "${start_checkpoint}" ]]; then
+      printf '  --start_checkpoint %q \\\n' "${start_checkpoint}"
+    fi
     printf '  --dense_ply_file %q \\\n' "${PLY}"
     if [[ -n "${DECODE_DATASET_PATH}" ]]; then
       printf '  --decode_dataset_path %q \\\n' "${DECODE_DATASET_PATH}"
@@ -250,7 +243,9 @@ append_train_command() {
     printf '  --use_ssd_offload \\\n'
     printf '  --pure_ssd_offload \\\n'
     printf '  --pure_ssd_init_backend streaming \\\n'
-    for arg in "${prebuilt_args[@]}"; do printf '  %q \\\n' "${arg}"; done
+    if [[ -z "${start_checkpoint}" && -n "${MANIFEST}" ]]; then
+      printf '  --pure_ssd_prebuilt_manifest %q \\\n' "${MANIFEST}"
+    fi
     printf '  --use_6plane \\\n'
     printf '  --ssd_cache_dir %q \\\n' "${cache_dir}"
     printf '  --gaussian_block_size 4096 \\\n'
@@ -279,6 +274,10 @@ append_train_command() {
 }
 
 if [[ "${MODE}" == "train" ]]; then
+  train_checkpoint_iter=""
+  if [[ "${CHECKPOINT_ITER_SET}" == "1" ]]; then
+    train_checkpoint_iter="${CHECKPOINT_ITER}"
+  fi
   for bsz in ${BSZ_LIST}; do
     for capacity in ${CAPACITY_LIST}; do
       for resident_lambda in ${RESIDENT_LAMBDA_LIST}; do
@@ -290,7 +289,7 @@ if [[ "${MODE}" == "train" ]]; then
             append_train_command \
               "train" \
               "train_bsz${bsz}_cap${capacity}_lam${lambda_tag}_decay${decay_tag}_seed${fraction_tag}_iter${ITERATIONS}" \
-              "${bsz}" "${capacity}" "${resident_lambda}" "${resident_decay}" "${balanced_seed_fraction}" "${ITERATIONS}" "" ""
+              "${bsz}" "${capacity}" "${resident_lambda}" "${resident_decay}" "${balanced_seed_fraction}" "${ITERATIONS}" "${train_checkpoint_iter}" ""
           done
         done
       done
