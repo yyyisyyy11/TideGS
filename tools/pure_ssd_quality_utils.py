@@ -14,6 +14,12 @@ from typing import Dict, Iterable, List, Mapping, Sequence
 METRIC_NAMES = ("psnr", "ssim", "lpips_alex", "render_ms")
 
 
+def fingerprint_camera_schedule(schedule: Sequence[int]) -> str:
+    """Return a stable fingerprint for an ordered camera schedule."""
+    payload = ",".join(str(int(camera_id)) for camera_id in schedule)
+    return hashlib.sha256(payload.encode("ascii")).hexdigest()
+
+
 def select_preview_indices(camera_count: int, preview_count: int) -> List[int]:
     """Return deterministic, unique camera indices spanning the full split."""
     camera_count = int(camera_count)
