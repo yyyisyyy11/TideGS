@@ -3,8 +3,11 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
+from tools.pure_ssd_image_io import load_evaluation_camera, normalize_gt_image
 from tools.pure_ssd_quality_utils import (
+    checkpoint_manifest_fingerprint,
     compute_next_resident_transition,
     compute_psnr,
     select_initial_resident_blocks,
@@ -76,6 +79,85 @@ class SummaryTest(unittest.TestCase):
             summarize_values([1.0, float("nan")])
 
 
+class EvaluationCameraSourceTest(unittest.TestCase):
+    @staticmethod
+    def make_context(root):
+        args = SimpleNamespace(decode_dataset_path=str(root))
+        camera_info = SimpleNamespace(image_name="test/camera_0001")
+        return args, camera_info
+
+    def test_existing_raw_uses_cache_loader(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            args, camera_info = self.make_context(root)
+            raw_path = root / "dataset_raw" / "test" / "camera_0001.raw"
+            raw_path.parent.mkdir(parents=True)
+            raw_path.write_bytes(bytes(range(12)))
+            calls = []
+
+            def raw_loader(*_):
+                calls.append("raw")
+                return "raw-camera"
+
+            def source_loader(*_):
+                calls.append("source")
+                return "source-camera"
+
+            result = load_evaluation_camera(
+                args,
+                0,
+                camera_info,
+                2,
+                2,
+                raw_loader=raw_loader,
+                source_loader=source_loader,
+            )
+            self.assertEqual(result.camera, "raw-camera")
+            self.assertEqual(result.source, "raw")
+            self.assertEqual(calls, ["raw"])
+
+    def test_missing_raw_falls_back_without_creating_cache(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            args, camera_info = self.make_context(root)
+            raw_path = root / "dataset_raw" / "test" / "camera_0001.raw"
+
+            result = load_evaluation_camera(
+                args,
+                0,
+                camera_info,
+                2,
+                2,
+                raw_loader=lambda *_: self.fail("raw loader should not run"),
+                source_loader=lambda *_: "source-camera",
+            )
+            self.assertEqual(result.camera, "source-camera")
+            self.assertEqual(result.source, "source_image")
+            self.assertEqual(result.fallback_reason, "raw_missing")
+            self.assertFalse(raw_path.exists())
+            self.assertFalse((root / "dataset_raw").exists())
+
+    def test_source_fallback_preserves_checkpoint_fingerprint_and_mtime(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            args, camera_info = self.make_context(root)
+            checkpoint = root / "pure_ssd_checkpoint.json"
+            checkpoint.write_text('{"iteration": 32}\n')
+            before = checkpoint_manifest_fingerprint(checkpoint)
+
+            load_evaluation_camera(
+                args,
+                0,
+                camera_info,
+                2,
+                2,
+                source_loader=lambda *_: "source-camera",
+            )
+
+            after = checkpoint_manifest_fingerprint(checkpoint)
+            self.assertEqual(after, before)
+
+
 @unittest.skipUnless(torch is not None, "PyTorch is required")
 class ImageMetricTest(unittest.TestCase):
     def test_known_psnr_and_ssim(self):
@@ -86,6 +168,14 @@ class ImageMetricTest(unittest.TestCase):
         self.assertEqual(compute_psnr(zeros, ones), 0.0)
         self.assertTrue(math.isinf(compute_psnr(zeros, zeros)))
         self.assertAlmostEqual(float(ssim(zeros, zeros).item()), 1.0, places=6)
+
+    def test_uint8_and_unit_float_gt_normalize_identically(self):
+        uint8_image = torch.tensor([0, 64, 127, 255], dtype=torch.uint8).reshape(1, 2, 2)
+        float_image = uint8_image.float() / 255.0
+        torch.testing.assert_close(
+            normalize_gt_image(uint8_image),
+            normalize_gt_image(float_image),
+        )
 
     def test_identical_image_lpips_is_near_zero_when_assets_are_available(self):
         try:
