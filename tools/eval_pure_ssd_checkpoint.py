@@ -23,6 +23,7 @@ from tools.pure_ssd_quality_utils import (  # noqa: E402
     checkpoint_manifest_fingerprint,
     compute_next_resident_transition,
     compute_psnr,
+    fingerprint_camera_schedule,
     select_initial_resident_blocks,
     select_preview_indices,
     summarize_metric_rows,
@@ -43,6 +44,12 @@ RESIDENT_LAMBDA = 0.3
 RESIDENT_RECENCY_DECAY = 0.95
 BALANCED_SEED_FRACTION = 0.25
 RESIDENT_CAPACITY = 2048
+
+
+def shared_schedule_cache_dir(output_dir: Path) -> Path:
+    """Place the A/B schedule cache beside both evaluator output directories."""
+    return output_dir.resolve().parent / "camera_schedule_cache"
+
 
 PER_CAMERA_FIELDS = (
     "camera_index",
@@ -117,7 +124,7 @@ def _configure_eval_args(
     args.paper_debug_logging = False
     args.tide_debug_logging = False
     args.pure_ssd_disable_schedule_cache = False
-    args.pure_ssd_schedule_cache_dir = str(output_dir / "camera_schedule_cache")
+    args.pure_ssd_schedule_cache_dir = str(shared_schedule_cache_dir(output_dir))
     args.ssd_cache_dir = str(output_dir / "ssd_eval_cache")
     args.ssd_schedule_ordering = "trajectory"
     args._pure_ssd_resume_manifest = manifest
@@ -345,6 +352,13 @@ def evaluate_checkpoint(cli_args: argparse.Namespace) -> Dict[str, object]:
         schedule = [int(camera_id) for camera_id in storage_adapter.get_training_schedule(shuffle=False)]
         if sorted(schedule) != list(range(len(test_camera_infos))):
             raise RuntimeError("Test TSP schedule is not a permutation of the Test split")
+        schedule_sha256 = fingerprint_camera_schedule(schedule)
+        schedule_message = (
+            f"[QUALITY SCHEDULE] sha256={schedule_sha256} "
+            f"cache_dir={training_args.pure_ssd_schedule_cache_dir}"
+        )
+        print(schedule_message)
+        log_file.write(schedule_message + "\n")
         if int(cli_args.camera_limit) >= 0:
             schedule = schedule[: int(cli_args.camera_limit)]
         if not schedule:
@@ -551,6 +565,8 @@ def evaluate_checkpoint(cli_args: argparse.Namespace) -> Dict[str, object]:
             "raw_cache_hits": int(raw_cache_hits),
             "source_image_fallbacks": int(source_image_fallbacks),
             "batch_size": EVAL_BATCH_SIZE,
+            "schedule_sha256": schedule_sha256,
+            "schedule_cache_dir": str(training_args.pure_ssd_schedule_cache_dir),
             "resident": {
                 "selection_policy": RESIDENT_POLICY,
                 "capacity_blocks": RESIDENT_CAPACITY,

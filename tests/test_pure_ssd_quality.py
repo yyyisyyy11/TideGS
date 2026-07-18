@@ -5,11 +5,13 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from tools.eval_pure_ssd_checkpoint import shared_schedule_cache_dir
 from tools.pure_ssd_image_io import load_evaluation_camera, normalize_gt_image
 from tools.pure_ssd_quality_utils import (
     checkpoint_manifest_fingerprint,
     compute_next_resident_transition,
     compute_psnr,
+    fingerprint_camera_schedule,
     select_initial_resident_blocks,
     select_preview_indices,
     summarize_values,
@@ -32,6 +34,29 @@ class PreviewSelectionTest(unittest.TestCase):
     def test_preview_count_is_bounded_by_camera_count(self):
         self.assertEqual(select_preview_indices(3, 64), [0, 1, 2])
         self.assertEqual(select_preview_indices(0, 64), [])
+
+
+class CameraScheduleTest(unittest.TestCase):
+    def test_ab_outputs_share_schedule_cache(self):
+        root = Path("/quality")
+        self.assertEqual(
+            shared_schedule_cache_dir(root / "adam"),
+            root / "camera_schedule_cache",
+        )
+        self.assertEqual(
+            shared_schedule_cache_dir(root / "stateless"),
+            root / "camera_schedule_cache",
+        )
+
+    def test_schedule_fingerprint_is_order_sensitive(self):
+        self.assertEqual(
+            fingerprint_camera_schedule([3, 1, 2]),
+            fingerprint_camera_schedule([3, 1, 2]),
+        )
+        self.assertNotEqual(
+            fingerprint_camera_schedule([3, 1, 2]),
+            fingerprint_camera_schedule([1, 2, 3]),
+        )
 
 
 @unittest.skipUnless(torch is not None, "PyTorch package initialization is required")
