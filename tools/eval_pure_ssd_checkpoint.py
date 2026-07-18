@@ -12,6 +12,7 @@ import sys
 import time
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +29,11 @@ from tools.pure_ssd_quality_utils import (  # noqa: E402
     summarize_values,
     validate_resident_configuration,
     write_tsv,
+)
+from tools.pure_ssd_image_io import (  # noqa: E402
+    load_evaluation_camera,
+    load_test_scene_metadata,
+    normalize_gt_image,
 )
 
 
@@ -200,8 +206,10 @@ def _render_camera(
     import torch
     from strategies.base_engine import pipeline_forward_one_step
 
+    target = normalize_gt_image(
+        camera.original_image_backup.cuda(non_blocking=True)
+    )
     if int(local_filter.numel()) == 0:
-        target = camera.original_image_backup.cuda(non_blocking=True).float().div_(255.0).clamp_(0.0, 1.0)
         return _empty_render_like(target, background), target, 0.0
 
     xyz = gpu_tensors["xyz"].index_select(0, local_filter)
@@ -236,7 +244,6 @@ def _render_camera(
     end_event.synchronize()
     render_ms = float(start_event.elapsed_time(end_event))
     render = render.clamp(0.0, 1.0)
-    target = camera.original_image_backup.cuda(non_blocking=True).float().div_(255.0).clamp_(0.0, 1.0)
     return render, target, render_ms
 
 
@@ -248,13 +255,11 @@ def evaluate_checkpoint(cli_args: argparse.Namespace) -> Dict[str, object]:
     import numpy as np
 
     import utils.general_utils as utils
-    from scene import Scene
     from storage.block_reader import TieredCacheBlockReader
     from storage.pure_ssd_checkpoint import load_pure_ssd_checkpoint_manifest
     from storage.tide_storage_adapter import TideStorageAdapter
     from strategies.base_engine import calculate_filters
     from strategies.tide_engine.gaussian_model import TideGaussianModel
-    from utils.camera_utils import loadCam_raw_from_disk
     from utils.loss_utils import ssim
 
     if not torch.cuda.is_available():
@@ -296,21 +301,28 @@ def evaluate_checkpoint(cli_args: argparse.Namespace) -> Dict[str, object]:
     started = time.perf_counter()
     rows: List[Dict[str, object]] = []
     preview_rows: List[Dict[str, object]] = []
+    raw_cache_hits = 0
+    source_image_fallbacks = 0
 
     try:
         gaussians = TideGaussianModel(
             sh_degree=int(training_args.sh_degree),
             only_for_rendering=True,
         )
-        scene = Scene(
-            training_args,
-            gaussians,
-            shuffle=False,
-            only_for_rendering=True,
+        (
+            test_camera_infos,
+            cameras_extent,
+            image_height,
+            image_width,
+        ) = load_test_scene_metadata(training_args)
+        gaussians.prepare_pure_ssd_checkpoint_resume(
+            manifest,
+            cameras_extent,
         )
-        test_camera_infos = list(scene.getTestCamerasInfo() or [])
-        if not test_camera_infos:
-            raise RuntimeError("Test split is empty; evaluation requires transforms_test.json cameras")
+        scene = SimpleNamespace(
+            model_path=str(output_dir),
+            cameras_extent=cameras_extent,
+        )
 
         storage_adapter = TideStorageAdapter(
             gaussians=gaussians,
@@ -375,8 +387,27 @@ def evaluate_checkpoint(cli_args: argparse.Namespace) -> Dict[str, object]:
                 )
                 cameras = []
                 for local_uid, camera_id in enumerate(camera_ids):
-                    camera = loadCam_raw_from_disk(training_args, local_uid, test_camera_infos[camera_id])
-                    cameras.append(_prepare_camera(camera, local_uid, camera_id))
+                    camera_load = load_evaluation_camera(
+                        training_args,
+                        local_uid,
+                        test_camera_infos[camera_id],
+                        image_height,
+                        image_width,
+                    )
+                    if camera_load.source == "raw":
+                        raw_cache_hits += 1
+                    else:
+                        source_image_fallbacks += 1
+                        fallback_message = (
+                            f"[QUALITY IMAGE] source fallback camera={camera_id} "
+                            f"image={test_camera_infos[camera_id].image_name} "
+                            f"reason={camera_load.fallback_reason} raw={camera_load.raw_path}"
+                        )
+                        print(fallback_message)
+                        log_file.write(fallback_message + "\n")
+                    cameras.append(
+                        _prepare_camera(camera_load.camera, local_uid, camera_id)
+                    )
 
                 filters_local, _, _ = calculate_filters(
                     cameras,
@@ -484,6 +515,17 @@ def evaluate_checkpoint(cli_args: argparse.Namespace) -> Dict[str, object]:
             raise AssertionError(
                 f"expected {len(preview_camera_ids)} previews, got {len(preview_rows)}"
             )
+        if raw_cache_hits + source_image_fallbacks != len(rows):
+            raise AssertionError(
+                "image source accounting mismatch: "
+                f"raw={raw_cache_hits} fallback={source_image_fallbacks} rows={len(rows)}"
+            )
+        image_source_message = (
+            f"[QUALITY IMAGE] raw_cache_hits={raw_cache_hits} "
+            f"source_image_fallbacks={source_image_fallbacks}"
+        )
+        print(image_source_message)
+        log_file.write(image_source_message + "\n")
 
         write_tsv(output_dir / "per_camera_metrics.tsv", rows, PER_CAMERA_FIELDS)
         write_tsv(
@@ -506,6 +548,8 @@ def evaluate_checkpoint(cli_args: argparse.Namespace) -> Dict[str, object]:
             "test_split_camera_count": len(test_camera_infos),
             "camera_limit": int(cli_args.camera_limit),
             "preview_count": len(preview_rows),
+            "raw_cache_hits": int(raw_cache_hits),
+            "source_image_fallbacks": int(source_image_fallbacks),
             "batch_size": EVAL_BATCH_SIZE,
             "resident": {
                 "selection_policy": RESIDENT_POLICY,
