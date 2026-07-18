@@ -124,8 +124,8 @@ def normalize_gt_image(image):
     raise TypeError(f"unsupported GT image dtype: {image.dtype}")
 
 
-def load_test_scene_metadata(args):
-    """Load camera metadata and image dimensions without constructing Scene or decoding images."""
+def load_scene_camera_metadata(args, split: str):
+    """Load one camera split and image dimensions without constructing Scene."""
     import utils.general_utils as utils
     from scene import load_scene_info_for_rendering
 
@@ -133,19 +133,32 @@ def load_test_scene_metadata(args):
     train_camera_infos = list(scene_info.train_cameras or [])
     test_camera_infos = list(scene_info.test_cameras or [])
     all_camera_infos = train_camera_infos + test_camera_infos
-    if not test_camera_infos:
-        raise RuntimeError("Test split is empty; expected transforms_test.json cameras")
     if not all_camera_infos:
         raise RuntimeError("camera metadata is empty")
+    split = str(split).lower()
+    if split == "train":
+        camera_infos = train_camera_infos
+    elif split == "test":
+        camera_infos = test_camera_infos
+    else:
+        raise ValueError(f"unsupported camera split: {split!r}")
+    if not camera_infos:
+        raise RuntimeError(f"{split.capitalize()} split is empty")
     image_width = min(int(camera.width) for camera in all_camera_infos)
     image_height = min(int(camera.height) for camera in all_camera_infos)
     utils.set_img_size(image_height, image_width)
-    return test_camera_infos, float(cameras_extent), image_height, image_width
+    return camera_infos, float(cameras_extent), image_height, image_width
+
+
+def load_test_scene_metadata(args):
+    """Load Test camera metadata without constructing Scene or decoding images."""
+    return load_scene_camera_metadata(args, "test")
 
 
 __all__ = [
     "EvaluationCameraLoad",
     "load_evaluation_camera",
+    "load_scene_camera_metadata",
     "load_source_image_camera",
     "load_test_scene_metadata",
     "normalize_gt_image",

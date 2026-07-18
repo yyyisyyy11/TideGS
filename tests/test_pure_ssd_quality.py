@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from tools.eval_pure_ssd_checkpoint import shared_schedule_cache_dir
+from tools.predecode_test_images import build_argparser as build_predecode_argparser
 from tools.pure_ssd_image_io import load_evaluation_camera, normalize_gt_image
 from tools.pure_ssd_quality_utils import (
     checkpoint_manifest_fingerprint,
@@ -57,6 +58,32 @@ class CameraScheduleTest(unittest.TestCase):
             fingerprint_camera_schedule([3, 1, 2]),
             fingerprint_camera_schedule([1, 2, 3]),
         )
+
+
+class PredecodeCliTest(unittest.TestCase):
+    def test_test_split_remains_the_default(self):
+        args = build_predecode_argparser().parse_args(
+            ["--run-dir", "/run", "--output", "/summary.json"]
+        )
+        self.assertEqual(args.split, "test")
+        self.assertEqual(args.expected_count, 2584)
+
+    def test_train_split_accepts_full_matrixcity_count(self):
+        args = build_predecode_argparser().parse_args(
+            [
+                "--run-dir",
+                "/run",
+                "--output",
+                "/summary.json",
+                "--split",
+                "train",
+                "--expected-count",
+                "49048",
+            ]
+        )
+        self.assertEqual(args.split, "train")
+        self.assertEqual(args.expected_count, 49048)
+        self.assertEqual(args.min_free_gb_after, 128.0)
 
 
 @unittest.skipUnless(torch is not None, "PyTorch package initialization is required")
