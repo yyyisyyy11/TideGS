@@ -3,6 +3,7 @@ import sys
 import json
 import gc
 import psutil
+import numpy as np
 from pathlib import Path
 
 # import faulthandler
@@ -48,6 +49,103 @@ from storage.pure_ssd_checkpoint import (
     write_pure_ssd_incremental_checkpoint,
     write_pure_ssd_snapshot_checkpoint,
 )
+from storage.distributed_checkpoint import (
+    is_distributed_checkpoint,
+    load_distributed_checkpoint_manifest,
+    write_distributed_incremental_checkpoint,
+)
+from strategies.tide_engine.distributed_plan import (
+    DistributedBatchPlan,
+    DistributedBatchPlanner,
+    build_balanced_block_owner,
+    validate_block_owner,
+)
+from strategies.tide_engine.gsplat_backend import prepare_distributed_gsplat
+from utils.distributed import DistributedContext, get_distributed_context
+
+
+def _sample_block_visibility_counts(storage_adapter, training_schedule, sample_count):
+    num_blocks = int(storage_adapter.num_blocks)
+    counts = np.zeros((num_blocks,), dtype=np.int64)
+    sample_count = min(max(0, int(sample_count)), len(training_schedule))
+    if sample_count == 0:
+        return counts
+    positions = np.linspace(0, len(training_schedule) - 1, num=sample_count, dtype=np.int64)
+    camera_ids = [int(training_schedule[position]) for position in positions]
+    _, camera_blocks = storage_adapter.get_visible_blocks_batch(camera_ids)
+    for blocks in camera_blocks.values():
+        if blocks:
+            counts[np.asarray(blocks, dtype=np.int64)] += 1
+    return counts
+
+
+def _prepare_distributed_block_owner(
+    *,
+    args,
+    context,
+    storage_adapter,
+    training_schedule,
+    resume_manifest,
+):
+    owner = None
+    if context.is_rank0:
+        owner_file = None if resume_manifest is None else resume_manifest.get("_tide_block_owner_file")
+        if owner_file:
+            owner = np.load(owner_file).astype(np.int32, copy=False)
+        else:
+            visibility_counts = _sample_block_visibility_counts(
+                storage_adapter,
+                training_schedule,
+                getattr(args, "tide_owner_balance_samples", 256),
+            )
+            owner = build_balanced_block_owner(
+                num_blocks=int(storage_adapter.num_blocks),
+                total_points=int(storage_adapter.num_points),
+                block_size=int(storage_adapter.block_size),
+                world_size=int(context.world_size),
+                visibility_counts=visibility_counts,
+            )
+    owner_values = context.broadcast_object(None if owner is None else owner.tolist())
+    owner = np.asarray(owner_values, dtype=np.int32)
+    validate_block_owner(
+        owner,
+        num_blocks=int(storage_adapter.num_blocks),
+        world_size=int(context.world_size),
+    )
+    storage_adapter.configure_block_ownership(owner, context.rank)
+    args._tide_block_owner = owner
+    if context.is_rank0:
+        counts = np.bincount(owner, minlength=context.world_size).tolist()
+        utils.print_rank_0(f"[DISTRIBUTED] Static block ownership per rank: {counts}")
+    return owner
+
+
+def _build_distributed_plan(
+    *,
+    context,
+    planner,
+    storage_adapter,
+    training_schedule,
+    iteration,
+    batch_size,
+    schedule_ordering,
+):
+    schedule_info = get_camera_batch_schedule(
+        training_schedule=training_schedule,
+        iteration=iteration,
+        batch_size=batch_size,
+        schedule_ordering=schedule_ordering,
+    )
+    payload = None
+    if context.is_rank0:
+        _, camera_blocks = storage_adapter.get_visible_blocks_batch(schedule_info.batch_indices)
+        payload = planner.plan(
+            iteration=iteration,
+            epoch=schedule_info.epoch,
+            camera_ids=schedule_info.batch_indices,
+            camera_blocks=camera_blocks,
+        ).to_dict()
+    return DistributedBatchPlan.from_dict(context.broadcast_object(payload)), schedule_info
 
 
 def _load_pure_ssd_prebuilt_manifest(args):
@@ -141,6 +239,9 @@ def _validate_pure_ssd_runtime(args, gaussians, storage_adapter, resolved_backen
 def training(dataset_args, opt_args, pipe_args, args, log_file):
     """Main training loop for the pure SSD/Tide release path."""
 
+    distributed_context = get_distributed_context(args)
+    distributed_enabled = distributed_context.enabled
+
     # ============================================================================
     # STAGE 1: INITIALIZATION
     # ============================================================================
@@ -156,6 +257,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             "train_tidegs.py is the pure SSD/Tide release entry. "
             "Use scripts/train_matrixcity_1b.sh or enable the TideGS SSD flags."
         ) from exc
+    if distributed_enabled:
+        prepare_distributed_gsplat(distributed_context)
     # ------------------------------------------------------------------------
     # 1.1: Setup auxiliary tools and GPU configuration
     # ------------------------------------------------------------------------
@@ -164,7 +267,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     torch.cuda.set_device(args.gpu)
     timers = Timer(args)
     utils.set_timers(timers)
-    prepare_output_and_logger(dataset_args)
+    if not distributed_enabled or distributed_context.is_rank0:
+        prepare_output_and_logger(dataset_args)
+    distributed_context.barrier()
     utils.log_cpu_memory_usage("at the beginning of training")
     start_from_this_iteration = 1
     pure_ssd_resume_manifest = None
@@ -186,11 +291,23 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         utils.print_rank_0(prebuilt_msg)
         log_file.write(prebuilt_msg + "\n")
     if args.start_checkpoint != "":
-        if not is_pure_ssd_checkpoint(args.start_checkpoint):
-            raise ValueError(
-                "train_tidegs.py only resumes pure SSD checkpoints."
+        if distributed_enabled:
+            if not is_distributed_checkpoint(args.start_checkpoint):
+                raise ValueError(
+                    "gaussian_sharded mode only resumes distributed Pure SSD checkpoints."
+                )
+            pure_ssd_resume_manifest = load_distributed_checkpoint_manifest(
+                args.start_checkpoint,
+                rank=distributed_context.rank,
+                world_size=distributed_context.world_size,
+                global_bsz=args.bsz,
             )
-        pure_ssd_resume_manifest = load_pure_ssd_checkpoint_manifest(args.start_checkpoint)
+        else:
+            if not is_pure_ssd_checkpoint(args.start_checkpoint):
+                raise ValueError(
+                    "train_tidegs.py only resumes pure SSD checkpoints."
+                )
+            pure_ssd_resume_manifest = load_pure_ssd_checkpoint_manifest(args.start_checkpoint)
         args._pure_ssd_resume_manifest = pure_ssd_resume_manifest
         start_from_this_iteration = int(pure_ssd_resume_manifest["next_iteration"])
         args.gaussian_block_size = int(pure_ssd_resume_manifest["block_size"])
@@ -217,27 +334,59 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     ssd_training_schedule = None
 
     with torch.no_grad():
-        scene = Scene(args, gaussians)
+        if distributed_enabled:
+            scene = Scene(args, gaussians) if distributed_context.is_rank0 else None
+            distributed_context.barrier()
+            if not distributed_context.is_rank0:
+                scene = Scene(args, gaussians)
+            distributed_context.barrier()
+        else:
+            scene = Scene(args, gaussians)
         utils.print_rank_0("[SSD] Initializing Tide storage engine...")
-        storage_adapter = TideStorageAdapter(
-            gaussians=gaussians,
-            cameras=scene.getTrainCamerasInfo(),
-            storage_dir=args.ssd_cache_dir,
-            block_size=args.gaussian_block_size,
-            max_ram_gb=args.max_ram_gb,
-            num_clusters=args.num_clusters,
-            use_6plane=args.use_6plane,
-            execution_mode=args.ssd_execution_mode,
-            max_patch_files=args.tide_storage_max_patch_files,
-            max_patch_gb=args.tide_storage_max_patch_gb,
-            min_free_gb=args.tide_storage_min_free_gb,
+        storage_dir = (
+            os.path.join(args.ssd_cache_dir, f"rank_{distributed_context.rank}")
+            if distributed_enabled
+            else args.ssd_cache_dir
         )
-
-        log_file.write(f"[SSD] Execution mode: {args.ssd_execution_mode}\n")
+        def create_storage_adapter():
+            return TideStorageAdapter(
+                gaussians=gaussians,
+                cameras=scene.getTrainCamerasInfo(),
+                storage_dir=storage_dir,
+                block_size=args.gaussian_block_size,
+                max_ram_gb=args.max_ram_gb,
+                num_clusters=args.num_clusters,
+                use_6plane=args.use_6plane,
+                execution_mode=args.ssd_execution_mode,
+                max_patch_files=args.tide_storage_max_patch_files,
+                max_patch_gb=args.tide_storage_max_patch_gb,
+                min_free_gb=args.tide_storage_min_free_gb,
+            )
 
         ssd_schedule_ordering = getattr(args, "ssd_schedule_ordering", "trajectory")
         ssd_schedule_shuffle = ssd_schedule_ordering == "shuffle"
-        ssd_training_schedule = storage_adapter.get_training_schedule(shuffle=ssd_schedule_shuffle)
+        if distributed_enabled:
+            storage_adapter = None
+            ssd_training_schedule = None
+            if distributed_context.is_rank0:
+                storage_adapter = create_storage_adapter()
+                ssd_training_schedule = storage_adapter.get_training_schedule(
+                    shuffle=ssd_schedule_shuffle
+                )
+            ssd_training_schedule = distributed_context.broadcast_object(
+                ssd_training_schedule
+            )
+            if not distributed_context.is_rank0:
+                storage_adapter = create_storage_adapter()
+            distributed_context.barrier()
+        else:
+            storage_adapter = create_storage_adapter()
+            ssd_training_schedule = storage_adapter.get_training_schedule(
+                shuffle=ssd_schedule_shuffle
+            )
+
+        log_file.write(f"[SSD] Execution mode: {args.ssd_execution_mode}\n")
+
         utils.print_rank_0(f"[SSD] Schedule ordering: {ssd_schedule_ordering}")
         log_file.write(f"[SSD] Schedule ordering: {ssd_schedule_ordering}\n")
 
@@ -288,6 +437,32 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 
         _validate_pure_ssd_runtime(args, gaussians, storage_adapter, resolved_backend, log_file)
 
+        distributed_planner = None
+        if distributed_enabled:
+            block_owner = _prepare_distributed_block_owner(
+                args=args,
+                context=distributed_context,
+                storage_adapter=storage_adapter,
+                training_schedule=ssd_training_schedule,
+                resume_manifest=pure_ssd_resume_manifest,
+            )
+            if distributed_context.is_rank0:
+                distributed_planner = DistributedBatchPlanner(
+                    block_owner=block_owner,
+                    total_points=int(storage_adapter.num_points),
+                    block_size=int(storage_adapter.block_size),
+                    world_size=int(distributed_context.world_size),
+                    resident_capacity_blocks=int(args.paper_resident_capacity_blocks),
+                    resident_lambda=float(args.paper_resident_lambda),
+                    resident_recency_decay=float(args.paper_resident_recency_decay),
+                    balanced_seed_fraction=float(args.paper_balanced_seed_fraction),
+                    camera_assignment=str(args.tide_camera_assignment),
+                )
+            log_file.write(
+                f"[DISTRIBUTED] rank={distributed_context.rank}/{distributed_context.world_size} "
+                f"local_gpu={distributed_context.local_rank} per_rank_cap={args.paper_resident_capacity_blocks}\n"
+            )
+
         if pure_ssd_resume_manifest is not None:
             msg = "[PURE SSD RESUME] GPUResidentAdam cold-started; Adam moments are not restored"
             utils.print_rank_0(msg)
@@ -321,11 +496,12 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     progress_bar = tqdm(
         range(1, opt_args.iterations + 1),
         desc="Training progress",
+        disable=distributed_enabled and not distributed_context.is_rank0,
     )
     progress_bar.update(start_from_this_iteration - 1)
     num_trained_batches = 0
 
-    mem_mon = MemMonitor(log_dir=args.model_path, warn_avail_gb=15.0)
+    mem_mon = MemMonitor(log_dir=args.log_folder, warn_avail_gb=15.0)
 
     # Random number generator for camera ordering in retention-based offloading
     perm_generator = torch.Generator(device="cuda")
@@ -393,7 +569,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         nonlocal optimizer_churn_tsv
         if optimizer_churn_tsv is not None:
             return
-        churn_tsv_path = os.path.join(args.model_path, 'optimizer_state_churn_by_epoch.tsv')
+        churn_tsv_path = os.path.join(args.log_folder, 'optimizer_state_churn_by_epoch.tsv')
         optimizer_churn_tsv = open(churn_tsv_path, 'w', buffering=1)
         optimizer_churn_tsv.write(
             'epoch\titeration_end\toptimizer_rows_updated\tcold_restarted_rows_updated\t'
@@ -407,13 +583,29 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     gaussians._paper_optimizer_backend = 'gpu_resident'
     _enable_optimizer_churn_logging("pure_ssd_gpu_resident")
     camera_batch_prefetcher = CameraBatchPrefetcher(train_dataset)
-    initial_camera_schedule = get_camera_batch_schedule(
-        training_schedule=ssd_training_schedule,
-        iteration=start_from_this_iteration,
-        batch_size=args.bsz,
-        schedule_ordering=getattr(args, "ssd_schedule_ordering", "trajectory"),
-    )
-    camera_batch_prefetcher.submit(initial_camera_schedule.batch_indices)
+    current_distributed_plan = None
+    if distributed_enabled:
+        current_distributed_plan, _ = _build_distributed_plan(
+            context=distributed_context,
+            planner=distributed_planner,
+            storage_adapter=storage_adapter,
+            training_schedule=ssd_training_schedule,
+            iteration=start_from_this_iteration,
+            batch_size=args.bsz,
+            schedule_ordering=getattr(args, "ssd_schedule_ordering", "trajectory"),
+        )
+        initial_camera_ids = current_distributed_plan.rank_camera_ids[
+            distributed_context.rank
+        ]
+    else:
+        initial_camera_schedule = get_camera_batch_schedule(
+            training_schedule=ssd_training_schedule,
+            iteration=start_from_this_iteration,
+            batch_size=args.bsz,
+            schedule_ordering=getattr(args, "ssd_schedule_ordering", "trajectory"),
+        )
+        initial_camera_ids = initial_camera_schedule.batch_indices
+    camera_batch_prefetcher.submit(initial_camera_ids)
     # ============================================================================
     # STAGE 2: MAIN TRAINING LOOP
     # ============================================================================
@@ -493,7 +685,21 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             batch_size=args.bsz,
             schedule_ordering=getattr(args, "ssd_schedule_ordering", "trajectory"),
         )
-        batch_indices = schedule_info.batch_indices
+        global_batch_indices = schedule_info.batch_indices
+        if distributed_enabled:
+            if (
+                current_distributed_plan is None
+                or current_distributed_plan.iteration != iteration
+                or current_distributed_plan.global_camera_ids != global_batch_indices
+            ):
+                raise RuntimeError(
+                    f"Distributed plan mismatch at iteration {iteration}"
+                )
+            batch_indices = current_distributed_plan.rank_camera_ids[
+                distributed_context.rank
+            ]
+        else:
+            batch_indices = global_batch_indices
         epoch = schedule_info.epoch
         within_epoch_idx = schedule_info.within_epoch_idx
         n_batches = schedule_info.num_batches
@@ -513,7 +719,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         nvtx.range_pop()
 
         next_iteration = iteration + args.bsz
-        if next_iteration <= opt_args.iterations:
+        if not distributed_enabled and next_iteration <= opt_args.iterations:
             nvtx.range_push("Outer: next_camera_prefetch_submit")
             next_camera_schedule = get_camera_batch_schedule(
                 training_schedule=ssd_training_schedule,
@@ -529,7 +735,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 f"[SSD Schedule] Iter {iteration}: epoch={epoch}, "
                 f"within_epoch_batch={within_epoch_idx}/{n_batches}, "
                 f"camera_offset={epoch_camera_offset}, "
-                f"Camera indices: {batch_indices[:3]}...{batch_indices[-1]}\n"
+                f"Global camera indices: {global_batch_indices[:3]}..."
+                f"{global_batch_indices[-1]}; local={batch_indices}\n"
             )
 
         timers.stop("dataloader: load the next image from disk and decode")
@@ -592,11 +799,18 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             perm_generator=perm_generator,
             storage_adapter=storage_adapter,
             training_schedule=ssd_training_schedule,
+            distributed_plan=current_distributed_plan,
+            distributed_context=distributed_context,
         )
 
         mem_mon.tick(iteration)
 
         if len(losses) == 0:
+            if distributed_enabled:
+                raise RuntimeError(
+                    f"Distributed rank {distributed_context.rank} produced no loss at "
+                    f"iteration {iteration}"
+                )
             log_file.write(
                 f"[WARNING] Iteration {iteration}: All {len(batched_cameras)} cameras see no Gaussians; "
                 "skipping optimizer step.\n"
@@ -608,7 +822,48 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         nvtx.range_push("Outer: loss_sync")
         timers.start("sync_loss_and_log")
         batched_losses = torch.stack(losses)
-        batched_loss_cpu = batched_losses.cpu().numpy()
+        local_loss_cpu = batched_losses.cpu().numpy()
+        if distributed_enabled:
+            local_payload = {
+                "records": [
+                    (
+                        int(camera.global_idx),
+                        float(loss),
+                        str(camera.image_name),
+                    )
+                    for camera, loss in zip(batched_cameras, local_loss_cpu)
+                ],
+                "sparsity": float(sparsity),
+            }
+            rank_payloads = distributed_context.all_gather_object(local_payload)
+            records = [
+                record
+                for payload in rank_payloads
+                for record in payload["records"]
+            ]
+            if len(records) != len(global_batch_indices):
+                raise RuntimeError(
+                    f"Distributed loss count mismatch: got={len(records)} "
+                    f"expected={len(global_batch_indices)}"
+                )
+            by_camera = {camera_id: (loss, image_name) for camera_id, loss, image_name in records}
+            if len(by_camera) != len(global_batch_indices):
+                raise RuntimeError("Distributed camera batch contains duplicate camera IDs")
+            try:
+                ordered_records = [by_camera[camera_id] for camera_id in global_batch_indices]
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"Distributed loss is missing camera {int(exc.args[0])}"
+                ) from exc
+            batched_loss_cpu = np.asarray(
+                [record[0] for record in ordered_records], dtype=np.float32
+            )
+            logged_image_names = [record[1] for record in ordered_records]
+            logged_sparsity = [payload["sparsity"] for payload in rank_payloads]
+        else:
+            batched_loss_cpu = local_loss_cpu
+            logged_image_names = [camera.image_name for camera in batched_cameras]
+            logged_sparsity = sparsity
         nvtx.range_pop()
 
         nvtx.range_push("Outer: batch_logging")
@@ -618,7 +873,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             else 0.6 * ema_loss_for_log + 0.4 * batched_loss_cpu.mean()
         )
 
-        train_dataset.update_losses(batched_loss_cpu)
+        if not distributed_enabled or distributed_context.is_rank0:
+            train_dataset.update_losses(batched_loss_cpu)
 
         batched_loss_cpu = [round(loss, 6) for loss in batched_loss_cpu]
         log_file.write(
@@ -626,11 +882,29 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 iteration,
                 iteration + args.bsz,
                 batched_loss_cpu,
-                sparsity,
-                [viewpoint_cam.image_name for viewpoint_cam in batched_cameras],
+                logged_sparsity,
+                logged_image_names,
             )
         )
+        timers.stop("sync_loss_and_log")
         nvtx.range_pop()
+
+        if distributed_enabled:
+            next_distributed_plan = None
+            if next_iteration <= opt_args.iterations:
+                next_distributed_plan, _ = _build_distributed_plan(
+                    context=distributed_context,
+                    planner=distributed_planner,
+                    storage_adapter=storage_adapter,
+                    training_schedule=ssd_training_schedule,
+                    iteration=next_iteration,
+                    batch_size=args.bsz,
+                    schedule_ordering=getattr(args, "ssd_schedule_ordering", "trajectory"),
+                )
+                camera_batch_prefetcher.submit(
+                    next_distributed_plan.rank_camera_ids[distributed_context.rank]
+                )
+            current_distributed_plan = next_distributed_plan
 
         with torch.no_grad():
             if any(
@@ -685,7 +959,19 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 pure_ssd_checkpoint_mode = str(
                     getattr(args, "pure_ssd_checkpoint_mode", "incremental")
                 ).lower()
-                if pure_ssd_checkpoint_mode == "snapshot":
+                if distributed_enabled:
+                    write_distributed_incremental_checkpoint(
+                        context=distributed_context,
+                        storage_adapter=storage_adapter,
+                        gaussians=gaussians,
+                        checkpoint_dir=save_folder,
+                        iteration=checkpoint_iteration,
+                        next_iteration=iteration + args.bsz,
+                        args=args,
+                        block_owner=args._tide_block_owner,
+                        log_file=log_file,
+                    )
+                elif pure_ssd_checkpoint_mode == "snapshot":
                     write_pure_ssd_snapshot_checkpoint(
                         storage_adapter=storage_adapter,
                         gaussians=gaussians,
@@ -706,11 +992,13 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                         args=args,
                         log_file=log_file,
                     )
-                prune_checkpoint_history(
-                    scene.model_path,
-                    keep_last=getattr(args, "pure_ssd_checkpoint_keep_last", 2),
-                    log_file=log_file,
-                )
+                if not distributed_enabled or distributed_context.is_rank0:
+                    prune_checkpoint_history(
+                        scene.model_path,
+                        keep_last=getattr(args, "pure_ssd_checkpoint_keep_last", 2),
+                        log_file=log_file,
+                    )
+                distributed_context.barrier()
                 end2end_timers.start()
 
         # ------------------------------------------------------------------------
@@ -743,7 +1031,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             if (iteration % args.log_interval) == 1 or (
                 iteration % args.densification_interval
             ) == 0:
-                dump_name = args.model_path + f"/trace_dump/iter={iteration}"
+                dump_name = args.log_folder + f"/trace_dump/iter={iteration}"
                 torch.cuda.memory._dump_snapshot(filename=dump_name)
                 torch.cuda.memory._record_memory_history(enabled=None)
 
@@ -792,8 +1080,10 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     if storage_adapter is not None:
         from strategies.tide_engine.engine import shutdown_double_buffer_gpu
 
+        distributed_context.barrier()
         storage_adapter.shutdown()
         shutdown_double_buffer_gpu()
+        distributed_context.barrier()
 
     scene.clean_up()
 
@@ -817,39 +1107,48 @@ if __name__ == "__main__":
     init_args(args)
 
     args = utils.get_args()
+    distributed_context = DistributedContext.initialize(args)
+    root_log_folder = args.log_folder
 
-    # create log folder
+    if distributed_context.is_rank0:
+        os.makedirs(root_log_folder, exist_ok=True)
+        os.makedirs(args.model_path, exist_ok=True)
+        serializable_args = {
+            key: value for key, value in vars(args).items() if not key.startswith("_")
+        }
+        with open(os.path.join(root_log_folder, "args.json"), "w") as f:
+            json.dump(serializable_args, f, default=str)
+    distributed_context.barrier()
+
+    if distributed_context.enabled and not distributed_context.is_rank0:
+        args.log_folder = os.path.join(
+            root_log_folder, f"rank_{distributed_context.rank}"
+        )
     os.makedirs(args.log_folder, exist_ok=True)
-    os.makedirs(args.model_path, exist_ok=True)
-    with open(args.log_folder + "/args.json", "w") as f:
-        json.dump(vars(args), f)
-
-    # create cuda trace dump folder
     if args.trace_cuda_mem:
-        os.makedirs(os.path.join(args.model_path, "trace_dump"))
+        os.makedirs(os.path.join(args.log_folder, "trace_dump"), exist_ok=True)
 
-    # Initialize log file and print all args
     log_file = open(
-        args.log_folder + "/python.log",
+        os.path.join(args.log_folder, "python.log"),
         "a" if args.auto_start_checkpoint else "w",
     )
     utils.set_log_file(log_file)
 
-    # Initialize system state (RNG). In quiet mode regular stdout is mirrored to
-    # python.log, while tqdm progress bars still use stderr for terminal progress.
-    safe_state(args.quiet, log_file=log_file)
-    # torch.autograd.set_detect_anomaly(args.detect_anomaly)
+    try:
+        worker_quiet = args.quiet or (
+            distributed_context.enabled and not distributed_context.is_rank0
+        )
+        safe_state(worker_quiet, log_file=log_file)
+        print_all_args(args, log_file)
 
-    print_all_args(args, log_file)
+        p = psutil.Process()
+        log_file.write(
+            f"Initial pinned memory: {p.memory_info().shared / 1024 / 1024 / 1024} GB\n"
+        )
 
-    p = psutil.Process()
-    log_file.write(
-        f"Initial pinned memory: {p.memory_info().shared / 1024 / 1024 / 1024} GB\n"
-    )
-
-    training(lp.extract(args), op.extract(args), pp.extract(args), args, log_file)
-
-    # All done
-    utils.print_rank_0("\nTraining complete.")
-    log_file.flush()
-    log_file.close()
+        training(lp.extract(args), op.extract(args), pp.extract(args), args, log_file)
+        utils.print_rank_0("\nTraining complete.")
+    finally:
+        log_file.flush()
+        log_file.close()
+        distributed_context.close()

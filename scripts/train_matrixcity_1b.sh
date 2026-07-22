@@ -8,6 +8,7 @@ cd "${REPO_ROOT}"
 TRAIN_ENTRY="${REPO_ROOT}/train_tidegs.py"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 GPU="${GPU:-7}"
+GPUS="${GPUS:-${GPU}}"
 ROOT="${ROOT:-${REPO_ROOT}/outputs/tidegs}"
 SRC="${SRC:-${MATRIXCITY_SCENE_DIR:-}}"
 PLY="${PLY:-${TIDEGS_DENSE_PLY:-}}"
@@ -50,6 +51,10 @@ CAPACITY_LIST="2048"
 CHECKPOINT_ITER=500
 RESUME_TO_ITER=1000
 START_CHECKPOINT=""
+DISTRIBUTED_MODE="${DISTRIBUTED_MODE:-off}"
+CAMERA_ASSIGNMENT="${CAMERA_ASSIGNMENT:-gaussian_balanced}"
+CAMERA_MICROBATCH="${CAMERA_MICROBATCH:-4}"
+OWNER_BALANCE_SAMPLES="${OWNER_BALANCE_SAMPLES:-256}"
 
 usage() {
   cat <<USAGE
@@ -64,6 +69,11 @@ Modes:
 Options:
   --mode MODE                 train|checkpoint|resume|summary
   --gpu ID                    GPU id (default: ${GPU})
+  --gpus LIST                 Comma-separated GPUs; enables gaussian_sharded mode
+  --distributed-mode MODE     off|gaussian_sharded (default: ${DISTRIBUTED_MODE})
+  --camera-assignment MODE    equal|gaussian_balanced (default: ${CAMERA_ASSIGNMENT})
+  --camera-microbatch N       Cameras per rank per gsplat call (default: ${CAMERA_MICROBATCH})
+  --owner-balance-samples N   Cameras sampled for static block ownership (default: ${OWNER_BALANCE_SAMPLES})
   --run-tag TAG               Experiment tag (default: timestamped)
   --root DIR                  Large output root (default: ${ROOT})
   --src DIR                   MatrixCity source dir
@@ -76,8 +86,8 @@ Options:
   --debug-max-train-cameras N Camera cap; -1 uses all training cameras (default: ${DEBUG_MAX_TRAIN_CAMERAS})
   --debug-camera-sample-mode M linspace|contiguous|window (default: ${DEBUG_CAMERA_SAMPLE_MODE})
   --debug-camera-sample-start N Start index for window mode (default: ${DEBUG_CAMERA_SAMPLE_START})
-  --bsz N                     Single batch size for release runs
-  --capacity N                Single resident block capacity for release runs
+  --bsz N                     Global batch size for release runs
+  --capacity N                Resident block capacity per rank
   --bsz-list "LIST"           Batch sizes for sweeps (default: "${BSZ_LIST}")
   --capacity-list "LIST"      Resident block capacities for sweeps (default: "${CAPACITY_LIST}")
   --projection-chunk N        projection_max_cameras_per_chunk (default: ${PROJECTION_CHUNK})
@@ -105,7 +115,8 @@ Options:
   --dry-run                   Write commands.sh only
 
 Environment overrides:
-  PYTHON_BIN, GPU, ROOT, SRC, PLY, MANIFEST, MATRIXCITY_SCENE_DIR,
+  PYTHON_BIN, GPU, GPUS, DISTRIBUTED_MODE, CAMERA_ASSIGNMENT,
+  CAMERA_MICROBATCH, OWNER_BALANCE_SAMPLES, ROOT, SRC, PLY, MANIFEST, MATRIXCITY_SCENE_DIR,
   TIDEGS_DENSE_PLY, TIDEGS_PREBUILT_MANIFEST, SCHED_CACHE, OUT_ROOT,
   CACHE_ROOT, RUN_TAG
 USAGE
@@ -114,7 +125,12 @@ USAGE
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode) MODE="$2"; shift 2 ;;
-    --gpu) GPU="$2"; shift 2 ;;
+    --gpu) GPU="$2"; GPUS="$2"; shift 2 ;;
+    --gpus) GPUS="$2"; DISTRIBUTED_MODE="gaussian_sharded"; shift 2 ;;
+    --distributed-mode) DISTRIBUTED_MODE="$2"; shift 2 ;;
+    --camera-assignment) CAMERA_ASSIGNMENT="$2"; shift 2 ;;
+    --camera-microbatch) CAMERA_MICROBATCH="$2"; shift 2 ;;
+    --owner-balance-samples) OWNER_BALANCE_SAMPLES="$2"; shift 2 ;;
     --run-tag) RUN_TAG="$2"; shift 2 ;;
     --root)
       ROOT="$2"
@@ -200,6 +216,41 @@ case "${SCHEDULE_ORDERING}" in
   trajectory|shuffle) ;;
   *) echo "Invalid --schedule-ordering '${SCHEDULE_ORDERING}'" >&2; usage >&2; exit 1 ;;
 esac
+case "${DISTRIBUTED_MODE}" in
+  off|gaussian_sharded) ;;
+  *) echo "Invalid --distributed-mode '${DISTRIBUTED_MODE}'" >&2; usage >&2; exit 1 ;;
+esac
+case "${CAMERA_ASSIGNMENT}" in
+  equal|gaussian_balanced) ;;
+  *) echo "Invalid --camera-assignment '${CAMERA_ASSIGNMENT}'" >&2; usage >&2; exit 1 ;;
+esac
+
+IFS=',' read -r -a GPU_IDS <<< "${GPUS}"
+GPU_COUNT="${#GPU_IDS[@]}"
+if [[ "${MODE}" != "summary" ]]; then
+  if [[ "${DISTRIBUTED_MODE}" == "gaussian_sharded" ]]; then
+    if (( GPU_COUNT <= 1 )); then
+      echo "gaussian_sharded mode requires at least two GPU ids" >&2
+      exit 1
+    fi
+    if [[ "${CHECKPOINT_MODE}" != "incremental" ]]; then
+      echo "gaussian_sharded mode supports only incremental checkpoints" >&2
+      exit 1
+    fi
+    if [[ "${MODE}" != "resume" && -z "${MANIFEST}" ]]; then
+      echo "gaussian_sharded mode requires --manifest for a fresh run" >&2
+      exit 1
+    fi
+  elif (( GPU_COUNT != 1 )); then
+    echo "Multiple GPU ids require --distributed-mode gaussian_sharded" >&2
+    exit 1
+  fi
+fi
+
+DISTRIBUTED_TAG=""
+if [[ "${DISTRIBUTED_MODE}" == "gaussian_sharded" ]]; then
+  DISTRIBUTED_TAG="_dist${GPU_COUNT}_${CAMERA_ASSIGNMENT}"
+fi
 
 RUN_ROOT="${OUT_ROOT}/${RUN_TAG}"
 COMMANDS="${RUN_ROOT}/commands.sh"
@@ -231,17 +282,17 @@ append_train_command() {
   local start_checkpoint="${10}"
   local model_path="${RUN_ROOT}/${run_name}"
   local cache_dir="${CACHE_ROOT}/${RUN_TAG}/${run_name}"
-  local checkpoint_args=()
-  local resume_args=()
-  local prebuilt_args=()
 
-  if [[ -n "${checkpoint_iter}" ]]; then
-    checkpoint_args=(--checkpoint_iterations "${checkpoint_iter}")
-  fi
-  if [[ -n "${start_checkpoint}" ]]; then
-    resume_args=(--start_checkpoint "${start_checkpoint}")
-  elif [[ -n "${MANIFEST}" ]]; then
-    prebuilt_args=(--pure_ssd_prebuilt_manifest "${MANIFEST}")
+  if [[ "${DISTRIBUTED_MODE}" == "gaussian_sharded" ]]; then
+    if (( bsz % GPU_COUNT != 0 )); then
+      echo "Global bsz=${bsz} must be divisible by GPU count=${GPU_COUNT}" >&2
+      return 1
+    fi
+    local local_bsz=$((bsz / GPU_COUNT))
+    if (( CAMERA_MICROBATCH > local_bsz || local_bsz % CAMERA_MICROBATCH != 0 )); then
+      echo "camera-microbatch=${CAMERA_MICROBATCH} must divide local bsz=${local_bsz}" >&2
+      return 1
+    fi
   fi
 
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -253,13 +304,25 @@ append_train_command() {
     printf 'PYTHONDONTWRITEBYTECODE=1 \\\n'
     printf 'PYTHONWARNINGS=%q \\\n' "ignore:TORCH_CUDA_ARCH_LIST is not set:UserWarning"
     printf 'PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\\n'
-    printf 'CUDA_VISIBLE_DEVICES=%q %q \\\n' "${GPU}" "${PYTHON_BIN}"
-    printf '  %q \\\n' "${TRAIN_ENTRY}"
+    if [[ "${DISTRIBUTED_MODE}" == "gaussian_sharded" ]]; then
+      printf 'CUDA_VISIBLE_DEVICES=%q %q -m torch.distributed.run \\\n' "${GPUS}" "${PYTHON_BIN}"
+      printf '  --standalone \\\n'
+      printf '  --nnodes=1 \\\n'
+      printf '  --nproc_per_node=%q \\\n' "${GPU_COUNT}"
+      printf '  %q \\\n' "${TRAIN_ENTRY}"
+    else
+      printf 'CUDA_VISIBLE_DEVICES=%q %q \\\n' "${GPUS}" "${PYTHON_BIN}"
+      printf '  %q \\\n' "${TRAIN_ENTRY}"
+    fi
     printf '  -s %q \\\n' "${SRC}"
     printf '  --model_path %q \\\n' "${model_path}"
     printf '  --iterations %q \\\n' "${iterations}"
-    for arg in "${checkpoint_args[@]}"; do printf '  %q \\\n' "${arg}"; done
-    for arg in "${resume_args[@]}"; do printf '  %q \\\n' "${arg}"; done
+    if [[ -n "${checkpoint_iter}" ]]; then
+      printf '  --checkpoint_iterations %q \\\n' "${checkpoint_iter}"
+    fi
+    if [[ -n "${start_checkpoint}" ]]; then
+      printf '  --start_checkpoint %q \\\n' "${start_checkpoint}"
+    fi
     printf '  --dense_ply_file %q \\\n' "${PLY}"
     if [[ -n "${DECODE_DATASET_PATH}" ]]; then
       printf '  --decode_dataset_path %q \\\n' "${DECODE_DATASET_PATH}"
@@ -277,7 +340,9 @@ append_train_command() {
     printf '  --use_ssd_offload \\\n'
     printf '  --pure_ssd_offload \\\n'
     printf '  --pure_ssd_init_backend streaming \\\n'
-    for arg in "${prebuilt_args[@]}"; do printf '  %q \\\n' "${arg}"; done
+    if [[ -z "${start_checkpoint}" && -n "${MANIFEST}" ]]; then
+      printf '  --pure_ssd_prebuilt_manifest %q \\\n' "${MANIFEST}"
+    fi
     printf '  --use_6plane \\\n'
     printf '  --ssd_cache_dir %q \\\n' "${cache_dir}"
     printf '  --gaussian_block_size 4096 \\\n'
@@ -293,6 +358,12 @@ append_train_command() {
     printf '  --tide_balanced_seed_fraction %q \\\n' "${balanced_seed_fraction}"
     printf '  --tide_resident_capacity_blocks %q \\\n' "${capacity}"
     printf '  --tide_optimizer_state_mode resident_blocks \\\n'
+    printf '  --tide_distributed_mode %q \\\n' "${DISTRIBUTED_MODE}"
+    if [[ "${DISTRIBUTED_MODE}" == "gaussian_sharded" ]]; then
+      printf '  --tide_camera_assignment %q \\\n' "${CAMERA_ASSIGNMENT}"
+      printf '  --tide_camera_microbatch %q \\\n' "${CAMERA_MICROBATCH}"
+      printf '  --tide_owner_balance_samples %q \\\n' "${OWNER_BALANCE_SAMPLES}"
+    fi
     printf '  --projection_max_cameras_per_chunk %q \\\n' "${PROJECTION_CHUNK}"
     printf '  --pure_ssd_checkpoint_mode %q \\\n' "${CHECKPOINT_MODE}"
     printf '  --pure_ssd_checkpoint_patch_mode %q \\\n' "${CHECKPOINT_PATCH_MODE}"
@@ -322,7 +393,7 @@ if [[ "${MODE}" == "train" ]]; then
             decay_tag="${resident_decay//./p}"
             append_train_command \
               "train" \
-              "train_bsz${bsz}_cap${capacity}_lam${lambda_tag}_decay${decay_tag}_seed${fraction_tag}_iter${ITERATIONS}" \
+              "train_bsz${bsz}_cap${capacity}_lam${lambda_tag}_decay${decay_tag}_seed${fraction_tag}_iter${ITERATIONS}${DISTRIBUTED_TAG}" \
               "${bsz}" "${capacity}" "${resident_lambda}" "${resident_decay}" "${balanced_seed_fraction}" "${ITERATIONS}" "" ""
           done
         done
@@ -340,7 +411,7 @@ elif [[ "${MODE}" == "checkpoint" ]]; then
   decay_tag="${resident_decay//./p}"
   append_train_command \
     "checkpoint" \
-    "ckpt_bsz${bsz}_cap${capacity}_lam${lambda_tag}_decay${decay_tag}_seed${fraction_tag}_iter1000_ckpt${CHECKPOINT_ITER}" \
+    "ckpt_bsz${bsz}_cap${capacity}_lam${lambda_tag}_decay${decay_tag}_seed${fraction_tag}_iter1000_ckpt${CHECKPOINT_ITER}${DISTRIBUTED_TAG}" \
     "${bsz}" "${capacity}" "${resident_lambda}" "${resident_decay}" "${balanced_seed_fraction}" "1000" "${CHECKPOINT_ITER}" ""
 elif [[ "${MODE}" == "resume" ]]; then
   if [[ -z "${START_CHECKPOINT}" ]]; then
@@ -357,7 +428,7 @@ elif [[ "${MODE}" == "resume" ]]; then
   decay_tag="${resident_decay//./p}"
   append_train_command \
     "resume" \
-    "resume_bsz${bsz}_cap${capacity}_lam${lambda_tag}_decay${decay_tag}_seed${fraction_tag}_to${RESUME_TO_ITER}" \
+    "resume_bsz${bsz}_cap${capacity}_lam${lambda_tag}_decay${decay_tag}_seed${fraction_tag}_to${RESUME_TO_ITER}${DISTRIBUTED_TAG}" \
     "${bsz}" "${capacity}" "${resident_lambda}" "${resident_decay}" "${balanced_seed_fraction}" "${RESUME_TO_ITER}" "" "${START_CHECKPOINT}"
 fi
 

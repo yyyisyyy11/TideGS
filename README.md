@@ -60,9 +60,11 @@ cd TideGS
 pip install -r requirements.txt
 pip install --no-build-isolation submodules/clm_kernels
 pip install submodules/fast-tsp
-pip install --no-build-isolation submodules/gsplat
 pip install --no-build-isolation submodules/simple-knn
 ```
+
+The four-GPU path uses the official `gsplat==1.5.3` distributed rasterizer,
+which is installed by `requirements.txt`.
 
 Set PyTorch allocation behavior before training:
 
@@ -201,6 +203,33 @@ projection camera chunk: 2
 RAM cache budget: 32 GB
 checkpoint mode: incremental
 ```
+
+### Four-GPU Gaussian Sharding
+
+Use one process per GPU. `--bsz` is global, while resident capacity and RAM
+cache limits are per rank. A fresh distributed run requires a prebuilt SSD
+manifest so all ranks can share the immutable base file.
+
+```bash
+RUN_TAG=$(date +"%Y%m%d_%H%M%S")_tidegs_1b_4gpu \
+bash scripts/train_matrixcity_1b.sh \
+  --mode train \
+  --gpus 0,1,2,3 \
+  --bsz 16 \
+  --capacity 2048 \
+  --camera-assignment gaussian_balanced \
+  --camera-microbatch 4 \
+  --debug-max-train-cameras -1 \
+  --src "$MATRIXCITY_SCENE_DIR" \
+  --ply "$TIDEGS_DENSE_PLY" \
+  --manifest "$TIDEGS_PREBUILT_MANIFEST" \
+  --decode-dataset-path "$TIDEGS_DECODE_CACHE" \
+  --root "$TIDEGS_ROOT"
+```
+
+This configuration assigns every block to exactly one rank, gives each rank
+four cameras per synchronized step, and enforces a 2048-block resident cap per
+rank. Distributed checkpoints must be resumed with the same world size.
 
 ## Checkpoint And Resume
 

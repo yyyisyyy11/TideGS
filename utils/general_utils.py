@@ -116,7 +116,8 @@ def inc_densify_iter():
 
 
 def print_rank_0(str):
-    print(str)
+    if int(os.environ.get("RANK", "0")) == 0:
+        print(str)
 
 
 def check_enable_python_timer():
@@ -388,7 +389,10 @@ def safe_state(silent, log_file=None):
     random.seed(0)
     np.random.seed(0)
     torch.manual_seed(0)
-    torch.cuda.set_device(torch.device("cuda", 0))
+    if torch.cuda.is_available():
+        args = get_args()
+        device_index = int(getattr(args, "gpu", 0)) if args is not None else 0
+        torch.cuda.set_device(torch.device("cuda", device_index))
 
 
 def prepare_output_and_logger(args):

@@ -210,6 +210,10 @@ class AuxiliaryParams(ParamGroup):
         self.paper_block_reader_backend = "auto"  # {auto, unified_params, tiered_cache}; source for per-iteration block reads
         self.paper_free_unified_params = False  # release _unified_params after init to unlock >100GB scenes; requires paper_block_reader_backend != unified_params and paper_optimizer_backend=gpu_resident
         self.paper_debug_logging = False  # Enable verbose TideGS diagnostics for development runs
+        self.tide_distributed_mode = "off"  # {off, gaussian_sharded}; explicit torchrun mode
+        self.tide_camera_assignment = "equal"  # {equal, gaussian_balanced}; camera identity placement
+        self.tide_camera_microbatch = 4  # Cameras rendered per distributed gsplat call
+        self.tide_owner_balance_samples = 256  # Camera samples used to weight the static block-owner map
         # Public TideGS aliases. These map onto the internal paper_* names for
         # checkpoint and args.json compatibility.
         self.tide_optimizer_deferred_mode = ""
@@ -398,10 +402,13 @@ def find_latest_checkpoint(log_folder):
             has_pure_ssd_manifest = os.path.exists(
                 os.path.join(folder_path, "pure_ssd_checkpoint.json")
             )
+            has_distributed_manifest = os.path.exists(
+                os.path.join(folder_path, "pure_ssd_distributed_checkpoint.json")
+            )
             has_legacy_pth = any(
                 file_name.endswith(".pth") for file_name in os.listdir(folder_path)
             )
-            if has_pure_ssd_manifest or has_legacy_pth:
+            if has_pure_ssd_manifest or has_distributed_manifest or has_legacy_pth:
                 valid_checkpoints.append((iteration, folder_path))
         if valid_checkpoints:
             valid_checkpoints.sort(key=lambda x: x[0], reverse=True)
@@ -469,6 +476,8 @@ def init_args(args):
 
     # Logging are saved with where model is saved.
     args.log_folder = args.model_path
+    if args.auto_start_checkpoint:
+        args.start_checkpoint = find_latest_checkpoint(args.log_folder)
 
     if hasattr(args, "ssd_execution_mode"):
         args.ssd_execution_mode = str(args.ssd_execution_mode).lower()
@@ -480,6 +489,24 @@ def init_args(args):
         assert args.paper_optimizer_deferred_mode in {"off", "same_iter", "cross_iter"}, (
             "Invalid paper_optimizer_deferred_mode="
             f"{args.paper_optimizer_deferred_mode!r}; expected one of off, same_iter, cross_iter"
+        )
+    if hasattr(args, "tide_distributed_mode"):
+        args.tide_distributed_mode = str(args.tide_distributed_mode).lower()
+        assert args.tide_distributed_mode in {"off", "gaussian_sharded"}, (
+            "tide_distributed_mode must be off or gaussian_sharded"
+        )
+    if hasattr(args, "tide_camera_assignment"):
+        args.tide_camera_assignment = str(args.tide_camera_assignment).lower()
+        assert args.tide_camera_assignment in {"equal", "gaussian_balanced"}, (
+            "tide_camera_assignment must be equal or gaussian_balanced"
+        )
+    if hasattr(args, "tide_camera_microbatch"):
+        args.tide_camera_microbatch = int(args.tide_camera_microbatch)
+        assert args.tide_camera_microbatch > 0, "tide_camera_microbatch must be positive"
+    if hasattr(args, "tide_owner_balance_samples"):
+        args.tide_owner_balance_samples = int(args.tide_owner_balance_samples)
+        assert args.tide_owner_balance_samples >= 0, (
+            "tide_owner_balance_samples must be non-negative"
         )
     if hasattr(args, "paper_resident_selection_policy"):
         args.paper_resident_selection_policy = str(args.paper_resident_selection_policy).lower()
@@ -715,8 +742,16 @@ def init_args(args):
         )
         pure_ssd_checkpoint_resume = bool(
             getattr(args, "start_checkpoint", "")
-            and os.path.isfile(
-                os.path.join(args.start_checkpoint, "pure_ssd_checkpoint.json")
+            and (
+                os.path.isfile(
+                    os.path.join(args.start_checkpoint, "pure_ssd_checkpoint.json")
+                )
+                or os.path.isfile(
+                    os.path.join(
+                        args.start_checkpoint,
+                        "pure_ssd_distributed_checkpoint.json",
+                    )
+                )
             )
         )
         if (
@@ -728,8 +763,27 @@ def init_args(args):
                 "pure SSD streaming init requires --debug_fast_init_scales; full distCUDA2 init is not out-of-core"
             )
 
-    if args.auto_start_checkpoint:
-        args.start_checkpoint = find_latest_checkpoint(args.log_folder)
+    if getattr(args, "tide_distributed_mode", "off") == "gaussian_sharded":
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        assert world_size > 1, (
+            "gaussian_sharded mode must be launched with torchrun and WORLD_SIZE > 1"
+        )
+        assert int(args.bsz) % world_size == 0, (
+            f"global --bsz={args.bsz} must be divisible by WORLD_SIZE={world_size}"
+        )
+        local_cameras = int(args.bsz) // world_size
+        assert int(args.tide_camera_microbatch) <= local_cameras, (
+            "tide_camera_microbatch cannot exceed the per-rank camera count"
+        )
+        assert local_cameras % int(args.tide_camera_microbatch) == 0, (
+            "per-rank camera count must be divisible by tide_camera_microbatch"
+        )
+        assert getattr(args, "pure_ssd_checkpoint_mode", "incremental") == "incremental", (
+            "gaussian_sharded mode currently supports incremental checkpoints only"
+        )
+        assert bool(getattr(args, "pure_ssd_prebuilt_manifest", "")) or bool(
+            getattr(args, "start_checkpoint", "")
+        ), "gaussian_sharded mode requires a prebuilt manifest or distributed checkpoint"
 
     # sort test_iterations
     args.test_iterations.sort()

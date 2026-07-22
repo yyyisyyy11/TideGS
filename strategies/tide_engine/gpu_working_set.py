@@ -180,6 +180,7 @@ class PendingBlockWriteback:
         return result
 
     def release(self) -> None:
+        self.gpu_refs.clear()
         if self.release_event is not None:
             self.release_event.set()
 
@@ -451,6 +452,7 @@ class GPUWorkingSet:
         enable_retention: bool = True,
         unified_params: 'torch.Tensor | None' = None,
         block_reader: 'Optional[object]' = None,
+        allow_gpu_hotspots: bool = False,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, int]]:
         """
         Load visible blocks with resident-block overlap reuse.
@@ -470,6 +472,8 @@ class GPUWorkingSet:
                 ``BlockReader`` protocol from ``storage.block_reader`` and expose a
                 ``layout`` attribute (``BlockLayout.UNIFIED`` or ``BlockLayout.CACHE``).
                 When provided, it supersedes both older parameters.
+            allow_gpu_hotspots: Preserve overlapping GPU blocks while using the
+                block reader for cold blocks. The caller must flush dirty evictions.
             
         Returns:
             Tuple of:
@@ -558,7 +562,7 @@ class GPUWorkingSet:
         # between iterations.
         ssd_mode = (block_reader is not None) or (unified_params is not None)
         can_use_gpu_hotspots = (
-            not ssd_mode
+            (not ssd_mode or allow_gpu_hotspots)
             and hotspot_count > 0
             and self.gpu_xyz is not None
         )
@@ -984,7 +988,13 @@ class GPUWorkingSet:
             packed_cpu,
             ready_event,
             release_event=release_event,
-            gpu_refs=[packed_gpu, source_starts, row_counts, output_starts],
+            gpu_refs=[
+                packed_gpu,
+                source_starts,
+                row_counts,
+                output_starts,
+                *sources.values(),
+            ],
         )
 
     def stage_block_bounds(

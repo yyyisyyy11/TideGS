@@ -1803,6 +1803,8 @@ def train_tide_batch(
     perm_generator,
     storage_adapter,
     training_schedule,
+    distributed_plan=None,
+    distributed_context=None,
 ):
     """Train one batch through the TideGS out-of-core engine."""
     args = getattr(gaussians, "args", None)
@@ -1818,6 +1820,21 @@ def train_tide_batch(
         raise RuntimeError("Pure SSD/Tide release path requires storage_adapter.execution_mode == 'paper'.")
     if training_schedule is None:
         raise RuntimeError("Pure SSD/Tide release path requires a camera training schedule.")
+
+    if str(getattr(args, "tide_distributed_mode", "off")).lower() == "gaussian_sharded":
+        if distributed_plan is None or distributed_context is None:
+            raise RuntimeError("Distributed TideGS requires a batch plan and distributed context")
+        from .distributed_engine import train_distributed_tide_batch
+
+        return train_distributed_tide_batch(
+            gaussians=gaussians,
+            scene=scene,
+            batched_cameras=batched_cameras,
+            background=background,
+            storage_adapter=storage_adapter,
+            plan=distributed_plan,
+            context=distributed_context,
+        )
 
     # Keep this import lazy while engine.py remains the shared execution core.
     # engine.py imports this module for TideGS helpers, so a module-level import

@@ -160,6 +160,8 @@ class TideStorageAdapter:
         self._bounds_change_log = OrderedDict()
         self._bounds_change_history_limit = 64
         self.streaming_init_manifest = None
+        self.block_owner = None
+        self.owner_rank = None
 
         resume_manifest = getattr(gaussians, "_pure_ssd_resume_manifest", None)
         use_pure_ssd_resume = bool(getattr(gaussians, "_pure_ssd_resume_pending", False))
@@ -206,6 +208,34 @@ class TideStorageAdapter:
             self._initialize_cameras()
         self._initialize_pipeline()
         print("[TideStorageAdapter] Initialization complete")
+
+    def configure_block_ownership(self, block_owner, owner_rank: int) -> None:
+        owner = np.asarray(block_owner, dtype=np.int32)
+        if owner.shape != (int(self.num_blocks),):
+            raise ValueError(
+                f"Expected block_owner shape {(int(self.num_blocks),)}, got {owner.shape}"
+            )
+        owner_rank = int(owner_rank)
+        if owner_rank < 0:
+            raise ValueError(f"Invalid owner_rank={owner_rank}")
+        self.block_owner = owner
+        self.owner_rank = owner_rank
+
+    def _validate_owned_block_ids(self, block_ids, operation: str) -> None:
+        if self.block_owner is None:
+            return
+        invalid = [
+            int(block_id)
+            for block_id in block_ids
+            if int(block_id) < 0
+            or int(block_id) >= len(self.block_owner)
+            or int(self.block_owner[int(block_id)]) != self.owner_rank
+        ]
+        if invalid:
+            raise RuntimeError(
+                f"Rank {self.owner_rank} attempted {operation} for non-owner blocks "
+                f"{invalid[:8]}"
+            )
 
     def _log(self, message: str) -> None:
         if bool(getattr(self, "paper_debug_logging", False)):
@@ -299,6 +329,7 @@ class TideStorageAdapter:
         bounds_managed_externally: bool = False,
     ) -> int:
         block_ids = list(getattr(payload, "block_ids", []))
+        self._validate_owned_block_ids(block_ids, "cache writeback")
         if not block_ids:
             release = getattr(payload, "release", None)
             if callable(release):
@@ -962,6 +993,8 @@ class TideStorageAdapter:
         if not updated_blocks_dict:
             return 0
 
+        self._validate_owned_block_ids(updated_blocks_dict.keys(), "cache update")
+
         staged = len(updated_blocks_dict)
         self.execution_metrics["paper_cache_sync_calls"] += 1
         self.execution_metrics["paper_cache_sync_blocks"] += staged
@@ -973,6 +1006,7 @@ class TideStorageAdapter:
 
     def async_sync_updated_blocks(self, updated_blocks_dict: Dict[int, torch.Tensor]):
         if updated_blocks_dict:
+            self._validate_owned_block_ids(updated_blocks_dict.keys(), "async cache update")
             self.cache.upsert_dirty_block_batch(updated_blocks_dict)
             self.refresh_block_bounds_from_blocks(updated_blocks_dict)
 

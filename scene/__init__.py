@@ -72,7 +72,7 @@ class Scene:
                 is_debug=args.debug,
             )
 
-        if not self.loaded_iter:
+        if not self.loaded_iter and int(os.environ.get("RANK", "0")) == 0:
             # with open(scene_info.ply_path, "rb") as src_file, open(
             #     os.path.join(self.model_path, "input.ply"), "wb"
             # ) as dest_file:
