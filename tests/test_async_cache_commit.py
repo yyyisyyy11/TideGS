@@ -66,6 +66,8 @@ class _WorkingSet:
 class AsyncCacheCommitTest(unittest.TestCase):
     def setUp(self):
         self.adapter = TideStorageAdapter.__new__(TideStorageAdapter)
+        self.adapter.block_owner = None
+        self.adapter.owner_rank = None
         self.adapter.execution_metrics = {
             "paper_cache_sync_calls": 0,
             "paper_cache_sync_blocks": 0,
