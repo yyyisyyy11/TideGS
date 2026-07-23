@@ -331,14 +331,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     ssd_training_schedule = None
 
     with torch.no_grad():
-        if distributed_enabled:
-            scene = Scene(args, gaussians) if distributed_context.is_rank0 else None
-            distributed_context.barrier()
-            if not distributed_context.is_rank0:
-                scene = Scene(args, gaussians)
-            distributed_context.barrier()
-        else:
-            scene = Scene(args, gaussians)
+        scene = Scene(args, gaussians)
         utils.print_rank_0("[SSD] Initializing Tide storage engine...")
         storage_dir = (
             os.path.join(args.ssd_cache_dir, f"rank_{distributed_context.rank}")
