@@ -10,6 +10,7 @@ import torch
 
 
 MIN_DISTRIBUTED_GSPLAT = (1, 5, 3)
+PACKED_DISTRIBUTED_FIX = "image_ids = camera_ids"
 
 
 def _version_tuple(value: str) -> Tuple[int, ...]:
@@ -20,6 +21,21 @@ def _version_tuple(value: str) -> Tuple[int, ...]:
             break
         parts.append(int(digits))
     return tuple(parts)
+
+
+def _require_packed_distributed_fix(gsplat, version: Tuple[int, ...]) -> None:
+    if version[:3] != (1, 5, 3):
+        return
+    try:
+        source = inspect.getsource(gsplat.rasterization)
+    except (OSError, TypeError):
+        return
+    if PACKED_DISTRIBUTED_FIX not in source:
+        raise RuntimeError(
+            "gsplat 1.5.3 has an unsafe packed distributed rasterization path. "
+            "Run `python tools/patch_gsplat_distributed_packed.py` in the TideGS "
+            "environment before launching distributed training."
+        )
 
 
 @lru_cache(maxsize=1)
@@ -36,6 +52,7 @@ def require_distributed_gsplat():
     signature = inspect.signature(gsplat.rasterization)
     if "distributed" not in signature.parameters:
         raise RuntimeError("Installed gsplat.rasterization has no distributed parameter")
+    _require_packed_distributed_fix(gsplat, version)
     return gsplat
 
 
