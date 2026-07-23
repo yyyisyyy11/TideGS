@@ -84,7 +84,7 @@ class FakeStorage:
 
         return {block_id: self.data[block_id].clone() for block_id in block_ids}
 
-    def write_patch(self, dirty_blocks):
+    def write_patch(self, dirty_blocks, block_versions=None):
         return None
 
 
@@ -134,6 +134,32 @@ class TieredCacheSingleFlightTest(unittest.TestCase):
         )
         self.assertEqual(cache.dirty_set, {5, 6})
 
+    def test_stale_cache_commit_cannot_overwrite_newer_version(self):
+        storage = FakeStorage(block_size=2, point_dim=3)
+        cache = self.make_cache(storage)
+        newer = torch.full((2, 3), 20.0)
+        stale = torch.full((2, 3), 10.0)
+
+        self.assertEqual(
+            cache.upsert_dirty_block_batch(
+                {5: newer},
+                block_versions={5: 2},
+                origin_iteration=33,
+            ),
+            1,
+        )
+        self.assertEqual(
+            cache.upsert_dirty_block_batch(
+                {5: stale},
+                block_versions={5: 1},
+                origin_iteration=1,
+            ),
+            0,
+        )
+        self.assertTrue(torch.equal(cache.cache_data[5], newer))
+        self.assertEqual(cache.get_block_versions([5]), {5: 2})
+        self.assertEqual(cache.block_origin_iterations[5], 33)
+
     def test_future_read_serves_urgent_without_second_ssd_read(self):
         storage = FakeStorage()
         storage.block_first_read = True
@@ -158,6 +184,8 @@ class TieredCacheSingleFlightTest(unittest.TestCase):
         self.assertEqual(stats["urgent_prefetch_blocks"], 0)
         self.assertEqual(stats["future_prefetch_reserved"], 1)
         self.assertGreaterEqual(stats["inflight_wait_blocks"], 1)
+        events = cache.drain_io_events()
+        self.assertEqual(events[-1]["operation"], "ssd_read_future")
 
     def test_future_hint_skips_block_already_claimed_by_urgent(self):
         storage = FakeStorage()

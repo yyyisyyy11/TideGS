@@ -112,7 +112,12 @@ class BlockReader(Protocol):
     ) -> BlockBatch:
         ...
 
-    def hint_future(self, block_ids: List[int]) -> int:
+    def hint_future(
+        self,
+        block_ids: List[int],
+        *,
+        target_iteration: Optional[int] = None,
+    ) -> int:
         ...
 
     def contains_block(self, block_id: int) -> bool:
@@ -167,7 +172,12 @@ class UnifiedParamsBlockReader:
     ) -> BlockBatch:
         return _pack_block_batch(self.read_blocks(block_ids), block_ids, self.layout, out)
 
-    def hint_future(self, block_ids: List[int]) -> int:
+    def hint_future(
+        self,
+        block_ids: List[int],
+        *,
+        target_iteration: Optional[int] = None,
+    ) -> int:
         # In-memory slicing has no prefetch semantics.
         return 0
 
@@ -220,7 +230,12 @@ class TieredCacheBlockReader:
         valid_ids = [int(b) for b in block_ids if 0 <= int(b) < self.num_blocks]
         return _pack_block_batch(self.read_blocks(valid_ids), valid_ids, self.layout, out)
 
-    def hint_future(self, block_ids: List[int]) -> int:
+    def hint_future(
+        self,
+        block_ids: List[int],
+        *,
+        target_iteration: Optional[int] = None,
+    ) -> int:
         valid_ids = [int(b) for b in block_ids if 0 <= int(b) < self.num_blocks]
         if self._filter_hint is not None:
             valid_ids = self._filter_hint(valid_ids)
@@ -228,7 +243,11 @@ class TieredCacheBlockReader:
             return 0
         prefetcher = getattr(self._cache, 'prefetch_future', None)
         if callable(prefetcher):
-            return int(prefetcher(valid_ids) or 0)
+            if target_iteration is None:
+                return int(prefetcher(valid_ids) or 0)
+            return int(
+                prefetcher(valid_ids, target_iteration=int(target_iteration)) or 0
+            )
         return 0
 
     def contains_block(self, block_id: int) -> bool:

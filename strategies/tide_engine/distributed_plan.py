@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
@@ -43,6 +43,16 @@ def build_balanced_block_owner(
         owner[block_id] = rank
         rank_loads[rank] += weights[block_id]
         rank_counts[rank] += 1
+    validate_block_owner(owner, num_blocks=num_blocks, world_size=world_size)
+    return owner
+
+
+def build_stable_block_owner(*, num_blocks: int, world_size: int) -> np.ndarray:
+    """Assign blocks once with deterministic round-robin ownership."""
+    if num_blocks < 0 or world_size <= 0:
+        raise ValueError("Invalid block-owner dimensions")
+    owner = np.arange(int(num_blocks), dtype=np.int64) % int(world_size)
+    owner = owner.astype(np.int32, copy=False)
     validate_block_owner(owner, num_blocks=num_blocks, world_size=world_size)
     return owner
 
@@ -100,23 +110,49 @@ class DistributedBatchPlan:
     rank_camera_ids: List[List[int]]
     rank_resident_blocks: List[List[int]]
     rank_active_blocks: List[List[int]]
+    global_active_blocks: List[int] = field(default_factory=list)
+    global_resident_blocks: List[int] = field(default_factory=list)
+    stream_in_blocks: List[int] = field(default_factory=list)
+    evict_blocks: List[int] = field(default_factory=list)
+    block_cull_ms: float = 0.0
+    plan_ms: float = 0.0
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> "DistributedBatchPlan":
+        rank_active_blocks = [
+            [int(v) for v in values] for values in value["rank_active_blocks"]
+        ]
+        rank_resident_blocks = [
+            [int(v) for v in values] for values in value["rank_resident_blocks"]
+        ]
         return cls(
             iteration=int(value["iteration"]),
             epoch=int(value["epoch"]),
             global_camera_ids=[int(v) for v in value["global_camera_ids"]],
             rank_camera_ids=[[int(v) for v in values] for values in value["rank_camera_ids"]],
-            rank_resident_blocks=[
-                [int(v) for v in values] for values in value["rank_resident_blocks"]
+            rank_resident_blocks=rank_resident_blocks,
+            rank_active_blocks=rank_active_blocks,
+            global_active_blocks=[
+                int(v)
+                for v in value.get(
+                    "global_active_blocks",
+                    sorted({block for values in rank_active_blocks for block in values}),
+                )
             ],
-            rank_active_blocks=[
-                [int(v) for v in values] for values in value["rank_active_blocks"]
+            global_resident_blocks=[
+                int(v)
+                for v in value.get(
+                    "global_resident_blocks",
+                    sorted({block for values in rank_resident_blocks for block in values}),
+                )
             ],
+            stream_in_blocks=[int(v) for v in value.get("stream_in_blocks", [])],
+            evict_blocks=[int(v) for v in value.get("evict_blocks", [])],
+            block_cull_ms=float(value.get("block_cull_ms", 0.0)),
+            plan_ms=float(value.get("plan_ms", 0.0)),
         )
 
 
@@ -152,9 +188,9 @@ class DistributedBatchPlanner:
             rows_in_block(block_id, self.total_points, self.block_size)
             for block_id in range(len(self.block_owner))
         ]
-        self._resident: List[List[int]] = [[] for _ in range(self.world_size)]
-        self._active: List[List[int]] = [[] for _ in range(self.world_size)]
-        self._recency: List[Dict[int, float]] = [dict() for _ in range(self.world_size)]
+        self._resident: List[int] = []
+        self._active: List[int] = []
+        self._recency: Dict[int, float] = {}
 
     def plan(
         self,
@@ -185,39 +221,49 @@ class DistributedBatchPlanner:
         else:
             raise ValueError(f"Unsupported camera assignment: {self.camera_assignment}")
 
-        rank_active_blocks: List[List[int]] = []
-        rank_resident_blocks: List[List[int]] = []
-        for rank in range(self.world_size):
-            owner_camera_blocks = {
-                int(camera_id): [
+        normalized_camera_blocks = {
+            int(camera_id): sorted(
+                {
                     int(block_id)
                     for block_id in camera_blocks.get(int(camera_id), [])
-                    if self.block_owner[int(block_id)] == rank
-                ]
-                for camera_id in global_camera_ids
-            }
-            active = sorted({block_id for blocks in owner_camera_blocks.values() for block_id in blocks})
-            transition = compute_topc_resident_transition(
-                current_active_blocks=self._active[rank],
-                next_active_blocks=active,
-                current_resident_blocks=self._resident[rank],
-                next_camera_ids=global_camera_ids,
-                next_camera_blocks=owner_camera_blocks,
-                previous_recency_scores=self._recency[rank],
-                lambda_weight=self.resident_lambda,
-                recency_decay=self.recency_decay,
-                resident_capacity_blocks=self.capacity,
-                balanced_camera_seeds=True,
-                balanced_seed_fraction=self.balanced_seed_fraction,
+                    if 0 <= int(block_id) < len(self.block_owner)
+                }
             )
-            resident = list(transition.next_resident_blocks)
-            if any(self.block_owner[block_id] != rank for block_id in resident):
-                raise RuntimeError(f"Planner assigned a non-owner block to rank {rank}")
-            self._active[rank] = active
-            self._resident[rank] = resident
-            self._recency[rank] = dict(transition.updated_recency_scores or {})
-            rank_active_blocks.append(active)
-            rank_resident_blocks.append(resident)
+            for camera_id in global_camera_ids
+        }
+        global_active = sorted(
+            {
+                block_id
+                for blocks in normalized_camera_blocks.values()
+                for block_id in blocks
+            }
+        )
+        transition = compute_topc_resident_transition(
+            current_active_blocks=self._active,
+            next_active_blocks=global_active,
+            current_resident_blocks=self._resident,
+            next_camera_ids=global_camera_ids,
+            next_camera_blocks=normalized_camera_blocks,
+            previous_recency_scores=self._recency,
+            lambda_weight=self.resident_lambda,
+            recency_decay=self.recency_decay,
+            resident_capacity_blocks=self.capacity,
+            balanced_camera_seeds=True,
+            balanced_seed_fraction=self.balanced_seed_fraction,
+        )
+        global_resident = list(transition.next_resident_blocks)
+        self._active = global_active
+        self._resident = global_resident
+        self._recency = dict(transition.updated_recency_scores or {})
+
+        rank_active_blocks = [
+            [block_id for block_id in global_active if self.block_owner[block_id] == rank]
+            for rank in range(self.world_size)
+        ]
+        rank_resident_blocks = [
+            [block_id for block_id in global_resident if self.block_owner[block_id] == rank]
+            for rank in range(self.world_size)
+        ]
 
         resident_sets = [set(values) for values in rank_resident_blocks]
         for left in range(self.world_size):
@@ -232,4 +278,8 @@ class DistributedBatchPlanner:
             rank_camera_ids=rank_camera_ids,
             rank_resident_blocks=rank_resident_blocks,
             rank_active_blocks=rank_active_blocks,
+            global_active_blocks=global_active,
+            global_resident_blocks=global_resident,
+            stream_in_blocks=list(transition.stream_in_blocks),
+            evict_blocks=list(transition.evict_blocks),
         )

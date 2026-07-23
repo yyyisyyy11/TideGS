@@ -67,6 +67,15 @@ def load_distributed_checkpoint_manifest(
     manifest["_tide_distributed_root"] = root
     manifest["_tide_distributed_checkpoint_dir"] = str(checkpoint_dir)
     manifest["_tide_block_owner_file"] = str(owner_file.resolve())
+    checkpoint_version = int(root.get("checkpoint_version", 1))
+    if checkpoint_version >= 2:
+        global_capacity = int(root["global_capacity_blocks"])
+    else:
+        global_capacity = int(root["per_rank_capacity_blocks"]) * saved_world_size
+    manifest["_tide_global_capacity_blocks"] = global_capacity
+    manifest["_tide_owner_policy"] = str(
+        root.get("owner_policy", "visibility_weighted_lpt")
+    )
     return manifest
 
 
@@ -125,14 +134,18 @@ def write_distributed_incremental_checkpoint(
         )
         ordered = sorted(rank_results, key=lambda value: int(value["rank"]))
         root_manifest = {
-            "checkpoint_version": 1,
+            "checkpoint_version": 2,
             "checkpoint_type": "pure_ssd_distributed_incremental",
             "iteration": int(iteration),
             "next_iteration": int(next_iteration),
             "world_size": int(context.world_size),
             "global_bsz": int(args.bsz),
-            "per_rank_capacity_blocks": int(args.paper_resident_capacity_blocks),
-            "owner_policy": "visibility_weighted_lpt",
+            "global_capacity_blocks": int(args.paper_resident_capacity_blocks),
+            "capacity_semantics": "global",
+            "owner_policy": str(
+                getattr(args, "_tide_owner_policy", "stable_round_robin")
+            ),
+            "block_version_semantics": "monotonic_gpu_cpu_ssd",
             "camera_assignment": str(args.tide_camera_assignment),
             "camera_microbatch": int(args.tide_camera_microbatch),
             "block_owner": owner_file.name,

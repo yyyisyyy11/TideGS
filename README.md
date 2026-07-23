@@ -66,6 +66,12 @@ pip install --no-build-isolation submodules/simple-knn
 The four-GPU path uses the official `gsplat==1.5.3` distributed rasterizer,
 which is installed by `requirements.txt`.
 
+Patch its distributed packed camera IDs and projection timing hooks:
+
+```bash
+python tools/patch_gsplat_distributed_packed.py
+```
+
 Set PyTorch allocation behavior before training:
 
 ```bash
@@ -206,9 +212,9 @@ checkpoint mode: incremental
 
 ### Four-GPU Gaussian Sharding
 
-Use one process per GPU. `--bsz` is global, while resident capacity and RAM
-cache limits are per rank. A fresh distributed run requires a prebuilt SSD
-manifest so all ranks can share the immutable base file.
+Use one process per GPU. `--bsz` and `--capacity` are global; RAM cache limits
+remain per rank. A fresh distributed run requires a prebuilt SSD manifest so
+all ranks can share the immutable base file.
 
 ```bash
 RUN_TAG=$(date +"%Y%m%d_%H%M%S")_tidegs_1b_4gpu \
@@ -216,9 +222,10 @@ bash scripts/train_matrixcity_1b.sh \
   --mode train \
   --gpus 0,1,2,3 \
   --bsz 16 \
-  --capacity 2048 \
+  --capacity 8192 \
   --camera-assignment gaussian_balanced \
   --camera-microbatch 4 \
+  --detailed-metrics \
   --debug-max-train-cameras -1 \
   --src "$MATRIXCITY_SCENE_DIR" \
   --ply "$TIDEGS_DENSE_PLY" \
@@ -228,8 +235,8 @@ bash scripts/train_matrixcity_1b.sh \
 ```
 
 This configuration assigns every block to exactly one rank, gives each rank
-four cameras per synchronized step, and enforces a 2048-block resident cap per
-rank. Distributed checkpoints must be resumed with the same world size.
+four cameras per synchronized step, and enforces an 8192-block global resident
+cap. Distributed checkpoints must be resumed with the same world size.
 
 ## Checkpoint And Resume
 

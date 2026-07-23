@@ -28,6 +28,7 @@ MODE="train"
 DRY_RUN=0
 DEBUG_LOGGING=0
 VERBOSE_TERMINAL=0
+DETAILED_METRICS="${DETAILED_METRICS:-0}"
 ITERATIONS=240
 DEBUG_MAX_TRAIN_CAMERAS=256
 DEBUG_CAMERA_SAMPLE_MODE="linspace"
@@ -73,7 +74,7 @@ Options:
   --distributed-mode MODE     off|gaussian_sharded (default: ${DISTRIBUTED_MODE})
   --camera-assignment MODE    equal|gaussian_balanced (default: ${CAMERA_ASSIGNMENT})
   --camera-microbatch N       Cameras per rank per gsplat call (default: ${CAMERA_MICROBATCH})
-  --owner-balance-samples N   Cameras sampled for static block ownership (default: ${OWNER_BALANCE_SAMPLES})
+  --owner-balance-samples N   Legacy option; stable owner assignment ignores it
   --run-tag TAG               Experiment tag (default: timestamped)
   --root DIR                  Large output root (default: ${ROOT})
   --src DIR                   MatrixCity source dir
@@ -87,9 +88,9 @@ Options:
   --debug-camera-sample-mode M linspace|contiguous|window (default: ${DEBUG_CAMERA_SAMPLE_MODE})
   --debug-camera-sample-start N Start index for window mode (default: ${DEBUG_CAMERA_SAMPLE_START})
   --bsz N                     Global batch size for release runs
-  --capacity N                Resident block capacity per rank
+  --capacity N                Global resident block capacity across all ranks
   --bsz-list "LIST"           Batch sizes for sweeps (default: "${BSZ_LIST}")
-  --capacity-list "LIST"      Resident block capacities for sweeps (default: "${CAPACITY_LIST}")
+  --capacity-list "LIST"      Global resident capacities for sweeps (default: "${CAPACITY_LIST}")
   --projection-chunk N        projection_max_cameras_per_chunk (default: ${PROJECTION_CHUNK})
   --max-ram-gb N              RAM cache budget (default: ${MAX_RAM_GB})
   --checkpoint-mode MODE      incremental|snapshot (default: ${CHECKPOINT_MODE})
@@ -111,11 +112,12 @@ Options:
   --resume-to-iter N          Final iteration for resume mode (default: ${RESUME_TO_ITER})
   --start-checkpoint DIR      Checkpoint dir for resume mode
   --debug-logging             Enable detailed TideGS runtime logs while keeping terminal quiet
+  --detailed-metrics          Write per-rank/global batch and asynchronous I/O TSVs
   --verbose-terminal          Stream training subprocess output to the terminal
   --dry-run                   Write commands.sh only
 
 Environment overrides:
-  PYTHON_BIN, GPU, GPUS, DISTRIBUTED_MODE, CAMERA_ASSIGNMENT,
+  PYTHON_BIN, GPU, GPUS, DISTRIBUTED_MODE, CAMERA_ASSIGNMENT, DETAILED_METRICS,
   CAMERA_MICROBATCH, OWNER_BALANCE_SAMPLES, ROOT, SRC, PLY, MANIFEST, MATRIXCITY_SCENE_DIR,
   TIDEGS_DENSE_PLY, TIDEGS_PREBUILT_MANIFEST, SCHED_CACHE, OUT_ROOT,
   CACHE_ROOT, RUN_TAG
@@ -174,6 +176,7 @@ while [[ $# -gt 0 ]]; do
     --resume-to-iter) RESUME_TO_ITER="$2"; shift 2 ;;
     --start-checkpoint) START_CHECKPOINT="$2"; shift 2 ;;
     --debug-logging) DEBUG_LOGGING=1; shift ;;
+    --detailed-metrics) DETAILED_METRICS=1; shift ;;
     --verbose-terminal) VERBOSE_TERMINAL=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -373,6 +376,9 @@ append_train_command() {
     printf '  --tide_storage_min_free_gb %q \\\n' "${MIN_FREE_GB}"
     if [[ "${DEBUG_LOGGING}" == "1" ]]; then
       printf '  --tide_debug_logging \\\n'
+    fi
+    if [[ "${DETAILED_METRICS}" == "1" ]]; then
+      printf '  --tide_detailed_metrics \\\n'
     fi
     if [[ "${VERBOSE_TERMINAL}" != "1" ]]; then
       printf '  --quiet \\\n'

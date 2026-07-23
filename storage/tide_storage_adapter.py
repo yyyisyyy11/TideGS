@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import time
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
@@ -46,10 +47,14 @@ class _CacheCommitJob:
         payload,
         block_ids: List[int],
         bounds_managed_externally: bool = False,
+        on_complete=None,
+        on_error=None,
     ):
         self.payload = payload
         self.block_ids = tuple(sorted(set(int(block_id) for block_id in block_ids)))
         self.bounds_managed_externally = bool(bounds_managed_externally)
+        self.on_complete = on_complete
+        self.on_error = on_error
         self.done = threading.Event()
         self.result = 0
         self.error = None
@@ -137,6 +142,8 @@ class TideStorageAdapter:
             "background_cache_commit_jobs": 0,
             "background_cache_commit_blocks": 0,
             "background_cache_commit_waits": 0,
+            "background_gpu_d2h_time_ms": 0.0,
+            "background_cache_commit_time_ms": 0.0,
             "background_bounds_jobs": 0,
             "background_bounds_blocks": 0,
             "background_bounds_waits": 0,
@@ -260,13 +267,70 @@ class TideStorageAdapter:
                 return
             try:
                 updated_blocks = job.payload.wait()
+                bytes_transferred = sum(
+                    int(tensor.numel()) * int(tensor.element_size())
+                    for tensor in updated_blocks.values()
+                )
+                gpu_elapsed = getattr(job.payload, "gpu_elapsed_ms", None)
+                gpu_elapsed_ms = 0.0
+                if callable(gpu_elapsed):
+                    gpu_elapsed_ms = float(gpu_elapsed())
+                    self.execution_metrics["background_gpu_d2h_time_ms"] = float(
+                        self.execution_metrics.get("background_gpu_d2h_time_ms", 0.0)
+                    ) + gpu_elapsed_ms
+                commit_start = time.perf_counter()
+                block_versions = getattr(job.payload, "block_versions", None)
+                origin_iteration = getattr(job.payload, "origin_iteration", None)
+                record_io_event = getattr(self.cache, "record_io_event", None)
+                if callable(record_io_event):
+                    record_io_event(
+                        operation="gpu_d2h",
+                        tier="gpu_to_cpu",
+                        origin_iteration=origin_iteration,
+                        target_iteration=None,
+                        blocks=len(updated_blocks),
+                        bytes=bytes_transferred,
+                        service_ms=gpu_elapsed_ms,
+                    )
+                sync_kwargs = {
+                    "refresh_bounds": not job.bounds_managed_externally,
+                }
+                if block_versions:
+                    sync_kwargs["block_versions"] = block_versions
+                if origin_iteration is not None:
+                    sync_kwargs["origin_iteration"] = int(origin_iteration)
                 job.result = self.sync_cache_from_cpu_views(
                     updated_blocks,
-                    refresh_bounds=not job.bounds_managed_externally,
+                    **sync_kwargs,
                 )
+                if callable(job.on_complete):
+                    job.on_complete(job.block_ids, block_versions or {})
+                commit_elapsed_ms = (time.perf_counter() - commit_start) * 1000.0
+                self.execution_metrics["background_cache_commit_time_ms"] = float(
+                    self.execution_metrics.get(
+                        "background_cache_commit_time_ms", 0.0
+                    )
+                ) + commit_elapsed_ms
+                if callable(record_io_event):
+                    record_io_event(
+                        operation="cpu_cache_commit",
+                        tier="cpu_cache",
+                        origin_iteration=origin_iteration,
+                        target_iteration=None,
+                        blocks=len(updated_blocks),
+                        bytes=bytes_transferred,
+                        service_ms=commit_elapsed_ms,
+                    )
             except Exception as exc:
                 job.error = exc
                 self._cache_commit_error = exc
+                if callable(job.on_error):
+                    try:
+                        job.on_error(
+                            getattr(job.payload, "block_versions", {}) or {}
+                        )
+                    except Exception:
+                        pass
             finally:
                 release = getattr(job.payload, "release", None)
                 if callable(release):
@@ -327,6 +391,8 @@ class TideStorageAdapter:
         payload,
         *,
         bounds_managed_externally: bool = False,
+        on_complete=None,
+        on_error=None,
     ) -> int:
         block_ids = list(getattr(payload, "block_ids", []))
         self._validate_owned_block_ids(block_ids, "cache writeback")
@@ -340,6 +406,8 @@ class TideStorageAdapter:
             payload,
             block_ids,
             bounds_managed_externally=bounds_managed_externally,
+            on_complete=on_complete,
+            on_error=on_error,
         )
         with self._cache_commit_lock:
             for block_id in job.block_ids:
@@ -357,25 +425,75 @@ class TideStorageAdapter:
         resident_state = self._resident_state
         working_set = self._resident_working_set
         if resident_state is None or working_set is None:
+            self.drain_cache_writebacks()
             return 0
 
         dirty_blocks = resident_state.dirty_blocks()
         if not dirty_blocks:
+            self.drain_cache_writebacks()
             return 0
-        payload = working_set.stage_updated_blocks(dirty_blocks)
+        versions_for_blocks = getattr(resident_state, "versions_for_blocks", None)
+        block_versions = (
+            versions_for_blocks(dirty_blocks)
+            if callable(versions_for_blocks)
+            else None
+        )
+        if block_versions:
+            latest_dirty_iteration = getattr(
+                resident_state,
+                "latest_dirty_iteration",
+                None,
+            )
+            payload = working_set.stage_updated_blocks(
+                dirty_blocks,
+                block_versions=block_versions,
+                origin_iteration=(
+                    latest_dirty_iteration(dirty_blocks)
+                    if callable(latest_dirty_iteration)
+                    else None
+                ),
+            )
+        else:
+            payload = working_set.stage_updated_blocks(dirty_blocks)
         if payload is None or set(payload.block_ids) != set(dirty_blocks):
             staged_ids = [] if payload is None else payload.block_ids
             raise RuntimeError(
                 "Cannot flush all GPU-dirty resident blocks: "
                 f"dirty={dirty_blocks[:8]} staged={staged_ids[:8]}"
             )
-        staged = self.submit_cache_writeback(payload)
+        begin_writeback = getattr(resident_state, "begin_writeback", None)
+        cancel_writeback = getattr(resident_state, "cancel_writeback", None)
+        complete_writeback = getattr(resident_state, "complete_writeback", None)
+        pending_versions = (
+            begin_writeback(dirty_blocks)
+            if callable(begin_writeback)
+            else {}
+        )
+        try:
+            staged = self.submit_cache_writeback(
+                payload,
+                on_complete=(
+                    complete_writeback
+                    if callable(complete_writeback)
+                    else None
+                ),
+                on_error=(
+                    cancel_writeback
+                    if callable(cancel_writeback)
+                    else None
+                ),
+            )
+        except Exception:
+            if callable(cancel_writeback):
+                cancel_writeback(pending_versions)
+            raise
         if staged != len(dirty_blocks):
             raise RuntimeError(
                 f"GPU-dirty flush staged {staged}/{len(dirty_blocks)} blocks"
             )
-        resident_state.mark_blocks_written_back(dirty_blocks)
         self.drain_cache_writebacks()
+        if not callable(complete_writeback):
+            resident_state.mark_blocks_written_back(dirty_blocks)
         return staged
 
     def wait_for_cache_blocks(self, block_ids: List[int]) -> None:
@@ -989,6 +1107,8 @@ class TideStorageAdapter:
         updated_blocks_dict: Dict[int, torch.Tensor],
         *,
         refresh_bounds: bool = True,
+        block_versions: Optional[Dict[int, int]] = None,
+        origin_iteration: Optional[int] = None,
     ):
         if not updated_blocks_dict:
             return 0
@@ -998,7 +1118,11 @@ class TideStorageAdapter:
         staged = len(updated_blocks_dict)
         self.execution_metrics["paper_cache_sync_calls"] += 1
         self.execution_metrics["paper_cache_sync_blocks"] += staged
-        staged_valid = self.cache.upsert_dirty_block_batch(updated_blocks_dict)
+        staged_valid = self.cache.upsert_dirty_block_batch(
+            updated_blocks_dict,
+            block_versions=block_versions,
+            origin_iteration=origin_iteration,
+        )
         self.execution_metrics["paper_cache_sync_staged_blocks"] += staged_valid
         if refresh_bounds:
             self.refresh_block_bounds_from_blocks(updated_blocks_dict)

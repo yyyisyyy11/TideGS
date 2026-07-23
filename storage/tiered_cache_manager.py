@@ -74,6 +74,7 @@ class TieredCacheManager:
         # 驱逐前必须先flush，写回SSD
         self.dirty_set: Set[int] = set()
         self.block_versions: Dict[int, int] = {}
+        self.block_origin_iterations: Dict[int, int] = {}
         self.cache_lock = threading.RLock()
         
         # [FIX] Flushing buffer to prevent race condition
@@ -110,6 +111,9 @@ class TieredCacheManager:
 
         # Prefetch tracking， 防止重复预取同一个block
         self.prefetch_history: Set[int] = set()
+        self._foreground_iteration: Optional[int] = None
+        self._io_events: List[Dict[str, object]] = []
+        self._io_events_lock = threading.Lock()
 
         # Statistics
         self.stats = {
@@ -139,6 +143,17 @@ class TieredCacheManager:
             'future_prefetch_time': 0.0,
             'future_prefetch_errors': 0,
             'future_prefetch_reserved': 0,
+            'urgent_storage_read_calls': 0,
+            'urgent_storage_read_blocks': 0,
+            'urgent_storage_read_time': 0.0,
+            'future_storage_read_calls': 0,
+            'future_storage_read_blocks': 0,
+            'future_storage_read_time': 0.0,
+            'future_materialize_time': 0.0,
+            'ssd_bytes_read_urgent': 0,
+            'ssd_bytes_read_future': 0,
+            'ssd_bytes_written_async': 0,
+            'ssd_bytes_written_sync': 0,
             'inflight_wait_blocks': 0,
             'inflight_wait_time': 0.0,
             'inflight_fallback_blocks': 0,
@@ -148,6 +163,24 @@ class TieredCacheManager:
         self._start_sync_thread()
         self._start_flush_thread()
         self._start_future_prefetch_thread()
+
+    def set_foreground_iteration(self, iteration: Optional[int]) -> None:
+        self._foreground_iteration = (
+            None if iteration is None else int(iteration)
+        )
+
+    def _record_io_event(self, **event) -> None:
+        with self._io_events_lock:
+            self._io_events.append(dict(event))
+
+    def record_io_event(self, **event) -> None:
+        self._record_io_event(**event)
+
+    def drain_io_events(self) -> List[Dict[str, object]]:
+        with self._io_events_lock:
+            events = list(self._io_events)
+            self._io_events.clear()
+        return events
 
     def _start_sync_thread(self):
         """Start background thread for async GPU->RAM sync."""
@@ -198,6 +231,7 @@ class TieredCacheManager:
 
         tensor, _, _ = flushing_entry
         if promote_flushing:
+            flushing_version = int(flushing_entry[2])
             with self.cache_lock:
                 cached_tensor = self.cache_data.get(block_id)
                 if cached_tensor is not None:
@@ -205,7 +239,59 @@ class TieredCacheManager:
                     return cached_tensor, 'cache'
                 self.cache_data[block_id] = tensor
                 self.cache_data.move_to_end(block_id)
+                self.block_versions[block_id] = max(
+                    self.block_versions.get(block_id, 0),
+                    flushing_version,
+                )
         return tensor, 'flushing'
+
+    def _storage_versions(self, block_ids: List[int]) -> Dict[int, int]:
+        getter = getattr(self.storage, "get_block_versions", None)
+        if not callable(getter):
+            return {int(block_id): 0 for block_id in block_ids}
+        return {
+            int(block_id): int(version)
+            for block_id, version in getter(block_ids).items()
+        }
+
+    def _read_storage_blocks(
+        self,
+        block_ids: List[int],
+    ) -> Tuple[Dict[int, torch.Tensor], Dict[int, int]]:
+        reader = getattr(self.storage, "read_blocks_with_versions", None)
+        if callable(reader):
+            blocks, versions = reader(block_ids)
+            return blocks, {
+                int(block_id): int(version)
+                for block_id, version in versions.items()
+            }
+        blocks = self.storage.read_blocks(block_ids)
+        return blocks, self._storage_versions(list(blocks))
+
+    def get_block_versions(self, block_ids: List[int]) -> Dict[int, int]:
+        storage_missing = []
+        versions = {}
+        with self.cache_lock:
+            for raw_block_id in block_ids:
+                block_id = int(raw_block_id)
+                if block_id in self.block_versions:
+                    versions[block_id] = int(self.block_versions[block_id])
+                else:
+                    storage_missing.append(block_id)
+        if storage_missing:
+            versions.update(self._storage_versions(storage_missing))
+        return versions
+
+    def _origin_iteration_for_blocks(self, block_ids) -> Optional[int]:
+        with self.cache_lock:
+            origins = {
+                int(self.block_origin_iterations[int(block_id)])
+                for block_id in block_ids
+                if int(block_id) in self.block_origin_iterations
+            }
+        if len(origins) == 1:
+            return next(iter(origins))
+        return self._foreground_iteration
 
     def _reserve_inflight_read(self, block_id: int) -> Tuple[threading.Event, bool]:
         """Reserve the right to read one block from SSD."""
@@ -268,13 +354,38 @@ class TieredCacheManager:
 
         t0 = time.time()
         try:
-            loaded = self.storage.read_blocks(to_read)
+            loaded, loaded_versions = self._read_storage_blocks(to_read)
             elapsed = time.time() - t0
+            bytes_read = sum(
+                int(tensor.numel()) * int(tensor.element_size())
+                for tensor in loaded.values()
+            )
+            self.stats['urgent_storage_read_calls'] += 1
+            self.stats['urgent_storage_read_blocks'] += len(loaded)
+            self.stats['urgent_storage_read_time'] += elapsed
+            self.stats['ssd_bytes_read_urgent'] += bytes_read
+            self._record_io_event(
+                operation="ssd_read_urgent",
+                tier="ssd",
+                origin_iteration=self._foreground_iteration,
+                target_iteration=self._foreground_iteration,
+                blocks=len(loaded),
+                bytes=bytes_read,
+                service_ms=elapsed * 1000.0,
+            )
 
             with self.cache_lock:
                 for block_id, tensor in loaded.items():
+                    loaded_version = int(loaded_versions.get(block_id, 0))
+                    cached_tensor = self.cache_data.get(block_id)
+                    cached_version = int(self.block_versions.get(block_id, -1))
+                    if cached_tensor is not None and cached_version > loaded_version:
+                        self.cache_data.move_to_end(block_id)
+                        result[block_id] = cached_tensor
+                        continue
                     self.cache_data[block_id] = tensor
                     self.cache_data.move_to_end(block_id)
+                    self.block_versions[block_id] = loaded_version
                     result[block_id] = tensor
 
             return len(to_read), elapsed
@@ -285,6 +396,7 @@ class TieredCacheManager:
         self,
         dirty_blocks: Dict[int, torch.Tensor],
         block_versions: Optional[Dict[int, int]] = None,
+        origin_iteration: Optional[int] = None,
         mode: str = 'async',
     ):
         """Flush a batch of dirty blocks to SSD and clear flushing metadata."""
@@ -292,9 +404,16 @@ class TieredCacheManager:
             return
 
         block_versions = block_versions or {}
+        bytes_written = sum(
+            int(tensor.numel()) * int(tensor.element_size())
+            for tensor in dirty_blocks.values()
+        )
         t0 = time.time()
         try:
-            self.storage.write_patch(dirty_blocks)
+            self.storage.write_patch(
+                dirty_blocks,
+                block_versions=block_versions or None,
+            )
             elapsed = time.time() - t0
 
             with self.flushing_lock:
@@ -312,36 +431,63 @@ class TieredCacheManager:
                     flushed_version = block_versions.get(block_id)
                     if flushed_version is None:
                         self.dirty_set.discard(block_id)
+                        self.block_origin_iterations.pop(block_id, None)
                         continue
                     if self.block_versions.get(block_id, 0) == flushed_version:
                         self.dirty_set.discard(block_id)
+                        self.block_origin_iterations.pop(block_id, None)
 
             self.stats['flushes'] += 1
             if mode == 'async':
                 self.stats['async_flush_jobs'] += 1
                 self.stats['async_flush_blocks'] += len(dirty_blocks)
                 self.stats['async_flush_time'] += elapsed
+                self.stats['ssd_bytes_written_async'] += bytes_written
             else:
                 self.stats['sync_flush_jobs'] += 1
                 self.stats['sync_flush_blocks'] += len(dirty_blocks)
                 self.stats['sync_flush_time'] += elapsed
+                self.stats['ssd_bytes_written_sync'] += bytes_written
+            self._record_io_event(
+                operation=f"ssd_write_{mode}",
+                tier="ssd",
+                origin_iteration=origin_iteration,
+                target_iteration=None,
+                blocks=len(dirty_blocks),
+                bytes=bytes_written,
+                service_ms=elapsed * 1000.0,
+            )
         except Exception as e:
             print(f"[TieredCache] ERROR during SSD write: {e}")
             with self.cache_lock:
                 for block_id, tensor in dirty_blocks.items():
-                    if block_id not in self.cache_data:
+                    failed_version = int(block_versions.get(block_id, 0))
+                    current_version = int(self.block_versions.get(block_id, -1))
+                    if (
+                        block_id not in self.cache_data
+                        and current_version <= failed_version
+                    ):
                         self.cache_data[block_id] = tensor
                         self.cache_data.move_to_end(block_id)
-                    self.dirty_set.add(block_id)
+                        self.block_versions[block_id] = failed_version
+                    if current_version <= failed_version:
+                        self.dirty_set.add(block_id)
             with self.flushing_lock:
-                for block_id in dirty_blocks.keys():
-                    self.flushing_buffer.pop(block_id, None)
+                for block_id in dirty_blocks:
+                    failed_version = int(block_versions.get(block_id, 0))
+                    current_entry = self.flushing_buffer.get(block_id)
+                    if (
+                        current_entry is not None
+                        and int(current_entry[2]) <= failed_version
+                    ):
+                        self.flushing_buffer.pop(block_id, None)
             raise
 
     def _enqueue_dirty_flush(
         self,
         dirty_blocks: Dict[int, torch.Tensor],
         block_versions: Optional[Dict[int, int]] = None,
+        origin_iteration: Optional[int] = None,
         reason: str = 'background',
     ) -> bool:
         """Schedule dirty RAM blocks for background SSD writeback."""
@@ -349,7 +495,18 @@ class TieredCacheManager:
             return True
 
         try:
-            self.flush_queue.put_nowait((reason, dirty_blocks, block_versions or {}))
+            self.flush_queue.put_nowait(
+                (
+                    reason,
+                    dirty_blocks,
+                    block_versions or {},
+                    (
+                        self._foreground_iteration
+                        if origin_iteration is None
+                        else int(origin_iteration)
+                    ),
+                )
+            )
             self.stats['async_flush_requests'] += 1
             return True
         except Full:
@@ -361,12 +518,22 @@ class TieredCacheManager:
         """Background worker for async RAM->SSD dirty block writeback."""
         while self.flush_running or not self.flush_queue.empty():
             try:
-                reason, dirty_blocks, block_versions = self.flush_queue.get(timeout=0.1)
+                item = self.flush_queue.get(timeout=0.1)
             except Empty:
                 continue
 
             try:
-                self._flush_dirty_blocks(dirty_blocks, block_versions=block_versions, mode='async')
+                if len(item) == 4:
+                    reason, dirty_blocks, block_versions, origin_iteration = item
+                else:
+                    reason, dirty_blocks, block_versions = item
+                    origin_iteration = None
+                self._flush_dirty_blocks(
+                    dirty_blocks,
+                    block_versions=block_versions,
+                    origin_iteration=origin_iteration,
+                    mode='async',
+                )
             except Exception as e:
                 print(f"[TieredCache] Flush worker error ({reason}): {e}")
             finally:
@@ -376,10 +543,24 @@ class TieredCacheManager:
         """Background worker for SSD->RAM future block prefetch."""
         while self.future_prefetch_running or not self.future_prefetch_queue.empty():
             try:
-                block_ids = self.future_prefetch_queue.get(timeout=0.1)
+                item = self.future_prefetch_queue.get(timeout=0.1)
             except Empty:
                 continue
 
+            if (
+                isinstance(item, tuple)
+                and len(item) == 3
+                and isinstance(item[2], (list, tuple, set))
+            ):
+                origin_iteration, target_iteration, block_ids = item
+            elif (
+                isinstance(item, tuple)
+                and len(item) == 2
+                and isinstance(item[1], (list, tuple, set))
+            ):
+                origin_iteration, target_iteration, block_ids = None, item[0], item[1]
+            else:
+                origin_iteration, target_iteration, block_ids = None, None, item
             block_ids = [int(block_id) for block_id in block_ids]
             loaded_count = 0
             t0 = time.time()
@@ -391,7 +572,27 @@ class TieredCacheManager:
                         to_load.append(block_id)
 
                 if to_load:
-                    loaded = self.storage.read_blocks(to_load)
+                    read_t0 = time.time()
+                    loaded, loaded_versions = self._read_storage_blocks(to_load)
+                    read_elapsed = time.time() - read_t0
+                    bytes_read = sum(
+                        int(tensor.numel()) * int(tensor.element_size())
+                        for tensor in loaded.values()
+                    )
+                    self.stats['future_storage_read_calls'] += 1
+                    self.stats['future_storage_read_blocks'] += len(loaded)
+                    self.stats['future_storage_read_time'] += read_elapsed
+                    self.stats['ssd_bytes_read_future'] += bytes_read
+                    self._record_io_event(
+                        operation="ssd_read_future",
+                        tier="ssd",
+                        origin_iteration=origin_iteration,
+                        target_iteration=target_iteration,
+                        blocks=len(loaded),
+                        bytes=bytes_read,
+                        service_ms=read_elapsed * 1000.0,
+                    )
+                    materialize_start = time.perf_counter()
                     with self.cache_lock:
                         for block_id, tensor in loaded.items():
                             with self.flushing_lock:
@@ -400,7 +601,13 @@ class TieredCacheManager:
                             if block_id not in self.cache_data:
                                 self.cache_data[block_id] = tensor
                                 self.cache_data.move_to_end(block_id)
+                                self.block_versions[block_id] = int(
+                                    loaded_versions.get(block_id, 0)
+                                )
                                 loaded_count += 1
+                    self.stats['future_materialize_time'] += (
+                        time.perf_counter() - materialize_start
+                    )
 
                 elapsed = time.time() - t0
                 self.stats['future_prefetch_jobs'] += 1
@@ -521,7 +728,12 @@ class TieredCacheManager:
         self._maybe_evict()
         return staged
 
-    def upsert_dirty_block_batch(self, block_tensors: Dict[int, torch.Tensor]) -> int:
+    def upsert_dirty_block_batch(
+        self,
+        block_tensors: Dict[int, torch.Tensor],
+        block_versions: Optional[Dict[int, int]] = None,
+        origin_iteration: Optional[int] = None,
+    ) -> int:
         """Own one contiguous copy of a staged writeback batch.
 
         The incoming tensors are ordered views into one reusable pinned slab.
@@ -588,9 +800,20 @@ class TieredCacheManager:
         with self.cache_lock:
             for block_id, tensor in items:
                 row_count = int(tensor.shape[0])
+                current_version = int(self.block_versions.get(block_id, 0))
+                incoming_version = (
+                    current_version + 1
+                    if block_versions is None
+                    else int(block_versions[block_id])
+                )
+                if incoming_version <= current_version:
+                    offset += row_count
+                    continue
                 self.cache_data[block_id] = owned[offset:offset + row_count]
                 self.cache_data.move_to_end(block_id)
-                self.block_versions[block_id] = self.block_versions.get(block_id, 0) + 1
+                self.block_versions[block_id] = incoming_version
+                if origin_iteration is not None:
+                    self.block_origin_iterations[block_id] = int(origin_iteration)
                 self.dirty_set.add(block_id)
                 offset += row_count
                 staged += 1
@@ -628,9 +851,20 @@ class TieredCacheManager:
                 if existing is None or existing[2] <= version:
                     self.flushing_buffer[block_id] = (tensor, current_time, version)
 
-        enqueued = self._enqueue_dirty_flush(dirty_blocks, block_versions=dirty_versions, reason=reason)
+        origin_iteration = self._origin_iteration_for_blocks(dirty_blocks)
+        enqueued = self._enqueue_dirty_flush(
+            dirty_blocks,
+            block_versions=dirty_versions,
+            origin_iteration=origin_iteration,
+            reason=reason,
+        )
         if not enqueued:
-            self._flush_dirty_blocks(dirty_blocks, block_versions=dirty_versions, mode='sync')
+            self._flush_dirty_blocks(
+                dirty_blocks,
+                block_versions=dirty_versions,
+                origin_iteration=origin_iteration,
+                mode='sync',
+            )
 
         return len(dirty_blocks)
 
@@ -731,7 +965,12 @@ class TieredCacheManager:
 
         return result
 
-    def prefetch_future(self, block_ids: List[int]) -> int:
+    def prefetch_future(
+        self,
+        block_ids: List[int],
+        *,
+        target_iteration: Optional[int] = None,
+    ) -> int:
         """Prefetch future blocks in background without blocking urgent fetches."""
         to_prefetch = []
         skipped = 0
@@ -746,9 +985,13 @@ class TieredCacheManager:
                 with self.flushing_lock:
                     flushing_entry = self.flushing_buffer.get(block_id)
                 if flushing_entry is not None:
-                    tensor, _, _ = flushing_entry
+                    tensor, _, version = flushing_entry
                     self.cache_data[block_id] = tensor
                     self.cache_data.move_to_end(block_id)
+                    self.block_versions[block_id] = max(
+                        self.block_versions.get(block_id, 0),
+                        int(version),
+                    )
                     skipped += 1
                     continue
 
@@ -769,7 +1012,13 @@ class TieredCacheManager:
             return 0
 
         try:
-            self.future_prefetch_queue.put_nowait(to_prefetch)
+            self.future_prefetch_queue.put_nowait(
+                (
+                    self._foreground_iteration,
+                    None if target_iteration is None else int(target_iteration),
+                    to_prefetch,
+                )
+            )
             self.stats['future_prefetch_submitted'] += len(to_prefetch)
             self.stats['future_prefetch_reserved'] += len(to_prefetch)
             return len(to_prefetch)
@@ -849,9 +1098,20 @@ class TieredCacheManager:
 
         # Flush dirty blocks to SSD on the background writeback worker.
         if dirty_victims:
-            enqueued = self._enqueue_dirty_flush(dirty_victims, block_versions=dirty_versions, reason='evict')
+            origin_iteration = self._origin_iteration_for_blocks(dirty_victims)
+            enqueued = self._enqueue_dirty_flush(
+                dirty_victims,
+                block_versions=dirty_versions,
+                origin_iteration=origin_iteration,
+                reason='evict',
+            )
             if not enqueued:
-                self._flush_dirty_blocks(dirty_victims, block_versions=dirty_versions, mode='sync')
+                self._flush_dirty_blocks(
+                    dirty_victims,
+                    block_versions=dirty_versions,
+                    origin_iteration=origin_iteration,
+                    mode='sync',
+                )
 
         self.stats['evictions'] += len(victims)
 
@@ -880,7 +1140,12 @@ class TieredCacheManager:
                     version = dirty_versions.get(block_id, self.block_versions.get(block_id, 0))
                     self.flushing_buffer[block_id] = (tensor, current_time, version)
 
-            self._flush_dirty_blocks(dirty_blocks, block_versions=dirty_versions, mode='sync')
+            self._flush_dirty_blocks(
+                dirty_blocks,
+                block_versions=dirty_versions,
+                origin_iteration=self._origin_iteration_for_blocks(dirty_blocks),
+                mode='sync',
+            )
 
     def get_stats(self) -> Dict:
         """Get cache statistics."""

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Patch the gsplat 1.5.3 packed-distributed camera-index bug."""
+"""Patch gsplat 1.5.3 distributed camera IDs and projection timing."""
 
 from __future__ import annotations
 
@@ -12,11 +12,37 @@ from pathlib import Path
 
 ORIGINAL = "            C = C_world[world_rank]\n\n        else:\n"
 BUGGY_IMAGE_IDS = "image_ids = batch_ids * C + camera_ids"
+PROJECTION_TIMING_MARKER = "_tide_projection_events"
+PROJECTION_START_ANCHOR = "    if with_ut:\n"
+PROJECTION_END_ANCHOR = (
+    "    if packed:\n"
+    "        # The results are packed into shape [nnz, ...]. All elements are valid.\n"
+)
 PATCHED = (
     "            C = C_world[world_rank]\n"
     "            image_ids = camera_ids\n"
     "\n"
     "        else:\n"
+)
+PROJECTION_START_PATCHED = (
+    "    _tide_projection_start = None\n"
+    "    _tide_projection_end = None\n"
+    '    if getattr(torch, "_tide_gsplat_detailed_metrics", False):\n'
+    "        _tide_projection_start = torch.cuda.Event(enable_timing=True)\n"
+    "        _tide_projection_end = torch.cuda.Event(enable_timing=True)\n"
+    "        _tide_projection_start.record()\n"
+    "\n"
+    "    if with_ut:\n"
+)
+PROJECTION_END_PATCHED = (
+    "    if _tide_projection_start is not None:\n"
+    "        _tide_projection_end.record()\n"
+    f'        meta["{PROJECTION_TIMING_MARKER}"] = (\n'
+    "            _tide_projection_start,\n"
+    "            _tide_projection_end,\n"
+    "        )\n"
+    "\n"
+    f"{PROJECTION_END_ANCHOR}"
 )
 
 
@@ -35,6 +61,30 @@ def patch_rendering_source(source: str) -> tuple[str, bool]:
             f"found {occurrences}. Refusing to modify an unknown source layout."
         )
     return source.replace(ORIGINAL, PATCHED, 1), True
+
+
+def patch_projection_timing_source(source: str) -> tuple[str, bool]:
+    if PROJECTION_TIMING_MARKER in source:
+        return source, False
+    start_occurrences = source.count(PROJECTION_START_ANCHOR)
+    end_occurrences = source.count(PROJECTION_END_ANCHOR)
+    if start_occurrences != 1 or end_occurrences != 1:
+        raise RuntimeError(
+            "Expected exactly one gsplat 1.5.3 projection timing region; "
+            f"found start={start_occurrences}, end={end_occurrences}. "
+            "Refusing to modify an unknown source layout."
+        )
+    patched = source.replace(
+        PROJECTION_START_ANCHOR,
+        PROJECTION_START_PATCHED,
+        1,
+    )
+    patched = patched.replace(
+        PROJECTION_END_ANCHOR,
+        PROJECTION_END_PATCHED,
+        1,
+    )
+    return patched, True
 
 
 def find_rendering_path() -> Path:
@@ -59,9 +109,10 @@ def main() -> None:
 
     rendering_path = (args.path.resolve() if args.path else find_rendering_path())
     source = rendering_path.read_text(encoding="utf-8")
-    patched_source, changed = patch_rendering_source(source)
-    if not changed:
-        print(f"gsplat packed-distributed fix already present: {rendering_path}")
+    patched_source, camera_changed = patch_rendering_source(source)
+    patched_source, timing_changed = patch_projection_timing_source(patched_source)
+    if not camera_changed and not timing_changed:
+        print(f"TideGS gsplat fixes already present: {rendering_path}")
         return
 
     backup_path = rendering_path.with_name("rendering.py.tidegs-original")
@@ -72,7 +123,10 @@ def main() -> None:
     temporary_path.write_text(patched_source, encoding="utf-8")
     compile(patched_source, str(rendering_path), "exec")
     os.replace(temporary_path, rendering_path)
-    print(f"Patched gsplat packed-distributed camera IDs: {rendering_path}")
+    if camera_changed:
+        print(f"Patched gsplat packed-distributed camera IDs: {rendering_path}")
+    if timing_changed:
+        print(f"Patched gsplat projection timing events: {rendering_path}")
     print(f"Original source backup: {backup_path}")
 
 

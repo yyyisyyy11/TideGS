@@ -19,6 +19,7 @@ Key features:
 import torch
 import numpy as np
 import threading
+import time
 from typing import Dict, List, Optional, Tuple
 
 try:
@@ -145,13 +146,24 @@ class PendingBlockWriteback:
         self,
         plans,
         packed_cpu,
+        start_event,
         ready_event,
+        block_versions=None,
+        origin_iteration=None,
         release_event=None,
         gpu_refs=None,
     ):
         self.plans = plans
         self.packed_cpu = packed_cpu
+        self.start_event = start_event
         self.ready_event = ready_event
+        self.block_versions = {
+            int(block_id): int(version)
+            for block_id, version in (block_versions or {}).items()
+        }
+        self.origin_iteration = (
+            None if origin_iteration is None else int(origin_iteration)
+        )
         self.release_event = release_event
         self.gpu_refs = list(gpu_refs or [])
         self._result = None
@@ -163,6 +175,10 @@ class PendingBlockWriteback:
 
     def wait_gpu(self) -> None:
         self.ready_event.synchronize()
+
+    def gpu_elapsed_ms(self) -> float:
+        self.wait_gpu()
+        return float(self.start_event.elapsed_time(self.ready_event))
 
     def wait(self) -> Dict[int, torch.Tensor]:
         if self._result is not None:
@@ -480,6 +496,8 @@ class GPUWorkingSet:
             - Dict of GPU tensors: {xyz, scaling, rotation, opacity, features_dc, features_rest}
             - Stats dict with existing names: {hotspot_count, cold_count, total_count, hit_rate}
         """
+        load_start = time.perf_counter()
+        foreground_read_ms = 0.0
         # Topology may change after densification/pruning; trust whichever source
         # reports the current total count.
         if block_reader is not None:
@@ -600,6 +618,9 @@ class GPUWorkingSet:
         num_new_gaussians = len(new_local_to_global)
         
         # Allocate new GPU tensors
+        h2d_start_event = torch.cuda.Event(enable_timing=True)
+        h2d_end_event = torch.cuda.Event(enable_timing=True)
+        h2d_start_event.record()
         new_xyz = torch.empty(num_new_gaussians, 3, device=self.device, dtype=torch.float32)
         new_scaling = torch.empty(num_new_gaussians, 3, device=self.device, dtype=torch.float32)
         new_rotation = torch.empty(num_new_gaussians, 4, device=self.device, dtype=torch.float32)
@@ -622,7 +643,9 @@ class GPUWorkingSet:
                 bid for bid in sorted_visible
                 if not (can_use_gpu_hotspots and bid in old_block_to_gpu_slice)
             ]
+            read_start = time.perf_counter()
             cold_blocks_source = block_reader.read_blocks(cold_ids_for_reader)
+            foreground_read_ms = (time.perf_counter() - read_start) * 1000.0
 
         offset = 0
         for block_id in sorted_visible:
@@ -701,6 +724,7 @@ class GPUWorkingSet:
             # Record slice mapping
             self.block_to_gpu_slice[block_id] = s
             offset += block_len
+        h2d_end_event.record()
         
         # ====================================================================
         # STEP 4.5: Ensure DMA transfers complete before GPU kernels read data
@@ -764,6 +788,12 @@ class GPUWorkingSet:
             'memory_mb': memory_mb,
             'num_gaussians': num_new_gaussians,
             'data_reused_count': data_reused,
+            'foreground_read_ms': foreground_read_ms,
+            'cpu_materialize_ms': max(
+                0.0,
+                (time.perf_counter() - load_start) * 1000.0 - foreground_read_ms,
+            ),
+            'h2d_events': (h2d_start_event, h2d_end_event),
         }
         
         return {
@@ -899,6 +929,8 @@ class GPUWorkingSet:
     def stage_updated_blocks(
         self,
         updated_block_ids: List[int],
+        block_versions: Optional[Dict[int, int]] = None,
+        origin_iteration: Optional[int] = None,
     ) -> Optional[PendingBlockWriteback]:
         """Pack updated blocks and enqueue one batched D2H copy."""
         sources = {
@@ -949,10 +981,12 @@ class GPUWorkingSet:
             dtype=torch.long,
             device=self.device,
         )
-        ready_event = torch.cuda.Event()
+        start_event = torch.cuda.Event(enable_timing=True)
+        ready_event = torch.cuda.Event(enable_timing=True)
         current_stream = torch.cuda.current_stream(self.device)
         with torch.cuda.stream(self._writeback_stream):
             self._writeback_stream.wait_stream(current_stream)
+            start_event.record(self._writeback_stream)
             if triton is not None:
                 grid = (len(plans), triton.cdiv(self.block_size * 59, 256))
                 _pack_resident_rows_kernel[grid](
@@ -986,7 +1020,14 @@ class GPUWorkingSet:
         return PendingBlockWriteback(
             plans,
             packed_cpu,
+            start_event,
             ready_event,
+            block_versions={
+                block_id: int(block_versions[block_id])
+                for block_id, _ in plans
+                if block_versions is not None and block_id in block_versions
+            },
+            origin_iteration=origin_iteration,
             release_event=release_event,
             gpu_refs=[
                 packed_gpu,

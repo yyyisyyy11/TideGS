@@ -58,6 +58,29 @@ class LogStorageLifecycleTest(unittest.TestCase):
         )
         self.assertTrue(all(not path.exists() for path in old_paths))
 
+    def test_explicit_stale_version_cannot_replace_newer_index(self):
+        self.assertGreaterEqual(
+            self.storage.write_patch(
+                {0: self.block(50)},
+                block_versions={0: 5},
+            ),
+            1,
+        )
+        self.assertEqual(
+            self.storage.write_patch(
+                {0: self.block(40)},
+                block_versions={0: 4},
+            ),
+            -1,
+        )
+        self.assertEqual(self.storage.get_block_versions([0]), {0: 5})
+        self.assertTrue(
+            torch.equal(self.storage.read_blocks([0])[0], self.block(50))
+        )
+        blocks, versions = self.storage.read_blocks_with_versions([0])
+        self.assertEqual(versions, {0: 5})
+        self.assertTrue(torch.equal(blocks[0], self.block(50)))
+
     def test_checkpoint_hardlink_survives_runtime_patch_gc(self):
         self.storage.write_patch({0: self.block(10), 1: self.block(11)})
         self.storage.write_patch({0: self.block(20)})

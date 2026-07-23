@@ -7,10 +7,18 @@ from strategies.tide_engine.distributed_plan import (
     DistributedBatchPlanner,
     assign_cameras_balanced,
     build_balanced_block_owner,
+    build_stable_block_owner,
 )
 
 
 class DistributedPlanTest(unittest.TestCase):
+    def test_stable_owner_is_round_robin(self):
+        owner = build_stable_block_owner(num_blocks=11, world_size=4)
+        np.testing.assert_array_equal(
+            owner,
+            np.asarray([0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2], dtype=np.int32),
+        )
+
     def test_owner_map_is_deterministic_complete_and_balanced(self):
         kwargs = dict(
             num_blocks=17,
@@ -80,6 +88,20 @@ class DistributedPlanTest(unittest.TestCase):
             self.assertTrue(all(owner[block_id] == rank for block_id in blocks))
             self.assertFalse(seen.intersection(blocks))
             seen.update(blocks)
+        self.assertLessEqual(len(plan.global_resident_blocks), 3)
+        self.assertEqual(seen, set(plan.global_resident_blocks))
+        self.assertEqual(
+            set(plan.global_active_blocks),
+            {
+                block_id
+                for rank_blocks in plan.rank_active_blocks
+                for block_id in rank_blocks
+            },
+        )
+        self.assertEqual(
+            set(plan.stream_in_blocks),
+            set(plan.global_resident_blocks),
+        )
 
     def test_planner_rejects_duplicate_camera_ids(self):
         planner = DistributedBatchPlanner(

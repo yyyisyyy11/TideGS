@@ -204,7 +204,7 @@ class AuxiliaryParams(ParamGroup):
         self.paper_resident_lambda = 0.3  # Eq.(5) mixing weight for next-step usefulness vs. recency
         self.paper_resident_recency_decay = 0.95  # multiplicative aging factor for resident recency
         self.paper_balanced_seed_fraction = 0.25  # topc_balanced camera-seed capacity fraction
-        self.paper_resident_capacity_blocks = 2048  # resident capacity in blocks
+        self.paper_resident_capacity_blocks = 2048  # Global cap in distributed mode
         self.paper_optimizer_state_mode = "full_cpu"  # {full_cpu, resident_blocks}; optimizer-state placement
         self.paper_optimizer_backend = "cpu"  # {cpu, gpu_resident}; optimizer update backend
         self.paper_block_reader_backend = "auto"  # {auto, unified_params, tiered_cache}; source for per-iteration block reads
@@ -213,7 +213,8 @@ class AuxiliaryParams(ParamGroup):
         self.tide_distributed_mode = "off"  # {off, gaussian_sharded}; explicit torchrun mode
         self.tide_camera_assignment = "equal"  # {equal, gaussian_balanced}; camera identity placement
         self.tide_camera_microbatch = 4  # Cameras rendered per distributed gsplat call
-        self.tide_owner_balance_samples = 256  # Camera samples used to weight the static block-owner map
+        self.tide_owner_balance_samples = 256  # Legacy compatibility; stable round-robin ignores it
+        self.tide_detailed_metrics = False  # Write per-rank/global batch and I/O metrics
         # Public TideGS aliases. These map onto the internal paper_* names for
         # checkpoint and args.json compatibility.
         self.tide_optimizer_deferred_mode = ""

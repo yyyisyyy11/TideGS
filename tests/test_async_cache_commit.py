@@ -157,6 +157,22 @@ class AsyncCacheCommitTest(unittest.TestCase):
         self.assertTrue(torch.equal(self.cache.data[3], torch.full((4, 59), 9.0)))
         self.assertTrue(self.payloads[-1].released.is_set())
 
+    def test_checkpoint_waits_for_already_pending_gpu_commit(self):
+        payload = _Payload(3, torch.full((4, 59), 6.0))
+        self.payloads.append(payload)
+        self.assertEqual(self.adapter.submit_cache_writeback(payload), 1)
+        self.adapter.bind_resident_writeback(_ResidentState([]), _WorkingSet([]))
+
+        thread = threading.Thread(target=self.adapter.flush_resident_dirty)
+        thread.start()
+        time.sleep(0.05)
+        self.assertTrue(thread.is_alive())
+        payload.ready.set()
+        thread.join(timeout=2.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(torch.equal(self.cache.data[3], torch.full((4, 59), 6.0)))
+
 
 if __name__ == "__main__":
     unittest.main()

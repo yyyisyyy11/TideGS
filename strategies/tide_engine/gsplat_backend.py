@@ -11,6 +11,7 @@ import torch
 
 MIN_DISTRIBUTED_GSPLAT = (1, 5, 3)
 PACKED_DISTRIBUTED_FIX = "image_ids = camera_ids"
+PROJECTION_TIMING_FIX = "_tide_projection_events"
 
 
 def _version_tuple(value: str) -> Tuple[int, ...]:
@@ -35,6 +36,21 @@ def _require_packed_distributed_fix(gsplat, version: Tuple[int, ...]) -> None:
             "gsplat 1.5.3 has an unsafe packed distributed rasterization path. "
             "Run `python tools/patch_gsplat_distributed_packed.py` in the TideGS "
             "environment before launching distributed training."
+        )
+
+
+def _require_projection_timing_fix(gsplat) -> None:
+    try:
+        source = inspect.getsource(gsplat.rasterization)
+    except (OSError, TypeError) as exc:
+        raise RuntimeError(
+            "Detailed TideGS metrics require inspectable gsplat rasterization source"
+        ) from exc
+    if PROJECTION_TIMING_FIX not in source:
+        raise RuntimeError(
+            "Detailed TideGS metrics require the gsplat projection timing patch. "
+            "Run `python tools/patch_gsplat_distributed_packed.py` in the TideGS "
+            "environment before launching training."
         )
 
 
@@ -67,9 +83,12 @@ def require_gsplat_cuda_backend():
     return _C
 
 
-def prepare_distributed_gsplat(context) -> None:
+def prepare_distributed_gsplat(context, *, enable_timing: bool = False) -> None:
     """Serialize first-time CUDA extension setup across local ranks."""
-    require_distributed_gsplat()
+    gsplat = require_distributed_gsplat()
+    torch._tide_gsplat_detailed_metrics = bool(enable_timing)
+    if enable_timing:
+        _require_projection_timing_fix(gsplat)
     for loader_rank in range(context.world_size):
         error = None
         if context.rank == loader_rank:
@@ -82,6 +101,20 @@ def prepare_distributed_gsplat(context) -> None:
             raise RuntimeError(
                 f"gsplat CUDA backend setup failed on rank {loader_rank}: {error}"
             )
+
+
+def projection_elapsed_ms(meta) -> float:
+    events = meta.get(PROJECTION_TIMING_FIX) if isinstance(meta, dict) else None
+    if events is None:
+        return 0.0
+    if not isinstance(events, (tuple, list)) or len(events) != 2:
+        raise RuntimeError("gsplat returned an invalid TideGS projection event pair")
+    start_event, end_event = events
+    end_event.synchronize()
+    elapsed_ms = float(start_event.elapsed_time(end_event))
+    if elapsed_ms < 0.0:
+        raise RuntimeError(f"gsplat returned negative projection time: {elapsed_ms}")
+    return elapsed_ms
 
 
 def _stack_cameras(cameras: Iterable[object]):

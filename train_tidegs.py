@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import gc
+import time
 import psutil
 import numpy as np
 from pathlib import Path
@@ -57,26 +58,11 @@ from storage.distributed_checkpoint import (
 from strategies.tide_engine.distributed_plan import (
     DistributedBatchPlan,
     DistributedBatchPlanner,
-    build_balanced_block_owner,
+    build_stable_block_owner,
     validate_block_owner,
 )
 from strategies.tide_engine.gsplat_backend import prepare_distributed_gsplat
 from utils.distributed import DistributedContext, get_distributed_context
-
-
-def _sample_block_visibility_counts(storage_adapter, training_schedule, sample_count):
-    num_blocks = int(storage_adapter.num_blocks)
-    counts = np.zeros((num_blocks,), dtype=np.int64)
-    sample_count = min(max(0, int(sample_count)), len(training_schedule))
-    if sample_count == 0:
-        return counts
-    positions = np.linspace(0, len(training_schedule) - 1, num=sample_count, dtype=np.int64)
-    camera_ids = [int(training_schedule[position]) for position in positions]
-    _, camera_blocks = storage_adapter.get_visible_blocks_batch(camera_ids)
-    for blocks in camera_blocks.values():
-        if blocks:
-            counts[np.asarray(blocks, dtype=np.int64)] += 1
-    return counts
 
 
 def _prepare_distributed_block_owner(
@@ -92,19 +78,15 @@ def _prepare_distributed_block_owner(
         owner_file = None if resume_manifest is None else resume_manifest.get("_tide_block_owner_file")
         if owner_file:
             owner = np.load(owner_file).astype(np.int32, copy=False)
+            args._tide_owner_policy = str(
+                resume_manifest.get("_tide_owner_policy", "checkpoint")
+            )
         else:
-            visibility_counts = _sample_block_visibility_counts(
-                storage_adapter,
-                training_schedule,
-                getattr(args, "tide_owner_balance_samples", 256),
-            )
-            owner = build_balanced_block_owner(
+            owner = build_stable_block_owner(
                 num_blocks=int(storage_adapter.num_blocks),
-                total_points=int(storage_adapter.num_points),
-                block_size=int(storage_adapter.block_size),
                 world_size=int(context.world_size),
-                visibility_counts=visibility_counts,
             )
+            args._tide_owner_policy = "stable_round_robin"
     owner_values = context.broadcast_object(None if owner is None else owner.tolist())
     owner = np.asarray(owner_values, dtype=np.int32)
     validate_block_owner(
@@ -116,7 +98,10 @@ def _prepare_distributed_block_owner(
     args._tide_block_owner = owner
     if context.is_rank0:
         counts = np.bincount(owner, minlength=context.world_size).tolist()
-        utils.print_rank_0(f"[DISTRIBUTED] Static block ownership per rank: {counts}")
+        utils.print_rank_0(
+            f"[DISTRIBUTED] Static block ownership ({args._tide_owner_policy}) "
+            f"per rank: {counts}"
+        )
     return owner
 
 
@@ -138,13 +123,19 @@ def _build_distributed_plan(
     )
     payload = None
     if context.is_rank0:
+        cull_start = time.perf_counter()
         _, camera_blocks = storage_adapter.get_visible_blocks_batch(schedule_info.batch_indices)
-        payload = planner.plan(
+        block_cull_ms = (time.perf_counter() - cull_start) * 1000.0
+        plan_start = time.perf_counter()
+        plan = planner.plan(
             iteration=iteration,
             epoch=schedule_info.epoch,
             camera_ids=schedule_info.batch_indices,
             camera_blocks=camera_blocks,
-        ).to_dict()
+        )
+        payload = plan.to_dict()
+        payload["block_cull_ms"] = block_cull_ms
+        payload["plan_ms"] = (time.perf_counter() - plan_start) * 1000.0
     return DistributedBatchPlan.from_dict(context.broadcast_object(payload)), schedule_info
 
 
@@ -258,7 +249,10 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             "Use scripts/train_matrixcity_1b.sh or enable the TideGS SSD flags."
         ) from exc
     if distributed_enabled:
-        prepare_distributed_gsplat(distributed_context)
+        prepare_distributed_gsplat(
+            distributed_context,
+            enable_timing=bool(args.tide_detailed_metrics),
+        )
     # ------------------------------------------------------------------------
     # 1.1: Setup auxiliary tools and GPU configuration
     # ------------------------------------------------------------------------
@@ -301,6 +295,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 rank=distributed_context.rank,
                 world_size=distributed_context.world_size,
                 global_bsz=args.bsz,
+            )
+            args.paper_resident_capacity_blocks = int(
+                pure_ssd_resume_manifest["_tide_global_capacity_blocks"]
             )
         else:
             if not is_pure_ssd_checkpoint(args.start_checkpoint):
@@ -460,7 +457,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 )
             log_file.write(
                 f"[DISTRIBUTED] rank={distributed_context.rank}/{distributed_context.world_size} "
-                f"local_gpu={distributed_context.local_rank} per_rank_cap={args.paper_resident_capacity_blocks}\n"
+                f"local_gpu={distributed_context.local_rank} "
+                f"global_cap={args.paper_resident_capacity_blocks}\n"
             )
 
         if pure_ssd_resume_manifest is not None:
@@ -597,6 +595,13 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         initial_camera_ids = current_distributed_plan.rank_camera_ids[
             distributed_context.rank
         ]
+        initial_resident = current_distributed_plan.rank_resident_blocks[
+            distributed_context.rank
+        ]
+        gaussians._block_reader.hint_future(
+            initial_resident,
+            target_iteration=start_from_this_iteration,
+        )
     else:
         initial_camera_schedule = get_camera_batch_schedule(
             training_schedule=ssd_training_schedule,
@@ -901,8 +906,19 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     batch_size=args.bsz,
                     schedule_ordering=getattr(args, "ssd_schedule_ordering", "trajectory"),
                 )
+                rank = distributed_context.rank
+                current_resident = set(
+                    current_distributed_plan.rank_resident_blocks[rank]
+                )
+                next_resident = set(
+                    next_distributed_plan.rank_resident_blocks[rank]
+                )
+                gaussians._block_reader.hint_future(
+                    sorted(next_resident - current_resident),
+                    target_iteration=next_iteration,
+                )
                 camera_batch_prefetcher.submit(
-                    next_distributed_plan.rank_camera_ids[distributed_context.rank]
+                    next_distributed_plan.rank_camera_ids[rank]
                 )
             current_distributed_plan = next_distributed_plan
 
@@ -1082,6 +1098,15 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 
         distributed_context.barrier()
         storage_adapter.shutdown()
+        if distributed_enabled:
+            from strategies.tide_engine.distributed_metrics import (
+                get_distributed_metrics_writer,
+            )
+
+            get_distributed_metrics_writer(
+                gaussians,
+                distributed_context,
+            ).write_io_events(storage_adapter.cache.drain_io_events())
         shutdown_double_buffer_gpu()
         distributed_context.barrier()
 

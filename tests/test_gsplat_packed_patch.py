@@ -32,6 +32,24 @@ class GsplatPackedPatchTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "unknown source layout"):
             PATCH_MODULE.patch_rendering_source("unrelated source")
 
+    def test_inserts_projection_timing_once(self):
+        source = (
+            f"before\n{PATCH_MODULE.PROJECTION_START_ANCHOR}"
+            f"project\n{PATCH_MODULE.PROJECTION_END_ANCHOR}after\n"
+        )
+        patched, changed = PATCH_MODULE.patch_projection_timing_source(source)
+        self.assertTrue(changed)
+        self.assertIn(PATCH_MODULE.PROJECTION_TIMING_MARKER, patched)
+        patched_again, changed_again = (
+            PATCH_MODULE.patch_projection_timing_source(patched)
+        )
+        self.assertFalse(changed_again)
+        self.assertEqual(patched_again, patched)
+
+    def test_projection_timing_rejects_unknown_source_layout(self):
+        with self.assertRaisesRegex(RuntimeError, "unknown source layout"):
+            PATCH_MODULE.patch_projection_timing_source("unrelated source")
+
 
 if __name__ == "__main__":
     unittest.main()

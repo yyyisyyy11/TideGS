@@ -205,7 +205,30 @@ class LogStorageManager:
         with self._storage_operation():
             return self._read_blocks_uncoordinated(block_ids)
 
-    def _read_blocks_uncoordinated(self, block_ids: List[int]) -> Dict[int, torch.Tensor]:
+    def read_blocks_with_versions(
+        self,
+        block_ids: List[int],
+    ) -> Tuple[Dict[int, torch.Tensor], Dict[int, int]]:
+        with self._storage_operation():
+            return self._read_blocks_uncoordinated(
+                block_ids,
+                return_versions=True,
+            )
+
+    def get_block_versions(self, block_ids: List[int]) -> Dict[int, int]:
+        with self.index_lock:
+            return {
+                int(block_id): int(self.index[int(block_id)].version)
+                for block_id in block_ids
+                if int(block_id) in self.index
+            }
+
+    def _read_blocks_uncoordinated(
+        self,
+        block_ids: List[int],
+        *,
+        return_versions: bool = False,
+    ):
         """
         Read multiple blocks from storage.
         从存储中批量读取多个 blocks
@@ -218,9 +241,10 @@ class LogStorageManager:
             Dictionary mapping block_id -> tensor data
         """
         if not block_ids:
-            return {}
+            return ({}, {}) if return_versions else {}
 
         result = {}
+        versions = {}
 
         # Group blocks by file for efficient batched reads
         # 建立分组字典： k是文件id，v是(block_id, Blocklocation)列表
@@ -233,6 +257,7 @@ class LogStorageManager:
                     raise ValueError(f"Block {block_id} not in index")
 
                 location = self.index[block_id]
+                versions[int(block_id)] = int(location.version)
                 if location.file_id not in file_groups:
                     file_groups[location.file_id] = []
                 file_groups[location.file_id].append((block_id, location))
@@ -275,7 +300,7 @@ class LogStorageManager:
 
             self.stats['reads'] += len(blocks)
 
-        return result
+        return (result, versions) if return_versions else result
 
     def _read_base_block(self, block_id: int) -> torch.Tensor:
         """Read a block directly from the immutable base segment."""
@@ -290,25 +315,62 @@ class LogStorageManager:
             raise RuntimeError(f"Base segment returned empty data for block {block_id}")
         return torch.from_numpy(np_array).reshape(curr_num_points, self.point_dim)
 
-    def write_patch(self, block_dict: Dict[int, torch.Tensor]) -> int:
+    def write_patch(
+        self,
+        block_dict: Dict[int, torch.Tensor],
+        block_versions: Optional[Dict[int, int]] = None,
+    ) -> int:
         if not block_dict:
             return -1
-        estimated_bytes = sum(
-            int(tensor.numel()) * int(tensor.element_size())
-            for tensor in block_dict.values()
-            if tensor is not None and torch.is_tensor(tensor)
-        )
         with self._write_lock:
+            selected = dict(block_dict)
+            selected_versions = None
+            if block_versions is not None:
+                missing_versions = sorted(
+                    int(block_id)
+                    for block_id in block_dict
+                    if int(block_id) not in block_versions
+                )
+                if missing_versions:
+                    raise ValueError(
+                        "Explicit patch write is missing block versions for "
+                        f"{missing_versions[:8]}"
+                    )
+                with self.index_lock:
+                    selected = {
+                        int(block_id): tensor
+                        for block_id, tensor in block_dict.items()
+                        if int(block_versions.get(int(block_id), -1))
+                        > int(self.index[int(block_id)].version)
+                    }
+                selected_versions = {
+                    block_id: int(block_versions[block_id])
+                    for block_id in selected
+                }
+            if not selected:
+                return -1
+            estimated_bytes = sum(
+                int(tensor.numel()) * int(tensor.element_size())
+                for tensor in selected.values()
+                if tensor is not None and torch.is_tensor(tensor)
+            )
             if self._compaction_needed():
                 self.maybe_compact(min_patches=2)
             self._check_free_space(estimated_bytes, "patch write")
             with self._storage_operation():
-                patch_id = self._write_patch_uncoordinated(block_dict)
+                patch_id = self._write_patch_uncoordinated(
+                    selected,
+                    block_versions=selected_versions,
+                )
             if self._compaction_needed():
                 self.maybe_compact(min_patches=2)
             return patch_id
 
-    def _write_patch_uncoordinated(self, block_dict: Dict[int, torch.Tensor]) -> int:
+    def _write_patch_uncoordinated(
+        self,
+        block_dict: Dict[int, torch.Tensor],
+        block_versions: Optional[Dict[int, int]] = None,
+    ) -> int:
         """
         Write updated blocks to a new patch file (append-only).
 
@@ -367,11 +429,16 @@ class LogStorageManager:
 
                     with self.index_lock:
                         old_version = self.index[block_id].version if block_id in self.index else 0
+                    new_version = (
+                        int(block_versions[block_id])
+                        if block_versions is not None
+                        else int(old_version) + 1
+                    )
                     updated_locations[block_id] = BlockLocation(
                         file_id=patch_id,
                         offset=current_offset,
                         size=len(data_bytes),
-                        version=old_version + 1,
+                        version=new_version,
                     )
                     current_offset += len(data_bytes)
                 f.flush()
