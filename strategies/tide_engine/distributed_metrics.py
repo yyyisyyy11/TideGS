@@ -36,6 +36,7 @@ BATCH_FIELDS = [
     "gaussian_projection_cull_ms",
     "backward_ms",
     "optimizer_ms",
+    "train_ms",
     "bounds_sync_ms",
     "barrier_ms",
     "gpu_d2h_ms",

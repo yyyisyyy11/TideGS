@@ -414,6 +414,9 @@ def train_distributed_tide_batch(
         )
 
     projection_ms = sum(projection_elapsed_ms(meta) for meta in metas)
+    forward_ms = float(forward_start.elapsed_time(forward_end))
+    backward_ms = float(backward_start.elapsed_time(backward_end))
+    optimizer_ms = float(optimizer_start.elapsed_time(optimizer_end))
     metrics_row = {
         "iteration": iteration,
         "local_cameras": len(batched_cameras),
@@ -445,10 +448,11 @@ def train_distributed_tide_batch(
         ),
         "prefetch_ssd_ms": cache_delta("future_storage_read_time") * 1000.0,
         "h2d_ms": h2d_ms,
-        "gsplat_forward_ms": float(forward_start.elapsed_time(forward_end)),
+        "gsplat_forward_ms": forward_ms,
         "gaussian_projection_cull_ms": projection_ms,
-        "backward_ms": float(backward_start.elapsed_time(backward_end)),
-        "optimizer_ms": float(optimizer_start.elapsed_time(optimizer_end)),
+        "backward_ms": backward_ms,
+        "optimizer_ms": optimizer_ms,
+        "train_ms": forward_ms + backward_ms + optimizer_ms,
         "bounds_sync_ms": bounds_sync_ms,
         "barrier_ms": barrier_ms,
         "gpu_d2h_ms": execution_delta("background_gpu_d2h_time_ms"),
