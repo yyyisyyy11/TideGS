@@ -85,6 +85,7 @@ class AsyncCacheCommitTest(unittest.TestCase):
         self.payloads = []
         self.refresh_bounds_flags = []
         self.cache = _Cache(3, torch.zeros(4, 59))
+        self.adapter.cache = self.cache
 
         def sync_cache(updated, *, refresh_bounds=True):
             self.refresh_bounds_flags.append(bool(refresh_bounds))
