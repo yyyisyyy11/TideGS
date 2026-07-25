@@ -19,21 +19,18 @@ def get_gpu_resident_optimizer(gaussians, batch_size):
         )
     )
     current_optimizer = getattr(gaussians, '_paper_gpu_resident_optimizer', None)
-    desired_capacity = max(
-        0,
-        int(getattr(getattr(gaussians, 'args', None), 'paper_resident_capacity_blocks', 0)),
-    )
     needs_recreate = (
         current_optimizer is None
         or getattr(current_optimizer, 'batch_size', None) != batch_size
         or getattr(current_optimizer, 'block_size', desired_block_size) != desired_block_size
-        or getattr(current_optimizer, 'capacity_blocks', desired_capacity) != desired_capacity
     )
     if needs_recreate:
         gaussians._paper_gpu_resident_optimizer = GPUResidentAdam(
             batch_size=batch_size,
             block_size=desired_block_size,
-            capacity_blocks=desired_capacity,
+            # Planner capacity is global in distributed mode; storage grows from
+            # the actual rank-local resident set in set_resident_blocks().
+            capacity_blocks=0,
             device='cuda',
         )
     return gaussians._paper_gpu_resident_optimizer

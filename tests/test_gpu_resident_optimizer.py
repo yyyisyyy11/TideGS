@@ -1,6 +1,7 @@
 import math
 import types
 import unittest
+from unittest import mock
 
 import torch
 
@@ -104,6 +105,54 @@ def _reference_step(
             block_state["exp_avg_sq"][name][rows] = avg_sq
             update = avg / (avg_sq.sqrt() / denom_scale + eps)
             params[name][local_ids[positions]] -= update * (columns_lr[group_index] / bias1)
+
+
+class GPUResidentAdamAllocationTest(unittest.TestCase):
+    def test_initial_allocation_matches_actual_resident_blocks(self):
+        block_size = 4
+        optimizer = GPUResidentAdam(
+            batch_size=1,
+            block_size=block_size,
+            capacity_blocks=0,
+            device="cpu",
+        )
+
+        optimizer.set_resident_blocks([10, 20, 30])
+
+        expected_bytes = 3 * block_size * GPUResidentAdam.TOTAL_WIDTH * 2 * 4
+        self.assertEqual(optimizer._allocated_slots, 3)
+        self.assertEqual(optimizer.get_stats()["allocated_state_bytes"], expected_bytes)
+
+    def test_planner_capacity_does_not_control_optimizer_allocation(self):
+        from strategies.tide_engine import engine as tide_engine
+
+        args = types.SimpleNamespace(
+            gaussian_block_size=4096,
+            paper_resident_capacity_blocks=8192,
+        )
+        gaussians = types.SimpleNamespace(args=args)
+        optimizer = types.SimpleNamespace(
+            batch_size=32,
+            block_size=4096,
+            capacity_blocks=0,
+        )
+
+        with mock.patch.object(
+            tide_engine, "GPUResidentAdam", return_value=optimizer
+        ) as optimizer_cls:
+            first = tide_engine.get_gpu_resident_optimizer(gaussians, batch_size=32)
+            optimizer_cls.assert_called_once_with(
+                batch_size=32,
+                block_size=4096,
+                capacity_blocks=0,
+                device="cuda",
+            )
+
+            args.paper_resident_capacity_blocks = 16384
+            second = tide_engine.get_gpu_resident_optimizer(gaussians, batch_size=32)
+
+        self.assertIs(first, second)
+        optimizer_cls.assert_called_once()
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
