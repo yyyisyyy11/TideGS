@@ -90,6 +90,14 @@ class DistributedResidentState:
             }
         return next(iter(origins)) if len(origins) == 1 else None
 
+    def origins_for_blocks(self, block_ids: Iterable[int]) -> Dict[int, int]:
+        with self._lock:
+            return {
+                int(block_id): int(self.dirty_origin_iterations[int(block_id)])
+                for block_id in block_ids
+                if int(block_id) in self.dirty_origin_iterations
+            }
+
     def begin_writeback(self, block_ids: Iterable[int]) -> Dict[int, int]:
         with self._lock:
             versions = {}
@@ -107,7 +115,9 @@ class DistributedResidentState:
             for block_id, version in block_versions.items():
                 if self.pending_commit_versions.get(int(block_id)) == int(version):
                     self.pending_commit_versions.pop(int(block_id), None)
-                    self.gpu_dirty_versions[int(block_id)] = int(version)
+                    current_dirty = self.gpu_dirty_versions.get(int(block_id))
+                    if current_dirty is None or int(current_dirty) < int(version):
+                        self.gpu_dirty_versions[int(block_id)] = int(version)
 
     def complete_writeback(
         self,
@@ -149,7 +159,7 @@ def _flush_blocks(storage_adapter, manager, state, block_ids: Sequence[int]) -> 
     payload = manager.stage_updated_blocks(
         selected,
         block_versions=block_versions,
-        origin_iteration=state.latest_dirty_iteration(selected),
+        block_origin_iterations=state.origins_for_blocks(selected),
     )
     if payload is None or set(payload.block_ids) != set(selected):
         staged = [] if payload is None else list(payload.block_ids)
@@ -278,7 +288,6 @@ def train_distributed_tide_batch(
     cache = storage_adapter.cache
     cache.set_foreground_iteration(iteration)
     cache_before = cache.get_stats()
-    execution_before = dict(storage_adapter.execution_metrics)
     state = _resident_state(gaussians)
     target_resident = set(int(value) for value in plan.rank_resident_blocks[context.rank])
     evicted = state.resident - target_resident
@@ -403,15 +412,9 @@ def train_distributed_tide_batch(
         else 0.0
     )
     cache_after = cache.get_stats()
-    execution_after = dict(storage_adapter.execution_metrics)
 
     def cache_delta(name):
         return float(cache_after.get(name, 0)) - float(cache_before.get(name, 0))
-
-    def execution_delta(name):
-        return float(execution_after.get(name, 0)) - float(
-            execution_before.get(name, 0)
-        )
 
     projection_ms = sum(projection_elapsed_ms(meta) for meta in metas)
     forward_ms = float(forward_start.elapsed_time(forward_end))
@@ -446,13 +449,6 @@ def train_distributed_tide_batch(
         ),
         "ssd_urgent_read_blocks": cache_delta("urgent_storage_read_blocks"),
         "ssd_urgent_read_bytes": cache_delta("ssd_bytes_read_urgent"),
-        "ssd_future_read_blocks": cache_delta("future_storage_read_blocks"),
-        "ssd_future_read_bytes": cache_delta("ssd_bytes_read_future"),
-        "prefetch_cpu_ms": max(
-            0.0,
-            cache_delta("future_materialize_time") * 1000.0,
-        ),
-        "prefetch_ssd_ms": cache_delta("future_storage_read_time") * 1000.0,
         "h2d_bytes": int(retention_stats.get("h2d_bytes", 0)),
         "h2d_ms": h2d_ms,
         "gsplat_forward_ms": forward_ms,
@@ -462,18 +458,6 @@ def train_distributed_tide_batch(
         "train_ms": forward_ms + backward_ms + optimizer_ms,
         "bounds_sync_ms": bounds_sync_ms,
         "barrier_ms": barrier_ms,
-        "gpu_d2h_ms": execution_delta("background_gpu_d2h_time_ms"),
-        "cpu_cache_commit_ms": execution_delta(
-            "background_cache_commit_time_ms"
-        ),
-        "ssd_write_blocks": cache_delta("async_flush_blocks")
-        + cache_delta("sync_flush_blocks"),
-        "ssd_write_bytes": cache_delta("ssd_bytes_written_async")
-        + cache_delta("ssd_bytes_written_sync"),
-        "ssd_write_service_ms": (
-            cache_delta("async_flush_time") + cache_delta("sync_flush_time")
-        )
-        * 1000.0,
         "batch_total_ms": (time.perf_counter() - batch_start) * 1000.0,
     }
     metrics_writer.write_io_events(cache.drain_io_events())

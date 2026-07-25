@@ -259,6 +259,27 @@ class TideStorageAdapter:
         )
         self._cache_commit_thread.start()
 
+    def _record_partitioned_io_events(
+        self,
+        *,
+        operation: str,
+        tier: str,
+        block_tensors: Dict[int, torch.Tensor],
+        service_ms: float,
+        block_origin_iterations: Optional[Dict[int, int]] = None,
+        origin_iteration: Optional[int] = None,
+    ) -> None:
+        recorder = getattr(self.cache, "record_partitioned_io_events", None)
+        if callable(recorder):
+            recorder(
+                operation=operation,
+                tier=tier,
+                block_tensors=block_tensors,
+                service_ms=service_ms,
+                block_origin_iterations=block_origin_iterations,
+                origin_iteration=origin_iteration,
+            )
+
     def _cache_commit_worker(self) -> None:
         while True:
             job = self._cache_commit_queue.get()
@@ -267,10 +288,6 @@ class TideStorageAdapter:
                 return
             try:
                 updated_blocks = job.payload.wait()
-                bytes_transferred = sum(
-                    int(tensor.numel()) * int(tensor.element_size())
-                    for tensor in updated_blocks.values()
-                )
                 gpu_elapsed = getattr(job.payload, "gpu_elapsed_ms", None)
                 gpu_elapsed_ms = 0.0
                 if callable(gpu_elapsed):
@@ -281,15 +298,19 @@ class TideStorageAdapter:
                 commit_start = time.perf_counter()
                 block_versions = getattr(job.payload, "block_versions", None)
                 origin_iteration = getattr(job.payload, "origin_iteration", None)
+                block_origin_iterations = getattr(
+                    job.payload,
+                    "block_origin_iterations",
+                    None,
+                )
                 record_io_event = getattr(self.cache, "record_io_event", None)
                 if callable(record_io_event):
-                    record_io_event(
+                    self._record_partitioned_io_events(
                         operation="gpu_d2h",
                         tier="gpu_to_cpu",
+                        block_tensors=updated_blocks,
+                        block_origin_iterations=block_origin_iterations,
                         origin_iteration=origin_iteration,
-                        target_iteration=None,
-                        blocks=len(updated_blocks),
-                        bytes=bytes_transferred,
                         service_ms=gpu_elapsed_ms,
                     )
                 sync_kwargs = {
@@ -299,6 +320,10 @@ class TideStorageAdapter:
                     sync_kwargs["block_versions"] = block_versions
                 if origin_iteration is not None:
                     sync_kwargs["origin_iteration"] = int(origin_iteration)
+                if block_origin_iterations:
+                    sync_kwargs["block_origin_iterations"] = (
+                        block_origin_iterations
+                    )
                 job.result = self.sync_cache_from_cpu_views(
                     updated_blocks,
                     **sync_kwargs,
@@ -312,13 +337,12 @@ class TideStorageAdapter:
                     )
                 ) + commit_elapsed_ms
                 if callable(record_io_event):
-                    record_io_event(
+                    self._record_partitioned_io_events(
                         operation="cpu_cache_commit",
                         tier="cpu_cache",
+                        block_tensors=updated_blocks,
+                        block_origin_iterations=block_origin_iterations,
                         origin_iteration=origin_iteration,
-                        target_iteration=None,
-                        blocks=len(updated_blocks),
-                        bytes=bytes_transferred,
                         service_ms=commit_elapsed_ms,
                     )
             except Exception as exc:
@@ -444,12 +468,25 @@ class TideStorageAdapter:
                 "latest_dirty_iteration",
                 None,
             )
+            origins_for_blocks = getattr(
+                resident_state,
+                "origins_for_blocks",
+                None,
+            )
             payload = working_set.stage_updated_blocks(
                 dirty_blocks,
                 block_versions=block_versions,
+                block_origin_iterations=(
+                    origins_for_blocks(dirty_blocks)
+                    if callable(origins_for_blocks)
+                    else None
+                ),
                 origin_iteration=(
                     latest_dirty_iteration(dirty_blocks)
-                    if callable(latest_dirty_iteration)
+                    if (
+                        not callable(origins_for_blocks)
+                        and callable(latest_dirty_iteration)
+                    )
                     else None
                 ),
             )
@@ -1109,6 +1146,7 @@ class TideStorageAdapter:
         refresh_bounds: bool = True,
         block_versions: Optional[Dict[int, int]] = None,
         origin_iteration: Optional[int] = None,
+        block_origin_iterations: Optional[Dict[int, int]] = None,
     ):
         if not updated_blocks_dict:
             return 0
@@ -1122,6 +1160,7 @@ class TideStorageAdapter:
             updated_blocks_dict,
             block_versions=block_versions,
             origin_iteration=origin_iteration,
+            block_origin_iterations=block_origin_iterations,
         )
         self.execution_metrics["paper_cache_sync_staged_blocks"] += staged_valid
         if refresh_bounds:

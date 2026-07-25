@@ -226,6 +226,7 @@ class PendingBlockWriteback:
         ready_event,
         block_versions=None,
         origin_iteration=None,
+        block_origin_iterations=None,
         release_event=None,
         gpu_refs=None,
     ):
@@ -237,9 +238,18 @@ class PendingBlockWriteback:
             int(block_id): int(version)
             for block_id, version in (block_versions or {}).items()
         }
-        self.origin_iteration = (
-            None if origin_iteration is None else int(origin_iteration)
-        )
+        self.block_origin_iterations = {
+            int(block_id): int(iteration)
+            for block_id, iteration in (block_origin_iterations or {}).items()
+        }
+        if origin_iteration is not None:
+            for block_id, _ in plans:
+                self.block_origin_iterations.setdefault(
+                    int(block_id),
+                    int(origin_iteration),
+                )
+        origins = set(self.block_origin_iterations.values())
+        self.origin_iteration = next(iter(origins)) if len(origins) == 1 else None
         self.release_event = release_event
         self.gpu_refs = list(gpu_refs or [])
         self._result = None
@@ -1350,6 +1360,7 @@ class GPUWorkingSet:
         updated_block_ids: List[int],
         block_versions: Optional[Dict[int, int]] = None,
         origin_iteration: Optional[int] = None,
+        block_origin_iterations: Optional[Dict[int, int]] = None,
     ) -> Optional[PendingBlockWriteback]:
         """Pack updated blocks and enqueue one batched D2H copy."""
         sources = {
@@ -1447,6 +1458,14 @@ class GPUWorkingSet:
                 if block_versions is not None and block_id in block_versions
             },
             origin_iteration=origin_iteration,
+            block_origin_iterations={
+                block_id: int(block_origin_iterations[block_id])
+                for block_id, _ in plans
+                if (
+                    block_origin_iterations is not None
+                    and block_id in block_origin_iterations
+                )
+            },
             release_event=release_event,
             gpu_refs=[
                 packed_gpu,

@@ -28,6 +28,33 @@ class DistributedResidentVersionTest(unittest.TestCase):
         self.assertEqual(state.pending_commit_versions, {})
         self.assertEqual(state.versions_for_blocks([4]), {4: 3})
 
+    def test_failed_old_commit_cannot_downgrade_newer_dirty_version(self):
+        state = DistributedResidentState(block_versions={4: 5})
+        state.mark_dirty_blocks([4], iteration=1)
+        pending = state.begin_writeback([4])
+        state.mark_dirty_blocks([4], iteration=33)
+
+        state.cancel_writeback(pending)
+
+        self.assertEqual(state.pending_commit_versions, {})
+        self.assertEqual(state.dirty_blocks(), [4])
+        self.assertEqual(state.versions_for_blocks([4]), {4: 7})
+        self.assertEqual(state.gpu_dirty_versions, {4: 7})
+        self.assertEqual(state.dirty_origin_iterations, {4: 33})
+
+    def test_late_old_callback_does_not_cancel_newer_pending_version(self):
+        state = DistributedResidentState(block_versions={4: 5})
+        state.mark_dirty_blocks([4], iteration=1)
+        old_pending = state.begin_writeback([4])
+        state.mark_dirty_blocks([4], iteration=33)
+        new_pending = state.begin_writeback([4])
+
+        state.cancel_writeback(old_pending)
+        state.complete_writeback([4], old_pending)
+
+        self.assertEqual(state.pending_commit_versions, new_pending)
+        self.assertEqual(state.versions_for_blocks([4]), {4: 7})
+
 
 if __name__ == "__main__":
     unittest.main()

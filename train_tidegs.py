@@ -1096,10 +1096,14 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 get_distributed_metrics_writer,
             )
 
-            get_distributed_metrics_writer(
+            metrics_writer = get_distributed_metrics_writer(
                 gaussians,
                 distributed_context,
-            ).write_io_events(storage_adapter.cache.drain_io_events())
+            )
+            metrics_writer.write_io_events(
+                storage_adapter.cache.drain_io_events()
+            )
+            metrics_writer.finalize_async_metrics()
         shutdown_double_buffer_gpu()
         distributed_context.barrier()
 
