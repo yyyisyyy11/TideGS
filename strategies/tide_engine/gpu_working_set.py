@@ -115,6 +115,82 @@ if triton is not None:
             )
             tl.store(output + block_position * 6 + 3 + axis, tl.max(values, axis=0))
 
+    @triton.jit
+    def _unpack_persistent_blocks_kernel(
+        source,
+        source_starts,
+        target_starts,
+        row_counts,
+        block_ids,
+        target_xyz,
+        target_scaling,
+        target_rotation,
+        target_opacity,
+        target_features_dc,
+        target_features_rest,
+        target_global_ids,
+        SOURCE_UNIFIED: tl.constexpr,
+        BLOCK_ROWS: tl.constexpr,
+        COPY_BLOCK_SIZE: tl.constexpr,
+    ):
+        block_position = tl.program_id(0)
+        offsets = tl.program_id(1) * COPY_BLOCK_SIZE + tl.arange(0, COPY_BLOCK_SIZE)
+        row_count = tl.load(row_counts + block_position)
+        mask = offsets < row_count * 59
+        row = offsets // 59
+        column = offsets - row * 59
+        source_row = tl.load(source_starts + block_position) + row
+        target_row = tl.load(target_starts + block_position) + row
+
+        source_column = column
+        if SOURCE_UNIFIED:
+            source_column = tl.where(
+                (column >= 3) & (column < 10), column + 1, source_column
+            )
+            source_column = tl.where(column == 10, 3, source_column)
+        value = tl.load(
+            source + source_row * 59 + source_column,
+            mask=mask,
+            other=0.0,
+        )
+
+        xyz_mask = mask & (column < 3)
+        scaling_mask = mask & (column >= 3) & (column < 6)
+        rotation_mask = mask & (column >= 6) & (column < 10)
+        opacity_mask = mask & (column == 10)
+        dc_mask = mask & (column >= 11) & (column < 14)
+        rest_mask = mask & (column >= 14)
+        tl.store(target_xyz + target_row * 3 + column, value, mask=xyz_mask)
+        tl.store(
+            target_scaling + target_row * 3 + (column - 3),
+            value,
+            mask=scaling_mask,
+        )
+        tl.store(
+            target_rotation + target_row * 4 + (column - 6),
+            value,
+            mask=rotation_mask,
+        )
+        tl.store(target_opacity + target_row, value, mask=opacity_mask)
+        tl.store(
+            target_features_dc + target_row * 3 + (column - 11),
+            value,
+            mask=dc_mask,
+        )
+        tl.store(
+            target_features_rest + target_row * 45 + (column - 14),
+            value,
+            mask=rest_mask,
+        )
+
+        global_mask = mask & (column == 0)
+        block_id = tl.load(block_ids + block_position, mask=global_mask, other=0)
+        tl.store(
+            target_global_ids + target_row,
+            block_id * BLOCK_ROWS + row,
+            mask=global_mask,
+        )
+
 
 class PendingBlockBounds:
     """Compact per-block bounds awaiting one asynchronous D2H copy."""
@@ -281,6 +357,11 @@ class GPUWorkingSet:
         # Compact block-start lookup: O(num_blocks) instead of O(N)
         self._block_starts: Optional[torch.Tensor] = None
 
+        # The distributed path keeps rank-local blocks in stable GPU slots.
+        self._persistent_slot_capacity = 0
+        self._persistent_block_to_slot: Dict[int, int] = {}
+        self._persistent_free_slots: List[int] = []
+
         self._writeback_stream = torch.cuda.Stream(device=self.device)
         self._writeback_staging_slots: List[Optional[torch.Tensor]] = [None, None]
         self._writeback_gpu_staging_slots: List[Optional[torch.Tensor]] = [None, None]
@@ -326,9 +407,14 @@ class GPUWorkingSet:
         self._block_starts = torch.full(
             (self.num_blocks,), -1, dtype=torch.long, device=self.device,
         )
-        for block_id, s in self.block_to_gpu_slice.items():
-            if 0 <= block_id < self.num_blocks:
-                self._block_starts[block_id] = s.start
+        valid_items = [
+            (int(block_id), int(block_slice.start))
+            for block_id, block_slice in self.block_to_gpu_slice.items()
+            if 0 <= int(block_id) < self.num_blocks
+        ]
+        if valid_items:
+            mapping = torch.tensor(valid_items, dtype=torch.long, device=self.device)
+            self._block_starts.index_copy_(0, mapping[:, 0], mapping[:, 1])
 
     def global_to_local(self, global_ids: torch.Tensor) -> torch.Tensor:
         """Map global Gaussian IDs to working-set-local indices.
@@ -460,6 +546,332 @@ class GPUWorkingSet:
             'features_dc': self.gpu_features_dc,
             'features_rest': self.gpu_features_rest
         }
+
+    def _persistent_component_tensors(self) -> Dict[str, torch.Tensor]:
+        return {
+            'xyz': self.gpu_xyz,
+            'scaling': self.gpu_scaling,
+            'rotation': self.gpu_rotation,
+            'opacity': self.gpu_opacity,
+            'features_dc': self.gpu_features_dc,
+            'features_rest': self.gpu_features_rest,
+        }
+
+    def _ensure_persistent_slot_capacity(self, required_slots: int) -> int:
+        if required_slots <= self._persistent_slot_capacity:
+            return 0
+
+        old_capacity = self._persistent_slot_capacity
+        target_capacity = max(required_slots, max(1, old_capacity * 2))
+        target_rows = target_capacity * self.block_size
+        old_rows = old_capacity * self.block_size
+        old_tensors = self._persistent_component_tensors()
+        specs = {
+            'xyz': 3,
+            'scaling': 3,
+            'rotation': 4,
+            'opacity': 1,
+            'features_dc': 3,
+            'features_rest': 45,
+        }
+        new_tensors = {
+            name: torch.empty(
+                (target_rows, width),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            for name, width in specs.items()
+        }
+        new_global_ids = torch.full(
+            (target_rows,),
+            -1,
+            dtype=torch.long,
+            device=self.device,
+        )
+        if old_rows:
+            with torch.no_grad():
+                for name, tensor in new_tensors.items():
+                    tensor[:old_rows].copy_(old_tensors[name].detach())
+                new_global_ids[:old_rows].copy_(self.local_to_global_idx)
+
+        self.gpu_xyz = new_tensors['xyz']
+        self.gpu_scaling = new_tensors['scaling']
+        self.gpu_rotation = new_tensors['rotation']
+        self.gpu_opacity = new_tensors['opacity']
+        self.gpu_features_dc = new_tensors['features_dc']
+        self.gpu_features_rest = new_tensors['features_rest']
+        self.local_to_global_idx = new_global_ids
+        free_slots = set(self._persistent_free_slots)
+        free_slots.update(range(old_capacity, target_capacity))
+        self._persistent_free_slots = sorted(free_slots, reverse=True)
+        self._persistent_slot_capacity = target_capacity
+        return target_capacity - old_capacity
+
+    @staticmethod
+    def _block_layout_columns(layout) -> Dict[str, slice]:
+        from storage.block_reader import BlockLayout
+
+        if layout == BlockLayout.UNIFIED:
+            return {
+                'xyz': slice(0, 3),
+                'opacity': slice(3, 4),
+                'scaling': slice(4, 7),
+                'rotation': slice(7, 11),
+                'features_dc': slice(11, 14),
+                'features_rest': slice(14, 59),
+            }
+        if layout == BlockLayout.CACHE:
+            return {
+                'xyz': slice(0, 3),
+                'scaling': slice(3, 6),
+                'rotation': slice(6, 10),
+                'opacity': slice(10, 11),
+                'features_dc': slice(11, 14),
+                'features_rest': slice(14, 59),
+            }
+        raise ValueError(f'Unsupported block layout: {layout!r}')
+
+    def _load_visible_blocks_persistent(
+        self,
+        visible_block_ids: List[int],
+        *,
+        enable_retention: bool,
+        block_reader,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, object]]:
+        """Materialize a distributed rank working set into stable GPU slots."""
+        load_start = time.perf_counter()
+        sorted_visible = sorted(
+            set(
+                int(block_id)
+                for block_id in visible_block_ids
+                if 0 <= int(block_id) < self.num_blocks
+            )
+        )
+        if not sorted_visible:
+            raise ValueError("Distributed GPU working set requires resident blocks")
+
+        target_set = set(sorted_visible)
+        current_set = set(self._persistent_block_to_slot)
+        retained_set = current_set & target_set if enable_retention else set()
+        evicted_set = current_set - retained_set
+        incoming_blocks = sorted(target_set - retained_set)
+
+        # Any evicted slot may still be a source for a queued D2H writeback.
+        torch.cuda.current_stream(self.device).wait_stream(self._writeback_stream)
+        growth_blocks = self._ensure_persistent_slot_capacity(len(target_set))
+
+        for block_id in sorted(evicted_set):
+            slot = self._persistent_block_to_slot.pop(block_id)
+            self._persistent_free_slots.append(slot)
+            self.block_to_gpu_slice.pop(block_id, None)
+        self._persistent_free_slots = sorted(
+            set(self._persistent_free_slots),
+            reverse=True,
+        )
+
+        assigned_slots = {}
+        for block_id in incoming_blocks:
+            if not self._persistent_free_slots:
+                raise RuntimeError("Persistent GPU slot allocator exhausted")
+            slot = self._persistent_free_slots.pop()
+            self._persistent_block_to_slot[block_id] = slot
+            assigned_slots[block_id] = slot
+
+        self.block_to_gpu_slice = {}
+        num_gaussians = 0
+        for block_id, slot in self._persistent_block_to_slot.items():
+            global_start = block_id * self.block_size
+            row_count = min(self.block_size, self.num_total - global_start)
+            local_start = slot * self.block_size
+            self.block_to_gpu_slice[block_id] = slice(
+                local_start,
+                local_start + row_count,
+            )
+            num_gaussians += row_count
+
+        changed_slots = sorted(
+            set(assigned_slots.values()).union(
+                self._persistent_free_slots
+            )
+        )
+        if changed_slots:
+            slot_ids = torch.tensor(
+                changed_slots,
+                dtype=torch.long,
+                device=self.device,
+            )
+            self.local_to_global_idx.view(
+                self._persistent_slot_capacity,
+                self.block_size,
+            ).index_fill_(0, slot_ids, -1)
+
+        foreground_read_ms = 0.0
+        block_batch = None
+        if incoming_blocks:
+            incoming_rows = sum(
+                min(
+                    self.block_size,
+                    self.num_total - block_id * self.block_size,
+                )
+                for block_id in incoming_blocks
+            )
+            try:
+                packed_out = torch.empty(
+                    (incoming_rows, 59),
+                    dtype=torch.float32,
+                    pin_memory=True,
+                )
+            except RuntimeError:
+                packed_out = torch.empty(
+                    (incoming_rows, 59),
+                    dtype=torch.float32,
+                )
+            read_start = time.perf_counter()
+            block_batch = block_reader.read_batch(
+                incoming_blocks,
+                out=packed_out,
+            )
+            foreground_read_ms = (time.perf_counter() - read_start) * 1000.0
+            if tuple(block_batch.block_ids) != tuple(incoming_blocks):
+                raise RuntimeError(
+                    "BlockReader returned a different persistent materialization order"
+                )
+
+        h2d_start_event = torch.cuda.Event(enable_timing=True)
+        h2d_end_event = torch.cuda.Event(enable_timing=True)
+        h2d_start_event.record()
+        h2d_bytes = 0
+        packed_gpu = None
+        if block_batch is not None:
+            packed_cpu = block_batch.tensor
+            if (
+                packed_cpu.device.type != 'cpu'
+                or packed_cpu.dim() != 2
+                or int(packed_cpu.shape[1]) != 59
+            ):
+                raise ValueError(
+                    f"Invalid persistent BlockBatch shape={tuple(packed_cpu.shape)} "
+                    f"device={packed_cpu.device}"
+                )
+            h2d_bytes = int(packed_cpu.numel()) * int(packed_cpu.element_size())
+            packed_gpu = packed_cpu.to(
+                self.device,
+                non_blocking=bool(packed_cpu.is_pinned()),
+            )
+            source_starts = []
+            target_starts = []
+            row_counts = []
+            for block_id in incoming_blocks:
+                source_slice = block_batch.block_slices.get(block_id)
+                target_slice = self.block_to_gpu_slice[block_id]
+                expected_rows = int(target_slice.stop - target_slice.start)
+                if (
+                    source_slice is None
+                    or int(source_slice.stop - source_slice.start) != expected_rows
+                ):
+                    raise ValueError(
+                        f"Invalid persistent block slice for {block_id}: "
+                        f"source={source_slice}, expected_rows={expected_rows}"
+                    )
+                source_starts.append(int(source_slice.start))
+                target_starts.append(int(target_slice.start))
+                row_counts.append(expected_rows)
+
+            source_starts_gpu = torch.tensor(
+                source_starts,
+                dtype=torch.long,
+                device=self.device,
+            )
+            target_starts_gpu = torch.tensor(
+                target_starts,
+                dtype=torch.long,
+                device=self.device,
+            )
+            row_counts_gpu = torch.tensor(
+                row_counts,
+                dtype=torch.long,
+                device=self.device,
+            )
+            block_ids_gpu = torch.tensor(
+                incoming_blocks,
+                dtype=torch.long,
+                device=self.device,
+            )
+            if triton is not None:
+                from storage.block_reader import BlockLayout
+
+                grid = (
+                    len(incoming_blocks),
+                    triton.cdiv(self.block_size * 59, 256),
+                )
+                _unpack_persistent_blocks_kernel[grid](
+                    packed_gpu,
+                    source_starts_gpu,
+                    target_starts_gpu,
+                    row_counts_gpu,
+                    block_ids_gpu,
+                    self.gpu_xyz,
+                    self.gpu_scaling,
+                    self.gpu_rotation,
+                    self.gpu_opacity,
+                    self.gpu_features_dc,
+                    self.gpu_features_rest,
+                    self.local_to_global_idx,
+                    SOURCE_UNIFIED=block_batch.layout == BlockLayout.UNIFIED,
+                    BLOCK_ROWS=self.block_size,
+                    COPY_BLOCK_SIZE=256,
+                    num_warps=4,
+                )
+            else:  # pragma: no cover
+                columns = self._block_layout_columns(block_batch.layout)
+                with torch.no_grad():
+                    for block_id in incoming_blocks:
+                        source_slice = block_batch.block_slices[block_id]
+                        target_slice = self.block_to_gpu_slice[block_id]
+                        source = packed_gpu[source_slice]
+                        for name, column_slice in columns.items():
+                            self._persistent_component_tensors()[name][
+                                target_slice
+                            ].copy_(source[:, column_slice])
+                        row_count = int(target_slice.stop - target_slice.start)
+                        self.local_to_global_idx[target_slice] = torch.arange(
+                            block_id * self.block_size,
+                            block_id * self.block_size + row_count,
+                            dtype=torch.long,
+                            device=self.device,
+                        )
+        h2d_end_event.record()
+
+        self.loaded_blocks = sorted_visible
+        self.previous_blocks = list(sorted_visible)
+        self._rebuild_block_starts()
+        hotspot_count = len(retained_set)
+        cold_count = len(incoming_blocks)
+        total_count = len(sorted_visible)
+        self.hotspot_stats['total_iterations'] += 1
+        self.hotspot_stats['total_blocks_loaded'] += total_count
+        self.hotspot_stats['total_blocks_retained'] += hotspot_count
+        self.hotspot_stats['total_blocks_cold'] += cold_count
+        allocated_rows = self._persistent_slot_capacity * self.block_size
+        stats = {
+            'hotspot_count': hotspot_count,
+            'cold_count': cold_count,
+            'total_count': total_count,
+            'hit_rate': hotspot_count / total_count,
+            'memory_mb': allocated_rows * 59 * 4 / (1024 ** 2),
+            'num_gaussians': num_gaussians,
+            'data_reused_count': hotspot_count,
+            'foreground_read_ms': foreground_read_ms,
+            'cpu_materialize_ms': max(
+                0.0,
+                (time.perf_counter() - load_start) * 1000.0 - foreground_read_ms,
+            ),
+            'h2d_events': (h2d_start_event, h2d_end_event),
+            'h2d_bytes': h2d_bytes,
+            'gpu_slot_capacity_blocks': self._persistent_slot_capacity,
+            'gpu_slot_growth_blocks': growth_blocks,
+        }
+        return self._persistent_component_tensors(), stats
     
     def load_visible_blocks_with_retention(
         self,
@@ -504,6 +916,13 @@ class GPUWorkingSet:
             self.refresh_topology(int(block_reader.total_gaussians))
         elif unified_params is not None:
             self.refresh_topology(int(unified_params.shape[0]))
+
+        if allow_gpu_hotspots and block_reader is not None:
+            return self._load_visible_blocks_persistent(
+                visible_block_ids,
+                enable_retention=enable_retention,
+                block_reader=block_reader,
+            )
 
         visible_set = set(int(block_id) for block_id in visible_block_ids if 0 <= int(block_id) < self.num_blocks)
         previous_set = set(self.previous_blocks)
@@ -1128,6 +1547,9 @@ class GPUWorkingSet:
         self.loaded_blocks.clear()
         self.local_to_global_idx = None
         self._block_starts = None
+        self._persistent_slot_capacity = 0
+        self._persistent_block_to_slot.clear()
+        self._persistent_free_slots.clear()
         
         # Force garbage collection
         if release_cuda_cache and torch.cuda.is_available():

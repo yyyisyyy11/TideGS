@@ -53,6 +53,9 @@ class DistributedMetricsTest(unittest.TestCase):
                 "iteration": 33,
                 "ssd_future_read_blocks": 0,
                 "ssd_future_read_bytes": 0,
+                "gpu_slot_capacity_blocks": 4,
+                "gpu_slot_growth_blocks": 1,
+                "h2d_bytes": 400,
                 "optimizer_ms": 6.0,
             }
             writer.write_batch(row)
@@ -67,6 +70,9 @@ class DistributedMetricsTest(unittest.TestCase):
                 Path(directory) / "metrics_batch_global.tsv"
             )
             self.assertEqual(global_rows[0]["ssd_future_read_bytes"], "500.0")
+            self.assertEqual(global_rows[0]["gpu_slot_capacity_blocks"], "8.0")
+            self.assertEqual(global_rows[0]["gpu_slot_growth_blocks"], "2.0")
+            self.assertEqual(global_rows[0]["h2d_bytes"], "800.0")
             self.assertEqual(global_rows[0]["optimizer_ms_max"], "8.0")
             self.assertEqual(global_rows[0]["optimizer_ms_mean"], "7.0")
 

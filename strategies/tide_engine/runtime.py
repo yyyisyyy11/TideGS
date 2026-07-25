@@ -839,6 +839,12 @@ def snapshot_paper_warm_layer_metrics(storage_adapter) -> Optional[Dict[str, flo
             "cache_future_queue": int(cache_stats.get("future_prefetch_queue_size", cache_stats.get("future_queue_size", 0))),
             "cache_future_pending": int(cache_stats.get("future_prefetch_pending", cache_stats.get("future_pending_blocks", 0))),
             "ram_usage_mb": float(cache_stats.get("ram_usage_mb", 0.0)),
+            "flushing_ram_usage_mb": float(
+                cache_stats.get("flushing_ram_usage_mb", 0.0)
+            ),
+            "managed_ram_usage_mb": float(
+                cache_stats.get("managed_ram_usage_mb", 0.0)
+            ),
             "max_ram_mb": float(cache_stats.get("max_ram_mb", 0.0)),
         })
 
@@ -884,7 +890,10 @@ def log_paper_warm_layer_metrics(storage_adapter, iteration: int, stage: str, lo
         f"hit_rate={metrics.get('hit_rate', 0.0) * 100.0:.1f}% "
         f"async_flush_req={metrics.get('async_flush_requests', 0)} "
         f"flush_drops={metrics.get('flush_queue_drops', 0)} "
-        f"ram={metrics.get('ram_usage_mb', 0.0):.1f}/{metrics.get('max_ram_mb', 0.0):.1f}MB\n",
+        f"ram_resident={metrics.get('ram_usage_mb', 0.0):.1f}MB "
+        f"ram_flushing={metrics.get('flushing_ram_usage_mb', 0.0):.1f}MB "
+        f"ram_managed={metrics.get('managed_ram_usage_mb', 0.0):.1f}/"
+        f"{metrics.get('max_ram_mb', 0.0):.1f}MB\n",
         log_file=log_file,
     )
     write_paper_phase1_log(

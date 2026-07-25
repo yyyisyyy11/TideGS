@@ -9,7 +9,10 @@ from pathlib import Path
 
 try:
     import torch
+    TORCH_AVAILABLE = True
 except ModuleNotFoundError:
+    TORCH_AVAILABLE = False
+
     class _FakeTensor:
         def __init__(self, shape, value):
             self.shape = tuple(shape)
@@ -23,6 +26,9 @@ except ModuleNotFoundError:
             for dim in self.shape:
                 total *= dim
             return total
+
+        def element_size(self):
+            return 4
 
         def dim(self):
             return len(self.shape)
@@ -114,7 +120,8 @@ class TieredCacheSingleFlightTest(unittest.TestCase):
         thread.start()
         return thread, result, errors
 
-    def test_dirty_batch_uses_one_cache_owned_slab(self):
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required")
+    def test_dirty_batch_uses_independently_owned_blocks(self):
         storage = FakeStorage(block_size=2, point_dim=3)
         cache = self.make_cache(storage)
         source = torch.arange(12, dtype=torch.float32).reshape(4, 3)
@@ -128,11 +135,46 @@ class TieredCacheSingleFlightTest(unittest.TestCase):
 
         self.assertTrue(torch.equal(cache.cache_data[5], expected[:2]))
         self.assertTrue(torch.equal(cache.cache_data[6], expected[2:]))
-        self.assertEqual(
+        self.assertNotEqual(
             cache.cache_data[5].untyped_storage().data_ptr(),
             cache.cache_data[6].untyped_storage().data_ptr(),
         )
         self.assertEqual(cache.dirty_set, {5, 6})
+        self.assertEqual(cache._get_ram_usage(), expected.numel() * expected.element_size())
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required")
+    def test_ram_usage_tracks_partial_blocks_and_lru_eviction(self):
+        storage = FakeStorage(block_size=4, point_dim=3)
+        cache = self.make_cache(storage)
+        full = torch.ones((4, 3), dtype=torch.float32)
+        partial = torch.ones((2, 3), dtype=torch.float32)
+        cache.upsert_dirty_block_batch({5: full, 6: partial})
+        expected_bytes = (full.numel() + partial.numel()) * full.element_size()
+        self.assertEqual(cache._get_ram_usage(), expected_bytes)
+
+        cache.dirty_set.clear()
+        cache.evict_and_flush(
+            target_ram_bytes=partial.numel() * partial.element_size()
+        )
+        self.assertEqual(
+            cache._get_ram_usage(),
+            partial.numel() * partial.element_size(),
+        )
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required")
+    def test_managed_ram_deduplicates_cache_and_flushing_storage(self):
+        storage = FakeStorage(block_size=2, point_dim=3)
+        cache = self.make_cache(storage)
+        source = torch.ones((2, 3), dtype=torch.float32)
+        cache.upsert_dirty_block_batch({5: source})
+        cached = cache.cache_data[5]
+        with cache.flushing_lock:
+            cache.flushing_buffer[5] = (cached, time.time(), 1)
+
+        expected_bytes = cached.numel() * cached.element_size()
+        self.assertEqual(cache._get_ram_usage(), expected_bytes)
+        self.assertEqual(cache._get_flushing_ram_usage(), expected_bytes)
+        self.assertEqual(cache._get_managed_ram_usage(), expected_bytes)
 
     def test_stale_cache_commit_cannot_overwrite_newer_version(self):
         storage = FakeStorage(block_size=2, point_dim=3)
@@ -159,6 +201,10 @@ class TieredCacheSingleFlightTest(unittest.TestCase):
         self.assertTrue(torch.equal(cache.cache_data[5], newer))
         self.assertEqual(cache.get_block_versions([5]), {5: 2})
         self.assertEqual(cache.block_origin_iterations[5], 33)
+        self.assertEqual(
+            cache._get_ram_usage(),
+            newer.numel() * newer.element_size(),
+        )
 
     def test_future_read_serves_urgent_without_second_ssd_read(self):
         storage = FakeStorage()

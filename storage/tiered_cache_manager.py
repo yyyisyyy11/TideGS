@@ -70,6 +70,8 @@ class TieredCacheManager:
         # - 最新访问的移动到末尾
         # - 内存满时，弹出最前面的（最久未使用的）
         self.cache_data: OrderedDict[int, torch.Tensor] = OrderedDict()
+        self._cache_entry_bytes: Dict[int, int] = {}
+        self._resident_ram_bytes = 0
         # 记录脏块的id，如果id在这个set中，那么说明它在内存中的版本比SSD中的版本更新
         # 驱逐前必须先flush，写回SSD
         self.dirty_set: Set[int] = set()
@@ -211,6 +213,74 @@ class TieredCacheManager:
         if self.verbose:
             print(message)
 
+    @staticmethod
+    def _tensor_nbytes(tensor: torch.Tensor) -> int:
+        element_size = getattr(tensor, 'element_size', None)
+        bytes_per_element = int(element_size()) if callable(element_size) else 4
+        return int(tensor.numel()) * bytes_per_element
+
+    @classmethod
+    def _unique_storage_bytes(cls, tensors) -> int:
+        storages = {}
+        for tensor in tensors:
+            if tensor is None:
+                continue
+            try:
+                storage = tensor.untyped_storage()
+                key = (
+                    str(tensor.device),
+                    int(storage.data_ptr()),
+                    int(storage.nbytes()),
+                )
+                storages[key] = int(storage.nbytes())
+            except (AttributeError, RuntimeError):
+                storages[("tensor", id(tensor))] = cls._tensor_nbytes(tensor)
+        return sum(storages.values())
+
+    @staticmethod
+    def _clone_cache_block(tensor: torch.Tensor) -> torch.Tensor:
+        """Create one cache-owned storage allocation for one block."""
+        if not hasattr(tensor, 'device'):
+            return tensor.clone()
+        if tensor.device.type != 'cpu':
+            raise ValueError(
+                f"RAM cache requires CPU tensors, got device={tensor.device}"
+            )
+        pinned = bool(tensor.is_pinned())
+        try:
+            owned = torch.empty(
+                tuple(tensor.shape),
+                dtype=tensor.dtype,
+                device='cpu',
+                pin_memory=pinned,
+            )
+        except RuntimeError:
+            owned = torch.empty(
+                tuple(tensor.shape),
+                dtype=tensor.dtype,
+                device='cpu',
+            )
+        owned.copy_(tensor)
+        return owned
+
+    def _store_cache_block_locked(
+        self,
+        block_id: int,
+        tensor: torch.Tensor,
+    ) -> None:
+        block_id = int(block_id)
+        self._resident_ram_bytes -= self._cache_entry_bytes.get(block_id, 0)
+        block_bytes = self._tensor_nbytes(tensor)
+        self.cache_data[block_id] = tensor
+        self.cache_data.move_to_end(block_id)
+        self._cache_entry_bytes[block_id] = block_bytes
+        self._resident_ram_bytes += block_bytes
+
+    def _pop_lru_cache_block_locked(self) -> Tuple[int, torch.Tensor]:
+        block_id, tensor = self.cache_data.popitem(last=False)
+        self._resident_ram_bytes -= self._cache_entry_bytes.pop(block_id, 0)
+        return block_id, tensor
+
     def _lookup_cached_or_flushing(
         self,
         block_id: int,
@@ -237,8 +307,7 @@ class TieredCacheManager:
                 if cached_tensor is not None:
                     self.cache_data.move_to_end(block_id)
                     return cached_tensor, 'cache'
-                self.cache_data[block_id] = tensor
-                self.cache_data.move_to_end(block_id)
+                self._store_cache_block_locked(block_id, tensor)
                 self.block_versions[block_id] = max(
                     self.block_versions.get(block_id, 0),
                     flushing_version,
@@ -383,8 +452,7 @@ class TieredCacheManager:
                         self.cache_data.move_to_end(block_id)
                         result[block_id] = cached_tensor
                         continue
-                    self.cache_data[block_id] = tensor
-                    self.cache_data.move_to_end(block_id)
+                    self._store_cache_block_locked(block_id, tensor)
                     self.block_versions[block_id] = loaded_version
                     result[block_id] = tensor
 
@@ -467,8 +535,7 @@ class TieredCacheManager:
                         block_id not in self.cache_data
                         and current_version <= failed_version
                     ):
-                        self.cache_data[block_id] = tensor
-                        self.cache_data.move_to_end(block_id)
+                        self._store_cache_block_locked(block_id, tensor)
                         self.block_versions[block_id] = failed_version
                     if current_version <= failed_version:
                         self.dirty_set.add(block_id)
@@ -599,8 +666,7 @@ class TieredCacheManager:
                                 if block_id in self.flushing_buffer:
                                     continue
                             if block_id not in self.cache_data:
-                                self.cache_data[block_id] = tensor
-                                self.cache_data.move_to_end(block_id)
+                                self._store_cache_block_locked(block_id, tensor)
                                 self.block_versions[block_id] = int(
                                     loaded_versions.get(block_id, 0)
                                 )
@@ -644,8 +710,7 @@ class TieredCacheManager:
 
                 # Update cache
                 with self.cache_lock:
-                    self.cache_data[block_id] = cpu_tensor
-                    self.cache_data.move_to_end(block_id)  # Mark as recently used
+                    self._store_cache_block_locked(block_id, cpu_tensor)
                     self.block_versions[block_id] = self.block_versions.get(block_id, 0) + 1
                     self.dirty_set.add(block_id) # 标记为脏，也就是修改过，未来需要写回SSD
 
@@ -716,11 +781,10 @@ class TieredCacheManager:
         staged = 0
         with self.cache_lock:
             for block_id, tensor in block_tensors.items():
-                cached_tensor = tensor.clone() if clone else tensor
+                cached_tensor = self._clone_cache_block(tensor)
                 if not self._is_valid_block_tensor(block_id, cached_tensor, 'upsert_dirty_blocks'):
                     continue
-                self.cache_data[block_id] = cached_tensor
-                self.cache_data.move_to_end(block_id)
+                self._store_cache_block_locked(block_id, cached_tensor)
                 self.block_versions[block_id] = self.block_versions.get(block_id, 0) + 1
                 self.dirty_set.add(block_id)
                 staged += 1
@@ -734,13 +798,7 @@ class TieredCacheManager:
         block_versions: Optional[Dict[int, int]] = None,
         origin_iteration: Optional[int] = None,
     ) -> int:
-        """Own one contiguous copy of a staged writeback batch.
-
-        The incoming tensors are ordered views into one reusable pinned slab.
-        Cache entries become views into a single cache-owned slab, avoiding one
-        allocation and clone per block while preserving ownership after the
-        producer reuses its staging slot.
-        """
+        """Copy staged writeback views into independently owned cache blocks."""
         if not block_tensors:
             return 0
 
@@ -754,68 +812,35 @@ class TieredCacheManager:
         if not items:
             return 0
 
-        total_rows = sum(int(tensor.shape[0]) for _, tensor in items)
-        first = items[0][1]
-        try:
-            owned = torch.empty(
-                (total_rows, self.point_dim),
-                dtype=first.dtype,
-                pin_memory=bool(first.is_pinned()),
-            )
-        except RuntimeError:
-            owned = torch.empty(
-                (total_rows, self.point_dim), dtype=first.dtype
-            )
-
-        same_storage = all(
-            tensor.untyped_storage().data_ptr()
-            == first.untyped_storage().data_ptr()
-            for _, tensor in items
-        )
-        contiguous_offsets = same_storage
-        expected_offset = int(first.storage_offset())
-        for _, tensor in items:
-            contiguous_offsets = contiguous_offsets and (
-                tensor.is_contiguous()
-                and int(tensor.storage_offset()) == expected_offset
-            )
-            expected_offset += int(tensor.numel())
-
-        if contiguous_offsets:
-            source = first.as_strided(
-                (total_rows, self.point_dim),
-                (self.point_dim, 1),
-                storage_offset=int(first.storage_offset()),
-            )
-            owned.copy_(source)
-        else:
-            offset = 0
-            for _, tensor in items:
-                row_count = int(tensor.shape[0])
-                owned[offset:offset + row_count].copy_(tensor)
-                offset += row_count
-
-        staged = 0
-        offset = 0
+        candidates = []
         with self.cache_lock:
             for block_id, tensor in items:
-                row_count = int(tensor.shape[0])
                 current_version = int(self.block_versions.get(block_id, 0))
                 incoming_version = (
                     current_version + 1
                     if block_versions is None
                     else int(block_versions[block_id])
                 )
+                if incoming_version > current_version:
+                    candidates.append(
+                        (block_id, tensor, incoming_version)
+                    )
+        candidates = [
+            (block_id, self._clone_cache_block(tensor), incoming_version)
+            for block_id, tensor, incoming_version in candidates
+        ]
+
+        staged = 0
+        with self.cache_lock:
+            for block_id, owned, incoming_version in candidates:
+                current_version = int(self.block_versions.get(block_id, 0))
                 if incoming_version <= current_version:
-                    offset += row_count
                     continue
-                self.cache_data[block_id] = owned[offset:offset + row_count]
-                self.cache_data.move_to_end(block_id)
+                self._store_cache_block_locked(block_id, owned)
                 self.block_versions[block_id] = incoming_version
                 if origin_iteration is not None:
                     self.block_origin_iterations[block_id] = int(origin_iteration)
                 self.dirty_set.add(block_id)
-                offset += row_count
                 staged += 1
 
         self._maybe_evict()
@@ -986,8 +1011,7 @@ class TieredCacheManager:
                     flushing_entry = self.flushing_buffer.get(block_id)
                 if flushing_entry is not None:
                     tensor, _, version = flushing_entry
-                    self.cache_data[block_id] = tensor
-                    self.cache_data.move_to_end(block_id)
+                    self._store_cache_block_locked(block_id, tensor)
                     self.block_versions[block_id] = max(
                         self.block_versions.get(block_id, 0),
                         int(version),
@@ -1037,16 +1061,33 @@ class TieredCacheManager:
         threshold_bytes = self.max_ram_bytes * self.eviction_threshold
 
         if current_usage > threshold_bytes:
-            # Calculate how much to evict (evict 20% of cache)
-            target_evict = int(len(self.cache_data) * 0.2)
-            self.evict_and_flush(num_blocks=target_evict)
+            self.evict_and_flush(target_ram_bytes=int(threshold_bytes))
 
     def _get_ram_usage(self) -> int:
-        """Get current RAM usage by cache."""
+        """Get physical bytes owned by resident cache entries."""
         with self.cache_lock:
-            return len(self.cache_data) * self.bytes_per_block
+            return int(self._resident_ram_bytes)
 
-    def evict_and_flush(self, num_blocks: Optional[int] = None):
+    def _get_flushing_ram_usage(self) -> int:
+        with self.flushing_lock:
+            return self._unique_storage_bytes(
+                entry[0] for entry in self.flushing_buffer.values()
+            )
+
+    def _get_managed_ram_usage(self) -> int:
+        with self.cache_lock:
+            with self.flushing_lock:
+                tensors = list(self.cache_data.values())
+                tensors.extend(
+                    entry[0] for entry in self.flushing_buffer.values()
+                )
+                return self._unique_storage_bytes(tensors)
+
+    def evict_and_flush(
+        self,
+        num_blocks: Optional[int] = None,
+        target_ram_bytes: Optional[int] = None,
+    ):
         """
         Evict blocks from RAM cache using LRU policy.
 
@@ -1062,7 +1103,7 @@ class TieredCacheManager:
         Args:
             num_blocks: Number of blocks to evict (default: evict 20% of cache)
         """
-        if num_blocks is None:
+        if num_blocks is None and target_ram_bytes is None:
             num_blocks = max(1, int(len(self.cache_data) * 0.2))
 
         victims = []
@@ -1070,14 +1111,26 @@ class TieredCacheManager:
         dirty_versions = {}
 
         with self.cache_lock:
+            resident_bytes = int(self._resident_ram_bytes)
+            max_victims = (
+                len(self.cache_data)
+                if num_blocks is None
+                else min(int(num_blocks), len(self.cache_data))
+            )
             # Select victims from LRU tail
-            for _ in range(min(num_blocks, len(self.cache_data))):
+            for _ in range(max_victims):
                 if not self.cache_data:
+                    break
+                if (
+                    target_ram_bytes is not None
+                    and resident_bytes <= int(target_ram_bytes)
+                ):
                     break
 
                 # Pop from front (oldest)
-                block_id, tensor = self.cache_data.popitem(last=False)
+                block_id, tensor = self._pop_lru_cache_block_locked()
                 victims.append(block_id)
+                resident_bytes -= self._tensor_nbytes(tensor)
 
                 # Check if dirty
                 if block_id in self.dirty_set:
@@ -1156,6 +1209,8 @@ class TieredCacheManager:
         
         with self.flushing_lock:
             flushing_count = len(self.flushing_buffer)
+        flushing_ram_usage_mb = self._get_flushing_ram_usage() / 1024 / 1024
+        managed_ram_usage_mb = self._get_managed_ram_usage() / 1024 / 1024
 
         flush_queue_size = self.flush_queue.qsize() if hasattr(self, 'flush_queue') else 0
         future_queue_size = self.future_prefetch_queue.qsize() if hasattr(self, 'future_prefetch_queue') else 0
@@ -1181,6 +1236,8 @@ class TieredCacheManager:
             'future_prefetch_pending': future_pending_count,
             'inflight_read_blocks': inflight_read_count,
             'ram_usage_mb': ram_usage_mb,
+            'flushing_ram_usage_mb': flushing_ram_usage_mb,
+            'managed_ram_usage_mb': managed_ram_usage_mb,
             'hit_rate': hit_rate,
             'max_ram_mb': self.max_ram_bytes / 1024 / 1024
         }

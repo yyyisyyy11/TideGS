@@ -426,6 +426,12 @@ def train_distributed_tide_batch(
         "rank_resident_blocks": len(target_resident),
         "cold_blocks": int(retention_stats.get("cold_count", 0)),
         "retained_blocks": int(retention_stats.get("hotspot_count", 0)),
+        "gpu_slot_capacity_blocks": int(
+            retention_stats.get("gpu_slot_capacity_blocks", 0)
+        ),
+        "gpu_slot_growth_blocks": int(
+            retention_stats.get("gpu_slot_growth_blocks", 0)
+        ),
         "touched_gaussians": int(touched_active.numel()),
         "block_cull_ms": float(plan.block_cull_ms),
         "plan_ms": float(plan.plan_ms),
@@ -447,6 +453,7 @@ def train_distributed_tide_batch(
             cache_delta("future_materialize_time") * 1000.0,
         ),
         "prefetch_ssd_ms": cache_delta("future_storage_read_time") * 1000.0,
+        "h2d_bytes": int(retention_stats.get("h2d_bytes", 0)),
         "h2d_ms": h2d_ms,
         "gsplat_forward_ms": forward_ms,
         "gaussian_projection_cull_ms": projection_ms,
