@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Dict, List, Mapping, Optional, Sequence
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -116,6 +116,12 @@ class DistributedBatchPlan:
     evict_blocks: List[int] = field(default_factory=list)
     block_cull_ms: float = 0.0
     plan_ms: float = 0.0
+    predicted_stream_in_blocks: int = 0
+    prediction_missing_blocks: int = 0
+    prediction_extra_blocks: int = 0
+    prediction_replanned: int = 0
+    prediction_repair_ms: float = 0.0
+    prediction_exact_plan_ms: float = 0.0
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
@@ -153,7 +159,28 @@ class DistributedBatchPlan:
             evict_blocks=[int(v) for v in value.get("evict_blocks", [])],
             block_cull_ms=float(value.get("block_cull_ms", 0.0)),
             plan_ms=float(value.get("plan_ms", 0.0)),
+            predicted_stream_in_blocks=int(
+                value.get("predicted_stream_in_blocks", 0)
+            ),
+            prediction_missing_blocks=int(
+                value.get("prediction_missing_blocks", 0)
+            ),
+            prediction_extra_blocks=int(
+                value.get("prediction_extra_blocks", 0)
+            ),
+            prediction_replanned=int(value.get("prediction_replanned", 0)),
+            prediction_repair_ms=float(value.get("prediction_repair_ms", 0.0)),
+            prediction_exact_plan_ms=float(
+                value.get("prediction_exact_plan_ms", 0.0)
+            ),
         )
+
+
+@dataclass(frozen=True)
+class DistributedPlannerState:
+    resident: Tuple[int, ...]
+    active: Tuple[int, ...]
+    recency: Dict[int, float]
 
 
 class DistributedBatchPlanner:
@@ -191,6 +218,39 @@ class DistributedBatchPlanner:
         self._resident: List[int] = []
         self._active: List[int] = []
         self._recency: Dict[int, float] = {}
+
+    def snapshot_state(self) -> DistributedPlannerState:
+        return DistributedPlannerState(
+            resident=tuple(self._resident),
+            active=tuple(self._active),
+            recency=dict(self._recency),
+        )
+
+    def restore_state(self, state: DistributedPlannerState) -> None:
+        self._resident = list(state.resident)
+        self._active = list(state.active)
+        self._recency = dict(state.recency)
+
+    def preview(
+        self,
+        *,
+        iteration: int,
+        epoch: int,
+        camera_ids: Sequence[int],
+        camera_blocks: Mapping[int, Sequence[int]],
+    ) -> Tuple[DistributedBatchPlan, DistributedPlannerState]:
+        baseline = self.snapshot_state()
+        try:
+            plan = self.plan(
+                iteration=iteration,
+                epoch=epoch,
+                camera_ids=camera_ids,
+                camera_blocks=camera_blocks,
+            )
+            predicted_state = self.snapshot_state()
+        finally:
+            self.restore_state(baseline)
+        return plan, predicted_state
 
     def plan(
         self,

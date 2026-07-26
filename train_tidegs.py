@@ -139,6 +139,130 @@ def _build_distributed_plan(
     return DistributedBatchPlan.from_dict(context.broadcast_object(payload)), schedule_info
 
 
+def _normalize_camera_blocks(camera_blocks):
+    return {
+        int(camera_id): tuple(int(block_id) for block_id in blocks)
+        for camera_id, blocks in camera_blocks.items()
+    }
+
+
+def _preview_distributed_plan(
+    *,
+    context,
+    planner,
+    storage_adapter,
+    training_schedule,
+    iteration,
+    batch_size,
+    schedule_ordering,
+):
+    schedule_info = get_camera_batch_schedule(
+        training_schedule=training_schedule,
+        iteration=iteration,
+        batch_size=batch_size,
+        schedule_ordering=schedule_ordering,
+    )
+    payload = None
+    rank0_preview = None
+    if context.is_rank0:
+        cull_start = time.perf_counter()
+        bounds_generation, camera_blocks = storage_adapter.get_visible_blocks_batch(
+            schedule_info.batch_indices
+        )
+        block_cull_ms = (time.perf_counter() - cull_start) * 1000.0
+        plan_start = time.perf_counter()
+        plan, predicted_state = planner.preview(
+            iteration=iteration,
+            epoch=schedule_info.epoch,
+            camera_ids=schedule_info.batch_indices,
+            camera_blocks=camera_blocks,
+        )
+        plan_ms = (time.perf_counter() - plan_start) * 1000.0
+        payload = plan.to_dict()
+        payload["block_cull_ms"] = block_cull_ms
+        payload["plan_ms"] = plan_ms
+        rank0_preview = {
+            "bounds_generation": int(bounds_generation),
+            "camera_blocks": _normalize_camera_blocks(camera_blocks),
+            "predicted_state": predicted_state,
+        }
+    plan = DistributedBatchPlan.from_dict(context.broadcast_object(payload))
+    return plan, schedule_info, rank0_preview
+
+
+def _finalize_distributed_plan(
+    *,
+    context,
+    planner,
+    storage_adapter,
+    training_schedule,
+    iteration,
+    batch_size,
+    schedule_ordering,
+    predicted_plan,
+    rank0_preview,
+):
+    schedule_info = get_camera_batch_schedule(
+        training_schedule=training_schedule,
+        iteration=iteration,
+        batch_size=batch_size,
+        schedule_ordering=schedule_ordering,
+    )
+    payload = None
+    if context.is_rank0:
+        if rank0_preview is None:
+            raise RuntimeError("Rank 0 is missing distributed plan preview state")
+        if predicted_plan.global_camera_ids != schedule_info.batch_indices:
+            raise RuntimeError(
+                f"Distributed prediction mismatch at iteration {iteration}"
+            )
+
+        repair_start = time.perf_counter()
+        current_generation = storage_adapter.get_bounds_generation()
+        if current_generation == rank0_preview["bounds_generation"]:
+            camera_blocks = rank0_preview["camera_blocks"]
+        else:
+            _, repaired_blocks = storage_adapter.get_visible_blocks_batch(
+                schedule_info.batch_indices
+            )
+            camera_blocks = _normalize_camera_blocks(repaired_blocks)
+        repair_ms = (time.perf_counter() - repair_start) * 1000.0
+
+        prediction_changed = camera_blocks != rank0_preview["camera_blocks"]
+        exact_plan_ms = 0.0
+        if prediction_changed:
+            plan_start = time.perf_counter()
+            exact_plan = planner.plan(
+                iteration=iteration,
+                epoch=schedule_info.epoch,
+                camera_ids=schedule_info.batch_indices,
+                camera_blocks=camera_blocks,
+            )
+            exact_plan_ms = (time.perf_counter() - plan_start) * 1000.0
+        else:
+            planner.restore_state(rank0_preview["predicted_state"])
+            exact_plan = predicted_plan
+
+        predicted_stream_in = set(predicted_plan.stream_in_blocks)
+        exact_stream_in = set(exact_plan.stream_in_blocks)
+        payload = exact_plan.to_dict()
+        payload["block_cull_ms"] = float(predicted_plan.block_cull_ms) + repair_ms
+        payload["plan_ms"] = float(predicted_plan.plan_ms) + exact_plan_ms
+        payload["predicted_stream_in_blocks"] = len(predicted_stream_in)
+        payload["prediction_missing_blocks"] = len(
+            exact_stream_in - predicted_stream_in
+        )
+        payload["prediction_extra_blocks"] = len(
+            predicted_stream_in - exact_stream_in
+        )
+        payload["prediction_replanned"] = int(prediction_changed)
+        payload["prediction_repair_ms"] = repair_ms
+        payload["prediction_exact_plan_ms"] = exact_plan_ms
+
+    plan = DistributedBatchPlan.from_dict(context.broadcast_object(payload))
+    return plan, schedule_info
+
+
 def _load_pure_ssd_prebuilt_manifest(args):
     manifest_path = getattr(args, "pure_ssd_prebuilt_manifest", "")
     if not manifest_path:
@@ -717,6 +841,38 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         nvtx.range_pop()
 
         next_iteration = iteration + args.bsz
+        next_distributed_prediction = None
+        next_distributed_rank0_preview = None
+        if distributed_enabled and next_iteration <= opt_args.iterations:
+            nvtx.range_push("Outer: distributed_predictive_prefetch")
+            (
+                next_distributed_prediction,
+                _,
+                next_distributed_rank0_preview,
+            ) = _preview_distributed_plan(
+                context=distributed_context,
+                planner=distributed_planner,
+                storage_adapter=storage_adapter,
+                training_schedule=ssd_training_schedule,
+                iteration=next_iteration,
+                batch_size=args.bsz,
+                schedule_ordering=getattr(
+                    args, "ssd_schedule_ordering", "trajectory"
+                ),
+            )
+            rank = distributed_context.rank
+            current_resident = set(
+                current_distributed_plan.rank_resident_blocks[rank]
+            )
+            predicted_resident = set(
+                next_distributed_prediction.rank_resident_blocks[rank]
+            )
+            gaussians._block_reader.hint_future(
+                sorted(predicted_resident - current_resident),
+                target_iteration=next_iteration,
+            )
+            nvtx.range_pop()
+
         if not distributed_enabled and next_iteration <= opt_args.iterations:
             nvtx.range_push("Outer: next_camera_prefetch_submit")
             next_camera_schedule = get_camera_batch_schedule(
@@ -890,7 +1046,11 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         if distributed_enabled:
             next_distributed_plan = None
             if next_iteration <= opt_args.iterations:
-                next_distributed_plan, _ = _build_distributed_plan(
+                if next_distributed_prediction is None:
+                    raise RuntimeError(
+                        f"Missing distributed prediction for iteration {next_iteration}"
+                    )
+                next_distributed_plan, _ = _finalize_distributed_plan(
                     context=distributed_context,
                     planner=distributed_planner,
                     storage_adapter=storage_adapter,
@@ -898,6 +1058,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     iteration=next_iteration,
                     batch_size=args.bsz,
                     schedule_ordering=getattr(args, "ssd_schedule_ordering", "trajectory"),
+                    predicted_plan=next_distributed_prediction,
+                    rank0_preview=next_distributed_rank0_preview,
                 )
                 rank = distributed_context.rank
                 current_resident = set(
@@ -906,8 +1068,14 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 next_resident = set(
                     next_distributed_plan.rank_resident_blocks[rank]
                 )
+                predicted_resident = set(
+                    next_distributed_prediction.rank_resident_blocks[rank]
+                )
                 gaussians._block_reader.hint_future(
-                    sorted(next_resident - current_resident),
+                    sorted(
+                        (next_resident - current_resident)
+                        - (predicted_resident - current_resident)
+                    ),
                     target_iteration=next_iteration,
                 )
                 camera_batch_prefetcher.submit(

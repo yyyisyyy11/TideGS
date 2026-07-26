@@ -122,6 +122,106 @@ class DistributedPlanTest(unittest.TestCase):
                 camera_blocks={camera_id: [camera_id] for camera_id in range(4)},
             )
 
+    def test_preview_does_not_advance_planner_until_state_is_committed(self):
+        planner = DistributedBatchPlanner(
+            block_owner=np.asarray([0, 1, 0, 1, 0, 1], dtype=np.int32),
+            total_points=24,
+            block_size=4,
+            world_size=2,
+            resident_capacity_blocks=4,
+            resident_lambda=0.3,
+            resident_recency_decay=0.95,
+            balanced_seed_fraction=1.0,
+            camera_assignment="equal",
+        )
+        camera_ids = [0, 1]
+        camera_blocks = {0: [0, 2], 1: [1, 3]}
+        baseline = planner.snapshot_state()
+
+        preview, predicted_state = planner.preview(
+            iteration=1,
+            epoch=0,
+            camera_ids=camera_ids,
+            camera_blocks=camera_blocks,
+        )
+
+        self.assertEqual(planner.snapshot_state(), baseline)
+        committed = planner.plan(
+            iteration=1,
+            epoch=0,
+            camera_ids=camera_ids,
+            camera_blocks=camera_blocks,
+        )
+        self.assertEqual(committed, preview)
+        self.assertEqual(planner.snapshot_state(), predicted_state)
+
+    def test_preview_state_can_be_committed_without_replanning(self):
+        planner = DistributedBatchPlanner(
+            block_owner=np.asarray([0, 1, 0, 1, 0, 1], dtype=np.int32),
+            total_points=24,
+            block_size=4,
+            world_size=2,
+            resident_capacity_blocks=4,
+            resident_lambda=0.3,
+            resident_recency_decay=0.95,
+            balanced_seed_fraction=1.0,
+            camera_assignment="equal",
+        )
+        preview, predicted_state = planner.preview(
+            iteration=1,
+            epoch=0,
+            camera_ids=[0, 1],
+            camera_blocks={0: [0, 2], 1: [1, 3]},
+        )
+        planner.restore_state(predicted_state)
+
+        next_plan = planner.plan(
+            iteration=3,
+            epoch=0,
+            camera_ids=[2, 3],
+            camera_blocks={2: [2, 4], 3: [3, 5]},
+        )
+
+        self.assertEqual(set(preview.global_resident_blocks), {0, 1, 2, 3})
+        self.assertEqual(set(next_plan.stream_in_blocks), {4, 5})
+
+    def test_changed_prediction_can_be_replanned_from_original_state(self):
+        kwargs = dict(
+            block_owner=np.asarray([0, 1, 0, 1, 0, 1], dtype=np.int32),
+            total_points=24,
+            block_size=4,
+            world_size=2,
+            resident_capacity_blocks=2,
+            resident_lambda=0.3,
+            resident_recency_decay=0.95,
+            balanced_seed_fraction=1.0,
+            camera_assignment="equal",
+        )
+        planner = DistributedBatchPlanner(**kwargs)
+        baseline = planner.snapshot_state()
+        predicted, _ = planner.preview(
+            iteration=1,
+            epoch=0,
+            camera_ids=[0, 1],
+            camera_blocks={0: [0], 1: [1]},
+        )
+        exact = planner.plan(
+            iteration=1,
+            epoch=0,
+            camera_ids=[0, 1],
+            camera_blocks={0: [2], 1: [3]},
+        )
+
+        reference = DistributedBatchPlanner(**kwargs).plan(
+            iteration=1,
+            epoch=0,
+            camera_ids=[0, 1],
+            camera_blocks={0: [2], 1: [3]},
+        )
+        self.assertEqual(baseline.resident, ())
+        self.assertEqual(set(predicted.stream_in_blocks), {0, 1})
+        self.assertEqual(exact, reference)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -70,6 +70,12 @@ class DistributedMetricsTest(unittest.TestCase):
             )
             row = {
                 "iteration": 33,
+                "predicted_stream_in_blocks": 5,
+                "prediction_missing_blocks": 1,
+                "prediction_extra_blocks": 2,
+                "prediction_replanned": 1,
+                "prediction_repair_ms": 4.0,
+                "prediction_exact_plan_ms": 3.0,
                 "gpu_slot_capacity_blocks": 4,
                 "gpu_slot_growth_blocks": 1,
                 "h2d_bytes": 400,
@@ -103,6 +109,14 @@ class DistributedMetricsTest(unittest.TestCase):
             self.assertEqual(global_rows[0]["gpu_slot_capacity_blocks"], "8.0")
             self.assertEqual(global_rows[0]["gpu_slot_growth_blocks"], "2.0")
             self.assertEqual(global_rows[0]["h2d_bytes"], "800.0")
+            self.assertEqual(global_rows[0]["predicted_stream_in_blocks"], "5.0")
+            self.assertEqual(global_rows[0]["prediction_missing_blocks"], "1.0")
+            self.assertEqual(global_rows[0]["prediction_extra_blocks"], "2.0")
+            self.assertEqual(global_rows[0]["prediction_replanned"], "1.0")
+            self.assertEqual(global_rows[0]["prediction_repair_ms_max"], "4.0")
+            self.assertEqual(
+                global_rows[0]["prediction_exact_plan_ms_mean"], "3.0"
+            )
             self.assertEqual(global_rows[0]["optimizer_ms_max"], "8.0")
             self.assertEqual(global_rows[0]["optimizer_ms_mean"], "7.0")
 

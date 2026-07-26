@@ -13,6 +13,12 @@ BATCH_FIELDS = [
     "local_cameras",
     "global_active_blocks",
     "global_resident_blocks",
+    "predicted_stream_in_blocks",
+    "prediction_missing_blocks",
+    "prediction_extra_blocks",
+    "prediction_replanned",
+    "prediction_repair_ms",
+    "prediction_exact_plan_ms",
     "rank_active_blocks",
     "rank_resident_blocks",
     "cold_blocks",
@@ -69,6 +75,10 @@ SUM_FIELDS = {
 GLOBAL_ONCE_FIELDS = {
     "global_active_blocks",
     "global_resident_blocks",
+    "predicted_stream_in_blocks",
+    "prediction_missing_blocks",
+    "prediction_extra_blocks",
+    "prediction_replanned",
 }
 
 TIME_FIELDS = [field for field in BATCH_FIELDS if field.endswith("_ms")]
