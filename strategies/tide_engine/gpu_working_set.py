@@ -184,7 +184,7 @@ if triton is not None:
         )
 
         global_mask = mask & (column == 0)
-        block_id = tl.load(block_ids + block_position, mask=global_mask, other=0)
+        block_id = tl.load(block_ids + block_position)
         tl.store(
             target_global_ids + target_row,
             block_id * BLOCK_ROWS + row,
