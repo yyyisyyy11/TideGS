@@ -42,6 +42,11 @@ import utils.general_utils as utils
 from utils.timer import Timer, End2endTimer
 
 from storage.tide_storage_adapter import TideStorageAdapter
+from storage.compaction_scheduler import (
+    crossed_periodic_iteration,
+    resolve_emergency_free_gb,
+    run_compaction_maintenance,
+)
 from storage.schedule_utils import get_camera_batch_schedule
 from storage.pure_ssd_checkpoint import (
     is_pure_ssd_checkpoint,
@@ -62,6 +67,9 @@ from strategies.tide_engine.distributed_plan import (
     validate_block_owner,
 )
 from strategies.tide_engine.gsplat_backend import prepare_distributed_gsplat
+from strategies.tide_engine.distributed_metrics import (
+    get_distributed_metrics_writer,
+)
 from utils.distributed import DistributedContext, get_distributed_context
 
 
@@ -586,6 +594,11 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             log_file.write(msg + "\n")
 
         scene.log_scene_info_to_file(log_file, "Scene Info Before Training")
+    emergency_compaction_free_gb = resolve_emergency_free_gb(
+        configured_gb=args.tide_storage_compaction_emergency_free_gb,
+        min_free_gb=args.tide_storage_min_free_gb,
+    )
+    final_storage_maintenance_complete = False
     utils.check_initial_gpu_memory_usage("after init and before training loop")
 
     # ------------------------------------------------------------------------
@@ -1085,6 +1098,50 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 )
             current_distributed_plan = next_distributed_plan
 
+        matched_checkpoint_iterations = [
+            checkpoint_iteration
+            for checkpoint_iteration in args.checkpoint_iterations
+            if iteration <= checkpoint_iteration < iteration + args.bsz
+        ]
+        periodic_compaction_iteration = crossed_periodic_iteration(
+            iteration=iteration,
+            batch_size=args.bsz,
+            interval_iterations=(
+                args.tide_storage_compaction_interval_iterations
+            ),
+        )
+        is_final_batch = next_iteration > opt_args.iterations
+        if matched_checkpoint_iterations or is_final_batch:
+            storage_adapter.flush_resident_dirty()
+        compaction_result = run_compaction_maintenance(
+            context=distributed_context,
+            storage_adapter=storage_adapter,
+            iteration=iteration,
+            periodic_iteration=periodic_compaction_iteration,
+            target_patch_files=(
+                args.tide_storage_compaction_target_patch_files
+            ),
+            rank_concurrency=args.tide_storage_compaction_rank_concurrency,
+            emergency_free_gb=emergency_compaction_free_gb,
+            flush_dirty_cache=bool(
+                matched_checkpoint_iterations or is_final_batch
+            ),
+        )
+        if compaction_result is not None:
+            get_distributed_metrics_writer(
+                gaussians,
+                distributed_context,
+            ).write_compaction(compaction_result)
+            utils.print_rank_0(
+                "[SSD COMPACTION] "
+                f"trigger={compaction_result['trigger']} "
+                f"iteration={compaction_result['iteration']} "
+                f"target_patches="
+                f"{args.tide_storage_compaction_target_patch_files}"
+            )
+            if is_final_batch:
+                final_storage_maintenance_complete = True
+
         with torch.no_grad():
             if any(
                 [
@@ -1110,18 +1167,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             # ------------------------------------------------------------------------
             # 2.10: Save training checkpoint (for resuming)
             # ------------------------------------------------------------------------
-            if any(
-                [
-                    iteration <= checkpoint_iteration < iteration + args.bsz
-                    for checkpoint_iteration in args.checkpoint_iterations
-                ]
-            ):
+            if matched_checkpoint_iterations:
                 end2end_timers.stop()
-                matched_checkpoint_iterations = [
-                    checkpoint_iteration
-                    for checkpoint_iteration in args.checkpoint_iterations
-                    if iteration <= checkpoint_iteration < iteration + args.bsz
-                ]
                 checkpoint_iteration = matched_checkpoint_iterations[-1]
                 save_folder = os.path.join(
                     scene.model_path,
@@ -1260,12 +1307,30 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         from strategies.tide_engine.engine import shutdown_double_buffer_gpu
 
         distributed_context.barrier()
-        storage_adapter.shutdown()
-        if distributed_enabled:
-            from strategies.tide_engine.distributed_metrics import (
-                get_distributed_metrics_writer,
+        if not final_storage_maintenance_complete:
+            storage_adapter.flush_resident_dirty()
+            compaction_result = run_compaction_maintenance(
+                context=distributed_context,
+                storage_adapter=storage_adapter,
+                iteration=opt_args.iterations,
+                periodic_iteration=None,
+                target_patch_files=(
+                    args.tide_storage_compaction_target_patch_files
+                ),
+                rank_concurrency=(
+                    args.tide_storage_compaction_rank_concurrency
+                ),
+                emergency_free_gb=emergency_compaction_free_gb,
+                forced_trigger="shutdown",
+                flush_dirty_cache=True,
             )
-
+            if compaction_result is not None:
+                get_distributed_metrics_writer(
+                    gaussians,
+                    distributed_context,
+                ).write_compaction(compaction_result)
+        storage_adapter.shutdown(compact_storage=False)
+        if distributed_enabled:
             metrics_writer = get_distributed_metrics_writer(
                 gaussians,
                 distributed_context,

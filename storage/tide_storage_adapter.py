@@ -99,11 +99,11 @@ class TideStorageAdapter:
         skip_camera_clustering: bool = False,
         use_6plane: bool = True,
         execution_mode: str = "paper",
-        max_patch_files: int = 16,
+        max_patch_files: int = 32,
         max_patch_gb: float = 64.0,
         min_free_gb: float = 64.0,
         compaction_batch_files: int = 4,
-        idle_compaction_seconds: float = 0.25,
+        idle_compaction_seconds: float = 0.0,
     ):
         self.gaussians = gaussians
         self.cameras = cameras
@@ -569,6 +569,24 @@ class TideStorageAdapter:
         self._cache_commit_queue.join()
         if self._cache_commit_error is not None:
             raise RuntimeError("background cache commit worker failed") from self._cache_commit_error
+
+    def drain_storage_writebacks(self) -> None:
+        self.drain_cache_writebacks()
+        flush_queue = getattr(self.cache, "flush_queue", None)
+        if flush_queue is not None:
+            flush_queue.join()
+
+    def flush_dirty_cache_to_storage(self) -> None:
+        self.drain_storage_writebacks()
+        flush_all_dirty = getattr(self.cache, "flush_all_dirty", None)
+        if callable(flush_all_dirty):
+            flush_all_dirty()
+        self.drain_storage_writebacks()
+
+    def wait_for_storage_reads(self) -> None:
+        wait_for_prefetches = getattr(self.cache, "wait_for_prefetches", None)
+        if callable(wait_for_prefetches):
+            wait_for_prefetches()
 
     def _init_from_resume_manifest(
         self,
@@ -1187,7 +1205,12 @@ class TideStorageAdapter:
             "storage": self.storage.get_stats(),
         }
 
-    def shutdown(self) -> None:
+    def shutdown(
+        self,
+        *,
+        compact_storage: bool = True,
+        target_patch_files: int = 8,
+    ) -> None:
         self._log("[TideStorageAdapter] Shutting down...")
         self.flush_resident_dirty()
         self.drain_cache_writebacks()
@@ -1202,6 +1225,9 @@ class TideStorageAdapter:
             self._bounds_refresh_thread.join(timeout=5.0)
         self.pipeline.shutdown()
         self.cache.shutdown()
-        self.storage.compact_for_checkpoint(min_patches=2)
+        if compact_storage:
+            self.storage.compact_to_patch_count(
+                target_patch_files=target_patch_files,
+            )
         self.storage.close()
         self._log("[TideStorageAdapter] Shutdown complete")

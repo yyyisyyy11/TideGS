@@ -192,11 +192,15 @@ class AuxiliaryParams(ParamGroup):
         self.num_clusters = 64
         self.visualize_ssd_schedule = False  # Generate TSP schedule visualization
         self.ssd_schedule_ordering = "trajectory"  # {trajectory, shuffle}
-        self.tide_storage_max_patch_files = 16  # Compact append-only deltas at this file count
+        self.tide_storage_max_patch_files = 32  # Legacy idle-compaction high watermark
         self.tide_storage_max_patch_gb = 64.0  # Compact after this much stale delta data accumulates
         self.tide_storage_min_free_gb = 64.0  # Refuse writes that consume this reserve
         self.tide_storage_compaction_batch_files = 4  # Oldest patches merged per maintenance pass
-        self.tide_storage_idle_compaction_seconds = 0.25  # Read-idle delay before maintenance
+        self.tide_storage_idle_compaction_seconds = 0.0  # Legacy idle maintenance; disabled by default
+        self.tide_storage_compaction_interval_iterations = 5000
+        self.tide_storage_compaction_target_patch_files = 8
+        self.tide_storage_compaction_rank_concurrency = 2
+        self.tide_storage_compaction_emergency_free_gb = -1.0
         self.pure_ssd_schedule_cache_dir = ""  # Optional persistent cache for pure SSD camera TSP schedules
         self.pure_ssd_disable_schedule_cache = False  # Disable pure SSD camera schedule cache
         self.enable_hotspot_retention = True  # Enable GPU hotspot retention to reduce RAM→GPU bandwidth
@@ -681,6 +685,37 @@ def init_args(args):
             args.tide_storage_idle_compaction_seconds
         )
         assert args.tide_storage_idle_compaction_seconds >= 0
+    if hasattr(args, "tide_storage_compaction_interval_iterations"):
+        args.tide_storage_compaction_interval_iterations = int(
+            args.tide_storage_compaction_interval_iterations
+        )
+        assert args.tide_storage_compaction_interval_iterations >= 0
+    if hasattr(args, "tide_storage_compaction_target_patch_files"):
+        args.tide_storage_compaction_target_patch_files = int(
+            args.tide_storage_compaction_target_patch_files
+        )
+        assert args.tide_storage_compaction_target_patch_files >= 1
+    if hasattr(args, "tide_storage_compaction_rank_concurrency"):
+        args.tide_storage_compaction_rank_concurrency = int(
+            args.tide_storage_compaction_rank_concurrency
+        )
+        assert args.tide_storage_compaction_rank_concurrency >= 1
+    if hasattr(args, "tide_storage_compaction_emergency_free_gb"):
+        args.tide_storage_compaction_emergency_free_gb = float(
+            args.tide_storage_compaction_emergency_free_gb
+        )
+        assert (
+            args.tide_storage_compaction_emergency_free_gb == -1
+            or args.tide_storage_compaction_emergency_free_gb
+            >= args.tide_storage_min_free_gb
+        )
+    if (
+        getattr(args, "tide_storage_idle_compaction_seconds", 0) > 0
+        and getattr(args, "tide_storage_compaction_interval_iterations", 0) > 0
+    ):
+        raise ValueError(
+            "Idle and iteration-based SSD compaction cannot be enabled together"
+        )
 
     if hasattr(args, "pure_ssd_sort_memory_mb"):
         args.pure_ssd_sort_memory_mb = float(args.pure_ssd_sort_memory_mb)

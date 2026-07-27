@@ -376,14 +376,8 @@ def write_pure_ssd_incremental_checkpoint(
     )
     _flush_gpu_resident_dirty(storage_adapter)
     _wait_for_pending_writeback(getattr(storage_adapter, "cache", None), log_file=log_file)
-    checkpoint_compaction_rounds = storage.compact_for_checkpoint(min_patches=2)
-    compacted_before_checkpoint = checkpoint_compaction_rounds > 0
-    if compacted_before_checkpoint:
-        _log(
-            f"[PURE SSD CHECKPOINT] Incremental compaction rounds="
-            f"{checkpoint_compaction_rounds}",
-            log_file,
-        )
+    checkpoint_compaction_rounds = 0
+    compacted_before_checkpoint = False
 
     patch_file_mode = str(
         getattr(args, "pure_ssd_checkpoint_patch_mode", "hardlink")
@@ -468,6 +462,26 @@ def write_pure_ssd_incremental_checkpoint(
             "tide_storage_idle_compaction_seconds": getattr(
                 args,
                 "tide_storage_idle_compaction_seconds",
+                None,
+            ),
+            "tide_storage_compaction_interval_iterations": getattr(
+                args,
+                "tide_storage_compaction_interval_iterations",
+                None,
+            ),
+            "tide_storage_compaction_target_patch_files": getattr(
+                args,
+                "tide_storage_compaction_target_patch_files",
+                None,
+            ),
+            "tide_storage_compaction_rank_concurrency": getattr(
+                args,
+                "tide_storage_compaction_rank_concurrency",
+                None,
+            ),
+            "tide_storage_compaction_emergency_free_gb": getattr(
+                args,
+                "tide_storage_compaction_emergency_free_gb",
                 None,
             ),
         },

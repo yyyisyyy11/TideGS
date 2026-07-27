@@ -27,6 +27,13 @@ class _Context:
             return [value, peer]
         peer = dict(value)
         peer["rank"] = 1
+        if "trigger" in value:
+            peer["rounds"] = 3
+            peer["input_bytes"] = 300
+            peer["output_bytes"] = 200
+            peer["reclaimed_bytes"] = 100
+            peer["duration_ms"] = 8.0
+            peer["free_space_gb_after"] = 140.0
         peer["optimizer_ms"] = 8.0
         return [value, peer]
 
@@ -163,6 +170,49 @@ class DistributedMetricsTest(unittest.TestCase):
                         }
                     ]
                 )
+
+    def test_compaction_metrics_write_rank_and_global_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = DistributedMetricsWriter(
+                args=SimpleNamespace(
+                    log_folder=directory,
+                    tide_detailed_metrics=True,
+                ),
+                context=_Context(),
+            )
+            writer.write_compaction(
+                {
+                    "trigger": "periodic",
+                    "iteration": 5000,
+                    "rounds": 2,
+                    "before_patches": 12,
+                    "after_patches": 8,
+                    "input_bytes": 200,
+                    "output_bytes": 120,
+                    "reclaimed_bytes": 80,
+                    "duration_ms": 6.0,
+                    "actual_concurrency": 2,
+                    "free_space_gb_before": 120.0,
+                    "free_space_gb_after": 150.0,
+                }
+            )
+
+            rank_row = _read_rows(
+                Path(directory) / "metrics_compaction_rank0.tsv"
+            )[0]
+            self.assertEqual(rank_row["trigger"], "periodic")
+            self.assertEqual(rank_row["iteration"], "5000")
+            self.assertEqual(rank_row["output_bytes"], "120")
+
+            global_row = _read_rows(
+                Path(directory) / "metrics_compaction_global.tsv"
+            )[0]
+            self.assertEqual(global_row["rounds"], "5")
+            self.assertEqual(global_row["input_bytes"], "500")
+            self.assertEqual(global_row["output_bytes"], "320")
+            self.assertEqual(global_row["duration_ms_max"], "8.0")
+            self.assertEqual(global_row["duration_ms_mean"], "7.0")
+            self.assertEqual(global_row["free_space_gb_after"], "140.0")
 
 
 if __name__ == "__main__":

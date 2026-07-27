@@ -143,6 +143,40 @@ class LogStorageLifecycleTest(unittest.TestCase):
         self.assertEqual(manifest["linked_patch_files"], 0)
         self.assertGreater(manifest["copied_patch_bytes"], 0)
 
+    def test_checkpoint_manifest_preserves_multiple_runtime_patches(self):
+        self.storage.write_patch({0: self.block(10)})
+        self.storage.write_patch({1: self.block(11)})
+        checkpoint_dir = self.root / "multi_patch_checkpoint"
+        manifest_path = checkpoint_dir / "storage_index.json"
+
+        manifest = self.storage.export_index_manifest(
+            manifest_path=manifest_path,
+            patches_dir=checkpoint_dir / "patches",
+            patch_file_mode="hardlink",
+        )
+
+        self.assertEqual(manifest["patch_files"], 2)
+        self.assertEqual(self.storage.get_stats()["num_patches"], 2)
+        resume = LogStorageManager(
+            storage_dir=str(self.root / "multi_patch_resume"),
+            block_size=2,
+            num_blocks=4,
+            point_dim=3,
+            verbose=False,
+            min_free_gb=0,
+            idle_compaction_seconds=0,
+        )
+        try:
+            resume.load_index_manifest(manifest_path)
+            self.assertTrue(
+                torch.equal(resume.read_blocks([0])[0], self.block(10))
+            )
+            self.assertTrue(
+                torch.equal(resume.read_blocks([1])[1], self.block(11))
+            )
+        finally:
+            resume.close()
+
     def test_failed_atomic_switch_keeps_old_index_and_patches(self):
         self.storage.write_patch({0: self.block(10)})
         self.storage.write_patch({0: self.block(20)})
@@ -214,6 +248,23 @@ class LogStorageLifecycleTest(unittest.TestCase):
 
         self.assertGreaterEqual(rounds, 3)
         self.assertEqual(self.storage.get_stats()["num_patches"], 1)
+
+    def test_compaction_stops_at_patch_low_watermark(self):
+        self.storage.compaction_batch_files = 2
+        for version in range(10):
+            self.storage.write_patch(
+                {version % 4: self.block(20 + version)}
+            )
+
+        result = self.storage.compact_to_patch_count(
+            target_patch_files=8,
+        )
+
+        self.assertEqual(result["rounds"], 1)
+        self.assertEqual(result["before_patches"], 10)
+        self.assertEqual(result["after_patches"], 8)
+        self.assertGreater(result["input_bytes"], 0)
+        self.assertGreaterEqual(result["output_bytes"], 0)
 
     def test_reader_priority_allows_new_reader_ahead_of_waiting_writer(self):
         lock = self.storage._storage_rwlock

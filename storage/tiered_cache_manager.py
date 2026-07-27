@@ -535,6 +535,18 @@ class TieredCacheManager:
         self.stats['inflight_wait_blocks'] += 1
         self.stats['inflight_wait_time'] += time.time() - t0
 
+    def wait_for_prefetches(self) -> None:
+        """Wait until queued and in-flight future reads have completed."""
+        if hasattr(self, "future_prefetch_queue"):
+            self.future_prefetch_queue.join()
+        while True:
+            with self.inflight_lock:
+                events = list(self.inflight_reads.values())
+            if not events:
+                return
+            for event in events:
+                event.wait()
+
     def _read_claimed_blocks(
         self,
         block_ids: List[int],

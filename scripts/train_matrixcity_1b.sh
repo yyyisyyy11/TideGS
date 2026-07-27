@@ -40,9 +40,13 @@ PROJECTION_CHUNK=2
 CHECKPOINT_MODE="incremental"
 CHECKPOINT_PATCH_MODE="hardlink"
 CHECKPOINT_KEEP_LAST=2
-MAX_PATCH_FILES=16
+MAX_PATCH_FILES=32
 MAX_PATCH_GB=64
 MIN_FREE_GB=64
+COMPACTION_INTERVAL=5000
+COMPACTION_TARGET_PATCHES=8
+COMPACTION_RANK_CONCURRENCY=2
+COMPACTION_EMERGENCY_FREE_GB=-1
 RESIDENT_POLICY="topc_balanced"
 RESIDENT_LAMBDA_LIST="0.3"
 RESIDENT_DECAY_LIST="0.95"
@@ -99,6 +103,13 @@ Options:
   --max-patch-files N         Compact at this active patch count (default: ${MAX_PATCH_FILES})
   --max-patch-gb N            Compact at this stale patch size in GiB (default: ${MAX_PATCH_GB})
   --min-free-gb N             Refuse writes that consume this free-space reserve (default: ${MIN_FREE_GB})
+  --compaction-interval N      Periodic compaction interval; 0 disables it (default: ${COMPACTION_INTERVAL})
+  --compaction-target-patches N
+                              Per-rank patch low watermark (default: ${COMPACTION_TARGET_PATCHES})
+  --compaction-rank-concurrency N
+                              Ranks compacting at once (default: ${COMPACTION_RANK_CONCURRENCY})
+  --compaction-emergency-free-gb N
+                              Emergency free-space threshold; -1 uses 2x min-free-gb
   --resident-policy POLICY    topc_strict|topc_balanced (default: ${RESIDENT_POLICY})
   --resident-lambda VALUE     Single resident-set mixing weight
   --resident-decay VALUE      Single resident recency decay value
@@ -165,6 +176,10 @@ while [[ $# -gt 0 ]]; do
     --max-patch-files) MAX_PATCH_FILES="$2"; shift 2 ;;
     --max-patch-gb) MAX_PATCH_GB="$2"; shift 2 ;;
     --min-free-gb) MIN_FREE_GB="$2"; shift 2 ;;
+    --compaction-interval) COMPACTION_INTERVAL="$2"; shift 2 ;;
+    --compaction-target-patches) COMPACTION_TARGET_PATCHES="$2"; shift 2 ;;
+    --compaction-rank-concurrency) COMPACTION_RANK_CONCURRENCY="$2"; shift 2 ;;
+    --compaction-emergency-free-gb) COMPACTION_EMERGENCY_FREE_GB="$2"; shift 2 ;;
     --resident-policy) RESIDENT_POLICY="$2"; shift 2 ;;
     --resident-lambda) RESIDENT_LAMBDA_LIST="$2"; shift 2 ;;
     --resident-lambda-list) RESIDENT_LAMBDA_LIST="$2"; shift 2 ;;
@@ -374,6 +389,11 @@ append_train_command() {
     printf '  --tide_storage_max_patch_files %q \\\n' "${MAX_PATCH_FILES}"
     printf '  --tide_storage_max_patch_gb %q \\\n' "${MAX_PATCH_GB}"
     printf '  --tide_storage_min_free_gb %q \\\n' "${MIN_FREE_GB}"
+    printf '  --tide_storage_compaction_interval_iterations %q \\\n' "${COMPACTION_INTERVAL}"
+    printf '  --tide_storage_compaction_target_patch_files %q \\\n' "${COMPACTION_TARGET_PATCHES}"
+    printf '  --tide_storage_compaction_rank_concurrency %q \\\n' "${COMPACTION_RANK_CONCURRENCY}"
+    printf '  --tide_storage_compaction_emergency_free_gb %q \\\n' "${COMPACTION_EMERGENCY_FREE_GB}"
+    printf '  --tide_storage_idle_compaction_seconds 0 \\\n'
     if [[ "${DEBUG_LOGGING}" == "1" ]]; then
       printf '  --tide_debug_logging \\\n'
     fi

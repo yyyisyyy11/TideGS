@@ -152,6 +152,37 @@ ASYNC_GLOBAL_FIELDS = (
     + [f"{field}_max" for field in sorted(ASYNC_TIME_FIELDS)]
     + [f"{field}_mean" for field in sorted(ASYNC_TIME_FIELDS)]
 )
+COMPACTION_FIELDS = [
+    "trigger",
+    "iteration",
+    "rank",
+    "rounds",
+    "before_patches",
+    "after_patches",
+    "input_bytes",
+    "output_bytes",
+    "reclaimed_bytes",
+    "duration_ms",
+    "actual_concurrency",
+    "free_space_gb_before",
+    "free_space_gb_after",
+]
+COMPACTION_GLOBAL_FIELDS = [
+    "trigger",
+    "iteration",
+    "world_size",
+    "rounds",
+    "before_patches",
+    "after_patches",
+    "input_bytes",
+    "output_bytes",
+    "reclaimed_bytes",
+    "duration_ms_max",
+    "duration_ms_mean",
+    "actual_concurrency",
+    "free_space_gb_before",
+    "free_space_gb_after",
+]
 
 
 def _append_tsv(path: Path, fields: Iterable[str], row: Dict[str, object]) -> None:
@@ -204,6 +235,13 @@ class DistributedMetricsWriter:
         )
         self.async_global_path = (
             Path(args.log_folder) / "metrics_async_iteration_global.tsv"
+        )
+        self.compaction_rank_path = (
+            Path(args.log_folder)
+            / f"metrics_compaction_rank{context.rank}.tsv"
+        )
+        self.compaction_global_path = (
+            Path(args.log_folder) / "metrics_compaction_global.tsv"
         )
         self._async_by_iteration: Dict[int, Dict[str, float]] = {}
         self._async_finalized = False
@@ -264,6 +302,69 @@ class DistributedMetricsWriter:
                 sum(values) / len(values) if values else 0.0
             )
         _append_tsv(self.global_path, GLOBAL_FIELDS, global_row)
+
+    def write_compaction(self, row: Dict[str, object]) -> None:
+        if not self.enabled:
+            return
+        rank_row = dict(row)
+        rank_row["rank"] = self.context.rank
+        _append_tsv(
+            self.compaction_rank_path,
+            COMPACTION_FIELDS,
+            rank_row,
+        )
+        rank_rows: List[Dict[str, object]] = self.context.all_gather_object(
+            rank_row
+        )
+        if not self.context.is_rank0:
+            return
+        durations = [
+            float(value.get("duration_ms", 0.0)) for value in rank_rows
+        ]
+        global_row = {
+            "trigger": rank_row.get("trigger", ""),
+            "iteration": int(rank_row["iteration"]),
+            "world_size": int(self.context.world_size),
+            "rounds": sum(
+                int(value.get("rounds", 0)) for value in rank_rows
+            ),
+            "before_patches": sum(
+                int(value.get("before_patches", 0)) for value in rank_rows
+            ),
+            "after_patches": sum(
+                int(value.get("after_patches", 0)) for value in rank_rows
+            ),
+            "input_bytes": sum(
+                int(value.get("input_bytes", 0)) for value in rank_rows
+            ),
+            "output_bytes": sum(
+                int(value.get("output_bytes", 0)) for value in rank_rows
+            ),
+            "reclaimed_bytes": sum(
+                int(value.get("reclaimed_bytes", 0)) for value in rank_rows
+            ),
+            "duration_ms_max": max(durations, default=0.0),
+            "duration_ms_mean": (
+                sum(durations) / len(durations) if durations else 0.0
+            ),
+            "actual_concurrency": max(
+                int(value.get("actual_concurrency", 0))
+                for value in rank_rows
+            ),
+            "free_space_gb_before": min(
+                float(value.get("free_space_gb_before", 0.0))
+                for value in rank_rows
+            ),
+            "free_space_gb_after": min(
+                float(value.get("free_space_gb_after", 0.0))
+                for value in rank_rows
+            ),
+        }
+        _append_tsv(
+            self.compaction_global_path,
+            COMPACTION_GLOBAL_FIELDS,
+            global_row,
+        )
 
     def finalize_async_metrics(self) -> None:
         if not self.enabled or self._async_finalized:

@@ -102,11 +102,11 @@ class LogStorageManager:
         point_dim: int = 59,  # 3(xyz) + 3(scale) + 4(rot) + 3(opacity) + 48(SH)
         dtype: torch.dtype = torch.float32,
         verbose: bool = True,
-        max_patch_files: int = 16,
+        max_patch_files: int = 32,
         max_patch_gb: float = 64.0,
         min_free_gb: float = 64.0,
         compaction_batch_files: int = 4,
-        idle_compaction_seconds: float = 0.25,
+        idle_compaction_seconds: float = 0.0,
     ):
         """
         Initialize Log-Structured Storage Manager.
@@ -803,6 +803,28 @@ class LogStorageManager:
         except OSError:
             return False
 
+    def estimate_next_compaction_output_bytes(
+        self,
+        *,
+        min_patches: int = 2,
+        max_patches: Optional[int] = None,
+    ) -> int:
+        """Estimate temporary output space for the next bounded compaction."""
+        min_patches = max(1, int(min_patches))
+        max_patches = max(
+            min_patches,
+            int(self.compaction_batch_files if max_patches is None else max_patches),
+        )
+        index_snapshot, _, patch_paths, _, _, _ = self._patch_state()
+        selected_file_ids = set(sorted(patch_paths)[:max_patches])
+        if len(selected_file_ids) < min_patches:
+            return 0
+        return sum(
+            int(location.size)
+            for location in index_snapshot.values()
+            if int(location.file_id) in selected_file_ids
+        )
+
     def compact_patches(
         self,
         min_patches: int = 2,
@@ -973,10 +995,50 @@ class LogStorageManager:
 
     def compact_for_checkpoint(self, min_patches: int = 2) -> int:
         """Drain patches through bounded compaction passes at a safe point."""
+        return self.compact_to_patch_count(
+            target_patch_files=1,
+            min_patches=min_patches,
+        )["rounds"]
+
+    def compact_to_patch_count(
+        self,
+        *,
+        target_patch_files: int,
+        min_patches: int = 2,
+    ) -> Dict[str, int]:
+        """Compact bounded batches until the active patch count reaches a low watermark."""
+        target_patch_files = max(1, int(target_patch_files))
+        before = self.get_stats()
         rounds = 0
-        while self.maybe_compact(min_patches=min_patches, force=True):
+        while int(self.get_stats()["num_patches"]) > target_patch_files:
+            previous_count = int(self.get_stats()["num_patches"])
+            if not self.compact_patches(min_patches=min_patches, force=True):
+                break
             rounds += 1
-        return rounds
+            current_count = int(self.get_stats()["num_patches"])
+            if current_count >= previous_count:
+                raise RuntimeError(
+                    "Incremental compaction made no patch-count progress: "
+                    f"before={previous_count} after={current_count}"
+                )
+        after = self.get_stats()
+        return {
+            "rounds": int(rounds),
+            "before_patches": int(before["num_patches"]),
+            "after_patches": int(after["num_patches"]),
+            "input_bytes": int(
+                self.stats["compaction_input_bytes"]
+                - before["compaction_input_bytes"]
+            ),
+            "output_bytes": int(
+                self.stats["compaction_output_bytes"]
+                - before["compaction_output_bytes"]
+            ),
+            "reclaimed_bytes": int(
+                self.stats["compaction_reclaimed_bytes"]
+                - before["compaction_reclaimed_bytes"]
+            ),
+        }
 
     def compact(self, min_patches: int = 10) -> bool:
         """Compatibility wrapper for explicit maintenance callers."""
