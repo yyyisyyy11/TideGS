@@ -2,6 +2,8 @@ import errno
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -26,6 +28,7 @@ class LogStorageLifecycleTest(unittest.TestCase):
             max_patch_files=32,
             max_patch_gb=0,
             min_free_gb=0,
+            idle_compaction_seconds=0,
         )
         base = torch.arange(24, dtype=torch.float32).reshape(8, 3)
         self.storage.file_paths[0].write_bytes(base.numpy().tobytes())
@@ -113,6 +116,7 @@ class LogStorageLifecycleTest(unittest.TestCase):
             point_dim=3,
             verbose=False,
             min_free_gb=0,
+            idle_compaction_seconds=0,
         )
         try:
             resume.load_index_manifest(manifest_path)
@@ -155,22 +159,131 @@ class LogStorageLifecycleTest(unittest.TestCase):
         self.assertEqual(list(self.storage_dir.glob(".tide_compact_*.tmp")), [])
         self.assertTrue(torch.equal(self.storage.read_blocks([0])[0], self.block(20)))
 
-    def test_patch_threshold_triggers_automatic_compaction(self):
+    def test_patch_write_never_runs_compaction_synchronously(self):
         self.storage.max_patch_files = 2
         self.storage.write_patch({0: self.block(10)})
         self.storage.write_patch({0: self.block(20), 1: self.block(11)})
 
+        self.assertEqual(self.storage.get_stats()["num_patches"], 2)
+        self.assertEqual(self.storage.get_stats()["compactions"], 0)
+
+        self.assertTrue(self.storage.maybe_compact())
         self.assertEqual(self.storage.get_stats()["num_patches"], 1)
         self.assertEqual(self.storage.get_stats()["compactions"], 1)
         self.assertTrue(torch.equal(self.storage.read_blocks([0])[0], self.block(20)))
+
+    def test_incremental_compaction_only_merges_oldest_patch_batch(self):
+        self.storage.compaction_batch_files = 2
+        patch_ids = [
+            self.storage.write_patch({block_id: self.block(10 + block_id)})
+            for block_id in range(4)
+        ]
+        old_paths = {
+            patch_id: self.storage.file_paths[patch_id]
+            for patch_id in patch_ids
+        }
+
+        self.assertTrue(self.storage.compact_patches(force=True))
+
+        remaining_ids = set(self.storage.file_paths) - {0}
+        self.assertEqual(len(remaining_ids), 3)
+        self.assertNotIn(patch_ids[0], remaining_ids)
+        self.assertNotIn(patch_ids[1], remaining_ids)
+        self.assertIn(patch_ids[2], remaining_ids)
+        self.assertIn(patch_ids[3], remaining_ids)
+        self.assertFalse(old_paths[patch_ids[0]].exists())
+        self.assertFalse(old_paths[patch_ids[1]].exists())
+        self.assertTrue(old_paths[patch_ids[2]].exists())
+        self.assertTrue(old_paths[patch_ids[3]].exists())
+        for block_id in range(4):
+            self.assertTrue(
+                torch.equal(
+                    self.storage.read_blocks([block_id])[block_id],
+                    self.block(10 + block_id),
+                )
+            )
+
+    def test_checkpoint_compaction_drains_bounded_batches(self):
+        self.storage.compaction_batch_files = 3
+        for version in range(7):
+            self.storage.write_patch(
+                {version % 4: self.block(20 + version)}
+            )
+
+        rounds = self.storage.compact_for_checkpoint()
+
+        self.assertGreaterEqual(rounds, 3)
+        self.assertEqual(self.storage.get_stats()["num_patches"], 1)
+
+    def test_reader_priority_allows_new_reader_ahead_of_waiting_writer(self):
+        lock = self.storage._storage_rwlock
+        writer_acquired = threading.Event()
+        second_reader_acquired = threading.Event()
+
+        def writer():
+            with lock.write_lock():
+                writer_acquired.set()
+
+        def second_reader():
+            with lock.read_lock():
+                second_reader_acquired.set()
+
+        with lock.read_lock():
+            writer_thread = threading.Thread(target=writer)
+            writer_thread.start()
+            deadline = time.monotonic() + 1.0
+            while lock.waiting_writers == 0 and time.monotonic() < deadline:
+                time.sleep(0.001)
+            self.assertEqual(lock.waiting_writers, 1)
+
+            reader_thread = threading.Thread(target=second_reader)
+            reader_thread.start()
+            self.assertTrue(second_reader_acquired.wait(timeout=1.0))
+            self.assertFalse(writer_acquired.is_set())
+
+        reader_thread.join(timeout=1.0)
+        writer_thread.join(timeout=1.0)
+        self.assertTrue(writer_acquired.is_set())
+
+    def test_idle_worker_runs_incremental_compaction(self):
+        idle_dir = self.root / "idle-cache"
+        storage = LogStorageManager(
+            storage_dir=str(idle_dir),
+            block_size=2,
+            num_blocks=4,
+            point_dim=3,
+            verbose=False,
+            max_patch_files=2,
+            max_patch_gb=0,
+            min_free_gb=0,
+            compaction_batch_files=2,
+            idle_compaction_seconds=0.01,
+        )
+        base = torch.arange(24, dtype=torch.float32).reshape(8, 3)
+        storage.file_paths[0].write_bytes(base.numpy().tobytes())
+        try:
+            storage.write_patch({0: self.block(10)})
+            storage.write_patch({1: self.block(11)})
+            deadline = time.monotonic() + 2.0
+            while (
+                storage.get_stats()["idle_compaction_runs"] == 0
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            self.assertEqual(storage.get_stats()["idle_compaction_runs"], 1)
+            self.assertEqual(storage.get_stats()["num_patches"], 1)
+        finally:
+            storage.close()
 
     def test_live_delta_size_does_not_retrigger_compaction(self):
         self.storage.max_stale_patch_bytes = 1
         self.storage.write_patch({0: self.block(10)})
         self.storage.write_patch({0: self.block(20)})
+        self.assertTrue(self.storage.maybe_compact())
         self.assertEqual(self.storage.get_stats()["compactions"], 1)
 
         self.storage.write_patch({1: self.block(11)})
+        self.assertFalse(self.storage.maybe_compact())
 
         stats = self.storage.get_stats()
         self.assertEqual(stats["compactions"], 1)

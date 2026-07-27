@@ -102,6 +102,8 @@ class TideStorageAdapter:
         max_patch_files: int = 16,
         max_patch_gb: float = 64.0,
         min_free_gb: float = 64.0,
+        compaction_batch_files: int = 4,
+        idle_compaction_seconds: float = 0.25,
     ):
         self.gaussians = gaussians
         self.cameras = cameras
@@ -111,6 +113,8 @@ class TideStorageAdapter:
         self.max_patch_files = int(max_patch_files)
         self.max_patch_gb = float(max_patch_gb)
         self.min_free_gb = float(min_free_gb)
+        self.compaction_batch_files = int(compaction_batch_files)
+        self.idle_compaction_seconds = float(idle_compaction_seconds)
         self.paper_debug_logging = bool(
             getattr(getattr(self.gaussians, "args", None), "paper_debug_logging", False)
         )
@@ -677,6 +681,8 @@ class TideStorageAdapter:
             max_patch_files=self.max_patch_files,
             max_patch_gb=self.max_patch_gb,
             min_free_gb=self.min_free_gb,
+            compaction_batch_files=self.compaction_batch_files,
+            idle_compaction_seconds=self.idle_compaction_seconds,
         )
         storage_index = None
         if self.streaming_init_manifest:
@@ -1196,6 +1202,6 @@ class TideStorageAdapter:
             self._bounds_refresh_thread.join(timeout=5.0)
         self.pipeline.shutdown()
         self.cache.shutdown()
-        self.storage.maybe_compact(min_patches=2, force=True)
+        self.storage.compact_for_checkpoint(min_patches=2)
         self.storage.close()
         self._log("[TideStorageAdapter] Shutdown complete")

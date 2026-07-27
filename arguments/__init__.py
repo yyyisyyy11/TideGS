@@ -195,6 +195,8 @@ class AuxiliaryParams(ParamGroup):
         self.tide_storage_max_patch_files = 16  # Compact append-only deltas at this file count
         self.tide_storage_max_patch_gb = 64.0  # Compact after this much stale delta data accumulates
         self.tide_storage_min_free_gb = 64.0  # Refuse writes that consume this reserve
+        self.tide_storage_compaction_batch_files = 4  # Oldest patches merged per maintenance pass
+        self.tide_storage_idle_compaction_seconds = 0.25  # Read-idle delay before maintenance
         self.pure_ssd_schedule_cache_dir = ""  # Optional persistent cache for pure SSD camera TSP schedules
         self.pure_ssd_disable_schedule_cache = False  # Disable pure SSD camera schedule cache
         self.enable_hotspot_retention = True  # Enable GPU hotspot retention to reduce RAM→GPU bandwidth
@@ -669,6 +671,16 @@ def init_args(args):
     if hasattr(args, "tide_storage_min_free_gb"):
         args.tide_storage_min_free_gb = float(args.tide_storage_min_free_gb)
         assert args.tide_storage_min_free_gb >= 0
+    if hasattr(args, "tide_storage_compaction_batch_files"):
+        args.tide_storage_compaction_batch_files = int(
+            args.tide_storage_compaction_batch_files
+        )
+        assert args.tide_storage_compaction_batch_files >= 2
+    if hasattr(args, "tide_storage_idle_compaction_seconds"):
+        args.tide_storage_idle_compaction_seconds = float(
+            args.tide_storage_idle_compaction_seconds
+        )
+        assert args.tide_storage_idle_compaction_seconds >= 0
 
     if hasattr(args, "pure_ssd_sort_memory_mb"):
         args.pure_ssd_sort_memory_mb = float(args.pure_ssd_sort_memory_mb)

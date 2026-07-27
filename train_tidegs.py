@@ -475,6 +475,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 max_patch_files=args.tide_storage_max_patch_files,
                 max_patch_gb=args.tide_storage_max_patch_gb,
                 min_free_gb=args.tide_storage_min_free_gb,
+                compaction_batch_files=args.tide_storage_compaction_batch_files,
+                idle_compaction_seconds=args.tide_storage_idle_compaction_seconds,
             )
 
         ssd_schedule_ordering = getattr(args, "ssd_schedule_ordering", "trajectory")
