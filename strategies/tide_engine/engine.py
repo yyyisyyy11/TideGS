@@ -3232,7 +3232,7 @@ def clm_offload_train_one_batch(
             model_path=getattr(args, 'model_path', ''),
             iteration=iteration,
             batch_size=bsz,
-            update_rule='swan',
+            update_rule='hybrid_bounded_swan',
             updates_enabled=not args.stop_update_param,
             omega_wait_ms=optimizer_omega_wait_ms,
             optimizer_submit_ms=optimizer_submit_ms,
@@ -3244,7 +3244,7 @@ def clm_offload_train_one_batch(
         )
         if _perf_log:
             log_file.write(
-                f"[OPTIMIZER TIMING] Iter {iteration}: rule=swan "
+                f"[OPTIMIZER TIMING] Iter {iteration}: rule=hybrid_bounded_swan "
                 f"omega_wait={optimizer_omega_wait_ms:.3f}ms "
                 f"submit={optimizer_submit_ms:.3f}ms "
                 f"cuda={optimizer_cuda_ms:.3f}ms "

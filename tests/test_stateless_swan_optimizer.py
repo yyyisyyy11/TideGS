@@ -65,7 +65,7 @@ class StatelessSWANOptimizerTest(unittest.TestCase):
             )
         return gaussians
 
-    def test_full_swan_matches_reference_and_keeps_untouched_rows(self):
+    def test_hybrid_swan_matches_reference_and_keeps_untouched_rows(self):
         torch.manual_seed(7)
         touched_rows = 48
         rows = touched_rows + 2
@@ -88,20 +88,31 @@ class StatelessSWANOptimizerTest(unittest.TestCase):
 
         for component_index, (name, width) in enumerate(self.COMPONENT_WIDTHS.items()):
             expected = before[name].clone()
-            update, used_fallback = self.swan_reference(grads[name] / 4.0, eps)
-            self.assertFalse(used_fallback, name)
+            mean_grad = grads[name] / 4.0
+            if name in GPUStatelessSWAN.SWAN_COMPONENTS:
+                update, used_fallback = self.swan_reference(mean_grad, eps)
+                self.assertFalse(used_fallback, name)
+                self.assertGreater(float(update.abs().max()), 1.0, name)
+                update = update.clamp(min=-1.0, max=1.0)
+            else:
+                update = mean_grad / (mean_grad.abs() + eps)
             expected.index_add_(0, local_ids, update, alpha=-columns_lr[component_index])
             actual = getattr(gaussians, self.COMPONENT_ATTRS[name])
             torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
             torch.testing.assert_close(actual[-2:], before[name][-2:])
+            applied_direction = (
+                before[name][local_ids] - actual[local_ids]
+            ) / columns_lr[component_index]
+            self.assertLessEqual(float(applied_direction.abs().max()), 1.0)
 
         self.assertEqual(
             stats,
             {
                 'touched_rows': touched_rows,
                 'state_bytes': 0,
-                'swan_whitened_components': 6,
+                'swan_whitened_components': 2,
                 'swan_gradnorm_fallback_components': 0,
+                'normalized_sgd_components': 4,
             },
         )
         self.assertFalse(hasattr(optimizer, 'state'))
@@ -109,8 +120,9 @@ class StatelessSWANOptimizerTest(unittest.TestCase):
         optimizer_stats = optimizer.get_stats()
         self.assertEqual(optimizer_stats['persistent_state_bytes'], 0)
         self.assertEqual(optimizer_stats['optimizer_rows_touched_total'], touched_rows)
-        self.assertEqual(optimizer_stats['swan_whitened_components_total'], 6)
+        self.assertEqual(optimizer_stats['swan_whitened_components_total'], 2)
         self.assertEqual(optimizer_stats['swan_gradnorm_fallback_components_total'], 0)
+        self.assertEqual(optimizer_stats['normalized_sgd_components_total'], 4)
 
         # A completely zero Gaussian gradient must remain a zero update.
         torch.testing.assert_close(
@@ -158,8 +170,9 @@ class StatelessSWANOptimizerTest(unittest.TestCase):
             sparse_grad_components=grads,
         )
 
-        self.assertEqual(stats['swan_whitened_components'], 4)
-        self.assertEqual(stats['swan_gradnorm_fallback_components'], 2)
+        self.assertEqual(stats['swan_whitened_components'], 2)
+        self.assertEqual(stats['swan_gradnorm_fallback_components'], 0)
+        self.assertEqual(stats['normalized_sgd_components'], 4)
 
     def test_rejects_nonfinite_gradients(self):
         optimizer = GPUStatelessSWAN(batch_size=1, device='cpu')

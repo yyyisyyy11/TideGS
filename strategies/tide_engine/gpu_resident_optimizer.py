@@ -6,11 +6,11 @@ import torch
 
 
 class GPUStatelessSWAN:
-    """Stateless SWAN updates over touched rows in the GPU working set.
+    """Hybrid bounded-SWAN updates over touched rows in the GPU working set.
 
-    Gradients are batch-averaged once, then each parameter component is treated
-    as a ``width x touched_rows`` matrix.  This makes the Gaussian dimension the
-    wide axis required by SWAN's row-wise GradNorm and GradWhitening update.
+    SWAN is restricted to the Euclidean ``xyz`` and RGB ``features_dc`` groups.
+    The opacity, exponential scaling, quaternion rotation, and higher-order SH
+    groups retain the established element-wise normalized-SGD update.
     """
 
     COMPONENT_SPECS = (
@@ -23,6 +23,8 @@ class GPUStatelessSWAN:
     )
     NEWTON_SCHULZ_STEPS = 10
     NEWTON_SCHULZ_BETA = 0.8
+    UPDATE_ABS_CAP = 1.0
+    SWAN_COMPONENTS = frozenset(('xyz', 'features_dc'))
 
     def __init__(self, batch_size: int = 1, device: str = 'cuda'):
         self.batch_size = int(batch_size)
@@ -42,6 +44,8 @@ class GPUStatelessSWAN:
             'optimizer_rows_touched_total': 0,
             'swan_whitened_components_total': 0,
             'swan_gradnorm_fallback_components_total': 0,
+            'normalized_sgd_components_total': 0,
+            'swan_update_abs_cap': self.UPDATE_ABS_CAP,
         }
 
     def _normalize_columns_lr(self, columns_lr) -> Dict[str, float]:
@@ -183,6 +187,7 @@ class GPUStatelessSWAN:
         touched_rows = int(local_ids.numel())
         whitened_components = 0
         gradnorm_fallback_components = 0
+        normalized_sgd_components = 0
         diagnostic_components = []
         with torch.no_grad():
             for name, _, _ in self.COMPONENT_SPECS:
@@ -202,15 +207,28 @@ class GPUStatelessSWAN:
 
                 # Keep this division before all normalization, exactly once.
                 mean_grads = grads.to(dtype=torch.float32) / float(self.batch_size)
-                update, used_gradnorm_fallback = self._swan_direction(
-                    mean_grads,
-                    eps,
-                    context=f'iteration={iteration} component={name}',
-                )
-                if used_gradnorm_fallback:
-                    gradnorm_fallback_components += 1
+                if name in self.SWAN_COMPONENTS:
+                    raw_update, used_gradnorm_fallback = self._swan_direction(
+                        mean_grads,
+                        eps,
+                        context=f'iteration={iteration} component={name}',
+                    )
+                    # Preserve the prior normalized-SGD direction bound before
+                    # applying the existing component learning rates.
+                    update = raw_update.clamp(
+                        min=-self.UPDATE_ABS_CAP,
+                        max=self.UPDATE_ABS_CAP,
+                    )
+                    component_mode = 'bounded_swan'
+                    if used_gradnorm_fallback:
+                        gradnorm_fallback_components += 1
+                    else:
+                        whitened_components += 1
                 else:
-                    whitened_components += 1
+                    raw_update = mean_grads / (mean_grads.abs() + eps)
+                    update = raw_update
+                    component_mode = 'normalized_sgd'
+                    normalized_sgd_components += 1
                 param = param_views[name]
                 param.data.index_add_(
                     0,
@@ -228,7 +246,16 @@ class GPUStatelessSWAN:
                     if self.log_update_stats:
                         diagnostic_components.append({
                             'name': name,
-                            'update_abs_max': float(update.abs().amax()),
+                            'mode': component_mode,
+                            'pre_bound_update_abs_max': float(
+                                raw_update.abs().amax()
+                            ),
+                            'applied_update_abs_max': float(update.abs().amax()),
+                            'clipped_value_fraction': float(
+                                (raw_update.abs() > self.UPDATE_ABS_CAP).float().mean()
+                                if component_mode == 'bounded_swan'
+                                else 0.0
+                            ),
                             'parameter_abs_max': float(
                                 updated_parameters.abs().amax()
                             ),
@@ -238,11 +265,13 @@ class GPUStatelessSWAN:
         self._stats['optimizer_rows_touched_total'] += touched_rows
         self._stats['swan_whitened_components_total'] += whitened_components
         self._stats['swan_gradnorm_fallback_components_total'] += gradnorm_fallback_components
+        self._stats['normalized_sgd_components_total'] += normalized_sgd_components
         step_stats = {
             'touched_rows': touched_rows,
             'state_bytes': 0,
             'swan_whitened_components': whitened_components,
             'swan_gradnorm_fallback_components': gradnorm_fallback_components,
+            'normalized_sgd_components': normalized_sgd_components,
         }
         if self.log_update_stats:
             step_stats['swan_diagnostic_components'] = diagnostic_components

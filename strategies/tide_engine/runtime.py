@@ -546,7 +546,8 @@ def initialize_paper_mode_runtime_state(
             log_file=log_file,
         )
         write_paper_phase1_log(
-            "[PAPER OPTIMIZER] update_rule=swan persistent_state_bytes=0\n",
+            "[PAPER OPTIMIZER] update_rule=hybrid_bounded_swan "
+            "swan_components=xyz,features_dc persistent_state_bytes=0\n",
             log_file=log_file,
         )
 
@@ -1585,14 +1586,20 @@ def run_gpu_stateless_optimizer_step(
             f"{step_stats['touched_rows']} rows (state_bytes=0, "
             f"whitened_components={step_stats.get('swan_whitened_components', 0)}, "
             f"gradnorm_fallback_components="
-            f"{step_stats.get('swan_gradnorm_fallback_components', 0)})\n",
+            f"{step_stats.get('swan_gradnorm_fallback_components', 0)}, "
+            f"normalized_sgd_components="
+            f"{step_stats.get('normalized_sgd_components', 0)})\n",
             log_file=log_file,
         )
         for component in step_stats.get('swan_diagnostic_components', []):
             write_paper_phase1_log(
                 f"{log_prefix} SWAN diagnostic iter={iteration} "
                 f"component={component['name']} "
-                f"update_abs_max={component['update_abs_max']:.6g} "
+                f"mode={component['mode']} "
+                f"pre_bound_update_abs_max="
+                f"{component['pre_bound_update_abs_max']:.6g} "
+                f"applied_update_abs_max={component['applied_update_abs_max']:.6g} "
+                f"clipped_value_fraction={component['clipped_value_fraction']:.6g} "
                 f"parameter_abs_max={component['parameter_abs_max']:.6g}\n",
                 log_file=log_file,
             )
