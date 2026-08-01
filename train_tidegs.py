@@ -129,7 +129,7 @@ def _validate_pure_ssd_runtime(args, gaussians, storage_adapter, resolved_backen
     message = (
         "[PURE SSD CHECK] Runtime path verified: "
         f"gaussians={total_desc} blocks={num_blocks} "
-        f"block_reader=TieredCacheBlockReader optimizer=GPUStatelessNormalizedSGD "
+        f"block_reader=TieredCacheBlockReader optimizer=GPUStatelessSWAN "
         f"state=none init={init_state} ram_cache_limit={cache_limit_gb:.2f}GB\n"
     )
     log_file.write(message)

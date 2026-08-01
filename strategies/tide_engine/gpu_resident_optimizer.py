@@ -1,10 +1,16 @@
-from typing import Any, Dict
+import math
+from typing import Any, Dict, Tuple
 
 import torch
 
 
-class GPUStatelessNormalizedSGD:
-    """Stateless normalized SGD over touched rows in the GPU working set."""
+class GPUStatelessSWAN:
+    """Stateless SWAN updates over touched rows in the GPU working set.
+
+    Gradients are batch-averaged once, then each parameter component is treated
+    as a ``width x touched_rows`` matrix.  This makes the Gaussian dimension the
+    wide axis required by SWAN's row-wise GradNorm and GradWhitening update.
+    """
 
     COMPONENT_SPECS = (
         ('xyz', '_xyz', 0),
@@ -14,6 +20,8 @@ class GPUStatelessNormalizedSGD:
         ('features_dc', '_features_dc', 4),
         ('features_rest', '_features_rest', 5),
     )
+    NEWTON_SCHULZ_STEPS = 10
+    NEWTON_SCHULZ_BETA = 0.8
 
     def __init__(self, batch_size: int = 1, device: str = 'cuda'):
         self.batch_size = int(batch_size)
@@ -25,13 +33,13 @@ class GPUStatelessNormalizedSGD:
             'state_mode': 'none',
             'persistent_state_bytes': 0,
             'optimizer_rows_touched_total': 0,
+            'swan_whitened_components_total': 0,
+            'swan_gradnorm_fallback_components_total': 0,
         }
 
     def _normalize_columns_lr(self, columns_lr) -> Dict[str, float]:
         if columns_lr is None:
-            raise RuntimeError(
-                '[GPUStatelessNormalizedSGD] optimizer.columns_lr is required'
-            )
+            raise RuntimeError('[GPUStatelessSWAN] optimizer.columns_lr is required')
         if torch.is_tensor(columns_lr):
             cols = columns_lr.detach()
             if cols.device.type != 'cpu':
@@ -53,13 +61,82 @@ class GPUStatelessNormalizedSGD:
             ], dtype=torch.float32)
         else:
             raise RuntimeError(
-                '[GPUStatelessNormalizedSGD] Unexpected columns_lr '
+                '[GPUStatelessSWAN] Unexpected columns_lr '
                 f'width={cols.numel()}; expected 6 grouped or 59 expanded entries'
             )
         return {
             name: float(grouped[group_idx].item())
             for name, _, group_idx in self.COMPONENT_SPECS
         }
+
+    @staticmethod
+    def _require_finite(tensor: torch.Tensor, context: str) -> None:
+        finite = torch.isfinite(tensor).all()
+        message = f'[GPUStatelessSWAN] Non-finite {context}'
+        if tensor.is_cuda:
+            # Keep the Paper SSD optimizer stream asynchronous. The following
+            # stage-level CUDA synchronize surfaces this assertion if it fails.
+            torch._assert_async(finite, message)
+        elif not bool(finite):
+            raise FloatingPointError(message)
+
+    @staticmethod
+    def _gradnorm(
+        gradient_matrix: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        row_rms = gradient_matrix.square().mean(dim=1, keepdim=True).sqrt()
+        return gradient_matrix / row_rms.clamp_min(eps)
+
+    def _swan_direction(
+        self,
+        mean_grads: torch.Tensor,
+        eps: float,
+    ) -> Tuple[torch.Tensor, bool]:
+        """Return a full-SWAN direction and whether GradNorm fallback was used."""
+        if mean_grads.ndim != 2:
+            raise ValueError(
+                '[GPUStatelessSWAN] Expected a two-dimensional component gradient, '
+                f'got shape={tuple(mean_grads.shape)}'
+            )
+        self._require_finite(mean_grads, 'component gradient')
+
+        touched_rows, width = mean_grads.shape
+        if touched_rows == 0:
+            return mean_grads, False
+
+        # G has one row per parameter component and one column per Gaussian,
+        # matching the m <= n layout used by SWAN.
+        gradient_matrix = mean_grads.transpose(0, 1).to(dtype=torch.float32)
+        normalized = self._gradnorm(gradient_matrix, eps)
+
+        # Whitening is rank-limited when fewer Gaussian rows than component
+        # dimensions are touched. GradNorm remains stateless and well-defined.
+        if touched_rows < width:
+            return normalized.transpose(0, 1), True
+
+        # SWAN-0 (Appendix K) normalizes before the naive Newton-Schulz
+        # inverse-square-root iteration, then runs the iteration in FP32.
+        input_matrix = normalized / normalized.norm().clamp_min(eps)
+        identity = torch.eye(
+            width,
+            dtype=input_matrix.dtype,
+            device=input_matrix.device,
+        )
+        y = input_matrix @ input_matrix.transpose(0, 1)
+        z = identity
+        beta = self.NEWTON_SCHULZ_BETA
+        for _ in range(self.NEWTON_SCHULZ_STEPS):
+            transform = beta * (3.0 * identity - z @ y)
+            y, z = y @ transform, transform @ z
+
+        whitened = z @ input_matrix
+        self._require_finite(whitened, 'Newton-Schulz whitening result')
+        # SWAN rescales the whitened matrix to the GradNorm target norm sqrt(mn).
+        target_norm = math.sqrt(float(width * touched_rows))
+        whitened = whitened * (target_norm / whitened.norm().clamp_min(eps))
+        self._require_finite(whitened, 'rescaled SWAN direction')
+        return whitened.transpose(0, 1), False
 
     def step(
         self,
@@ -90,28 +167,48 @@ class GPUStatelessNormalizedSGD:
             raise ValueError(f'eps must be positive, got {eps}')
 
         touched_rows = int(local_ids.numel())
+        whitened_components = 0
+        gradnorm_fallback_components = 0
         with torch.no_grad():
             for name, _, _ in self.COMPONENT_SPECS:
                 if name not in sparse_grad_components:
                     raise KeyError(
-                        '[GPUStatelessNormalizedSGD] Missing '
+                        '[GPUStatelessSWAN] Missing '
                         f'sparse_grad_components[{name!r}] at iter={iteration}'
                     )
                 grads = sparse_grad_components[name]
+                if grads.shape[0] != touched_rows:
+                    raise ValueError(
+                        '[GPUStatelessSWAN] Gradient/local-id row mismatch for '
+                        f'{name}: gradients={grads.shape[0]} local_ids={touched_rows}'
+                    )
                 if grads.device != self.device:
                     grads = grads.to(self.device)
 
-                mean_grads = grads / float(self.batch_size)
-                normalized_update = mean_grads / (mean_grads.abs() + eps)
-                param_views[name].data.index_add_(
+                # Keep this division before all normalization, exactly once.
+                mean_grads = grads.to(dtype=torch.float32) / float(self.batch_size)
+                update, used_gradnorm_fallback = self._swan_direction(mean_grads, eps)
+                if used_gradnorm_fallback:
+                    gradnorm_fallback_components += 1
+                else:
+                    whitened_components += 1
+                param = param_views[name]
+                param.data.index_add_(
                     0,
                     local_ids,
-                    normalized_update,
+                    update.to(dtype=param.dtype),
                     alpha=-component_lrs[name],
                 )
 
         self._stats['optimizer_rows_touched_total'] += touched_rows
-        return {'touched_rows': touched_rows, 'state_bytes': 0}
+        self._stats['swan_whitened_components_total'] += whitened_components
+        self._stats['swan_gradnorm_fallback_components_total'] += gradnorm_fallback_components
+        return {
+            'touched_rows': touched_rows,
+            'state_bytes': 0,
+            'swan_whitened_components': whitened_components,
+            'swan_gradnorm_fallback_components': gradnorm_fallback_components,
+        }
 
     def get_stats(self) -> Dict[str, Any]:
         return dict(self._stats)

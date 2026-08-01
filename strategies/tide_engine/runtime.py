@@ -546,7 +546,7 @@ def initialize_paper_mode_runtime_state(
             log_file=log_file,
         )
         write_paper_phase1_log(
-            "[PAPER OPTIMIZER] update_rule=normalized_sgd persistent_state_bytes=0\n",
+            "[PAPER OPTIMIZER] update_rule=swan persistent_state_bytes=0\n",
             log_file=log_file,
         )
 
@@ -1556,7 +1556,7 @@ def run_gpu_stateless_optimizer_step(
     log_file=None,
 ) -> Dict[str, Any]:
     write_paper_phase1_log(
-        f"{log_prefix} Using GPU stateless normalized SGD for optimization\n",
+        f"{log_prefix} Using GPU stateless SWAN for optimization\n",
         log_file=log_file,
     )
     if args.stop_update_param:
@@ -1564,7 +1564,7 @@ def run_gpu_stateless_optimizer_step(
         gaussians._paper_last_gpu_optimizer_step = dict(step_stats)
         return step_stats
 
-    torch.cuda.nvtx.range_push("Paper SSD: GPU Stateless Normalized SGD")
+    torch.cuda.nvtx.range_push("Paper SSD: GPU Stateless SWAN")
     try:
         gpu_optimizer = get_gpu_stateless_optimizer_fn(gaussians, args.bsz)
         step_stats = gpu_optimizer.step(
@@ -1575,8 +1575,11 @@ def run_gpu_stateless_optimizer_step(
         )
         gaussians._paper_last_gpu_optimizer_step = dict(step_stats)
         write_paper_phase1_log(
-            f"{log_prefix} GPU stateless normalized SGD updated "
-            f"{step_stats['touched_rows']} rows (state_bytes=0)\n",
+            f"{log_prefix} GPU stateless SWAN updated "
+            f"{step_stats['touched_rows']} rows (state_bytes=0, "
+            f"whitened_components={step_stats.get('swan_whitened_components', 0)}, "
+            f"gradnorm_fallback_components="
+            f"{step_stats.get('swan_gradnorm_fallback_components', 0)})\n",
             log_file=log_file,
         )
         return dict(step_stats)

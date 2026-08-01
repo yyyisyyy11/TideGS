@@ -8,7 +8,7 @@ import torch.nn as nn
 import gc
 from typing import Optional, List, Dict, Tuple
 
-from strategies.tide_engine.gpu_resident_optimizer import GPUStatelessNormalizedSGD
+from strategies.tide_engine.gpu_resident_optimizer import GPUStatelessSWAN
 from utils.optimizer_metrics import write_optimizer_timing_metrics
 
 def get_gpu_stateless_optimizer(gaussians, batch_size):
@@ -18,7 +18,7 @@ def get_gpu_stateless_optimizer(gaussians, batch_size):
         or getattr(current_optimizer, 'batch_size', None) != batch_size
     )
     if needs_recreate:
-        gaussians._paper_gpu_stateless_optimizer = GPUStatelessNormalizedSGD(
+        gaussians._paper_gpu_stateless_optimizer = GPUStatelessSWAN(
             batch_size=batch_size,
             device='cuda',
         )
@@ -3232,7 +3232,7 @@ def clm_offload_train_one_batch(
             model_path=getattr(args, 'model_path', ''),
             iteration=iteration,
             batch_size=bsz,
-            update_rule='normalized_sgd',
+            update_rule='swan',
             updates_enabled=not args.stop_update_param,
             omega_wait_ms=optimizer_omega_wait_ms,
             optimizer_submit_ms=optimizer_submit_ms,
@@ -3244,7 +3244,7 @@ def clm_offload_train_one_batch(
         )
         if _perf_log:
             log_file.write(
-                f"[OPTIMIZER TIMING] Iter {iteration}: rule=normalized_sgd "
+                f"[OPTIMIZER TIMING] Iter {iteration}: rule=swan "
                 f"omega_wait={optimizer_omega_wait_ms:.3f}ms "
                 f"submit={optimizer_submit_ms:.3f}ms "
                 f"cuda={optimizer_cuda_ms:.3f}ms "
