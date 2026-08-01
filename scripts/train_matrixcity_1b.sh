@@ -9,7 +9,8 @@ TRAIN_ENTRY="${REPO_ROOT}/train_tidegs.py"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 GPU="${GPU:-7}"
 GPUS="${GPUS:-${GPU}}"
-ROOT="${ROOT:-${REPO_ROOT}/outputs/tidegs}"
+DEFAULT_ROOT="$(cd "${REPO_ROOT}/.." && pwd)/TideGS-runs"
+ROOT="${ROOT:-${DEFAULT_ROOT}}"
 SRC="${SRC:-${MATRIXCITY_SCENE_DIR:-}}"
 PLY="${PLY:-${TIDEGS_DENSE_PLY:-}}"
 MANIFEST="${MANIFEST:-${TIDEGS_PREBUILT_MANIFEST:-}}"
@@ -80,7 +81,7 @@ Options:
   --camera-microbatch N       Cameras per rank per gsplat call (default: ${CAMERA_MICROBATCH})
   --owner-balance-samples N   Legacy option; stable owner assignment ignores it
   --run-tag TAG               Experiment tag (default: timestamped)
-  --root DIR                  Large output root (default: ${ROOT})
+  --root DIR                  Large output root (default: ${ROOT}); if DIR is the code repo, use sibling TideGS-runs
   --src DIR                   MatrixCity source dir
   --ply PATH                  1B PLY path
   --manifest PATH             Prebuilt streaming_init_manifest.json
@@ -242,6 +243,21 @@ case "${CAMERA_ASSIGNMENT}" in
   equal|gaussian_balanced) ;;
   *) echo "Invalid --camera-assignment '${CAMERA_ASSIGNMENT}'" >&2; usage >&2; exit 1 ;;
 esac
+
+if [[ -f "${ROOT}/train_tidegs.py" && -d "${ROOT}/scripts" ]]; then
+  CODE_ROOT="${ROOT}"
+  ROOT="$(cd "${CODE_ROOT}/.." && pwd)/TideGS-runs"
+  if [[ "${OUT_ROOT}" == "${CODE_ROOT}/output/runs" ]]; then
+    OUT_ROOT="${ROOT}/output/runs"
+  fi
+  if [[ "${CACHE_ROOT}" == "${CODE_ROOT}/ssd_cache" ]]; then
+    CACHE_ROOT="${ROOT}/ssd_cache"
+  fi
+  if [[ "${SCHED_CACHE_USER_SET}" != "1" && "${SCHED_CACHE}" == "${CODE_ROOT}/schedule_cache/oneb_bigcity" ]]; then
+    SCHED_CACHE="${ROOT}/schedule_cache/oneb_bigcity"
+  fi
+  echo "[TideGS] --root points to the code repo; using large-output root: ${ROOT}" >&2
+fi
 
 IFS=',' read -r -a GPU_IDS <<< "${GPUS}"
 GPU_COUNT="${#GPU_IDS[@]}"
