@@ -1567,6 +1567,12 @@ def run_gpu_stateless_optimizer_step(
     torch.cuda.nvtx.range_push("Paper SSD: GPU Stateless SWAN")
     try:
         gpu_optimizer = get_gpu_stateless_optimizer_fn(gaussians, args.bsz)
+        if getattr(gpu_optimizer, 'validate_finite', False) and iteration == 1:
+            write_paper_phase1_log(
+                f"{log_prefix} TIDEGS_SWAN_VALIDATE_FINITE=1; "
+                "synchronous finite diagnostics are enabled.\n",
+                log_file=log_file,
+            )
         step_stats = gpu_optimizer.step(
             iteration=iteration,
             gaussians=gaussians,

@@ -162,7 +162,7 @@ class StatelessSWANOptimizerTest(unittest.TestCase):
 
     def test_rejects_nonfinite_gradients(self):
         optimizer = GPUStatelessSWAN(batch_size=1, device='cpu')
-        with self.assertRaisesRegex(FloatingPointError, 'Non-finite component gradient'):
+        with self.assertRaisesRegex(FloatingPointError, 'Non-finite raw gradient'):
             optimizer._swan_direction(torch.tensor([[float('nan')]]), eps=1e-6)
 
     def test_all_zero_component_gradient_stays_zero(self):

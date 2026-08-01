@@ -1,4 +1,5 @@
 import math
+import os
 from typing import Any, Dict, Tuple
 
 import torch
@@ -29,6 +30,9 @@ class GPUStatelessSWAN:
             raise ValueError(f'batch_size must be positive, got {self.batch_size}')
         self.device = torch.device(device)
         self.state_mode = 'none'
+        self.validate_finite = os.environ.get(
+            'TIDEGS_SWAN_VALIDATE_FINITE', '0'
+        ) == '1'
         self._stats = {
             'state_mode': 'none',
             'persistent_state_bytes': 0,
@@ -69,11 +73,15 @@ class GPUStatelessSWAN:
             for name, _, group_idx in self.COMPONENT_SPECS
         }
 
-    @staticmethod
-    def _require_finite(tensor: torch.Tensor, context: str) -> None:
+    def _require_finite(self, tensor: torch.Tensor, context: str) -> None:
         finite = torch.isfinite(tensor).all()
         message = f'[GPUStatelessSWAN] Non-finite {context}'
-        if tensor.is_cuda:
+        if self.validate_finite:
+            # Diagnostics only: reading this CUDA scalar synchronizes so the
+            # raised Python error identifies the exact component and stage.
+            if not bool(finite):
+                raise FloatingPointError(message)
+        elif tensor.is_cuda:
             # Keep the Paper SSD optimizer stream asynchronous. The following
             # stage-level CUDA synchronize surfaces this assertion if it fails.
             torch._assert_async(finite, message)
@@ -92,6 +100,7 @@ class GPUStatelessSWAN:
         self,
         mean_grads: torch.Tensor,
         eps: float,
+        context: str = '',
     ) -> Tuple[torch.Tensor, bool]:
         """Return a full-SWAN direction and whether GradNorm fallback was used."""
         if mean_grads.ndim != 2:
@@ -99,7 +108,8 @@ class GPUStatelessSWAN:
                 '[GPUStatelessSWAN] Expected a two-dimensional component gradient, '
                 f'got shape={tuple(mean_grads.shape)}'
             )
-        self._require_finite(mean_grads, 'component gradient')
+        prefix = f'{context} ' if context else ''
+        self._require_finite(mean_grads, f'{prefix}raw gradient')
 
         touched_rows, width = mean_grads.shape
         if touched_rows == 0:
@@ -109,6 +119,7 @@ class GPUStatelessSWAN:
         # matching the m <= n layout used by SWAN.
         gradient_matrix = mean_grads.transpose(0, 1).to(dtype=torch.float32)
         normalized = self._gradnorm(gradient_matrix, eps)
+        self._require_finite(normalized, f'{prefix}GradNorm output')
 
         # Whitening is rank-limited when fewer Gaussian rows than component
         # dimensions are touched. GradNorm remains stateless and well-defined.
@@ -131,11 +142,11 @@ class GPUStatelessSWAN:
             y, z = y @ transform, transform @ z
 
         whitened = z @ input_matrix
-        self._require_finite(whitened, 'Newton-Schulz whitening result')
+        self._require_finite(whitened, f'{prefix}Newton-Schulz output')
         # SWAN rescales the whitened matrix to the GradNorm target norm sqrt(mn).
         target_norm = math.sqrt(float(width * touched_rows))
         whitened = whitened * (target_norm / whitened.norm().clamp_min(eps))
-        self._require_finite(whitened, 'rescaled SWAN direction')
+        self._require_finite(whitened, f'{prefix}rescaled SWAN update')
         return whitened.transpose(0, 1), False
 
     def step(
@@ -187,7 +198,11 @@ class GPUStatelessSWAN:
 
                 # Keep this division before all normalization, exactly once.
                 mean_grads = grads.to(dtype=torch.float32) / float(self.batch_size)
-                update, used_gradnorm_fallback = self._swan_direction(mean_grads, eps)
+                update, used_gradnorm_fallback = self._swan_direction(
+                    mean_grads,
+                    eps,
+                    context=f'iteration={iteration} component={name}',
+                )
                 if used_gradnorm_fallback:
                     gradnorm_fallback_components += 1
                 else:
