@@ -105,6 +105,7 @@ class StatelessSWANOptimizerTest(unittest.TestCase):
             },
         )
         self.assertFalse(hasattr(optimizer, 'state'))
+        self.assertFalse(optimizer.log_update_stats)
         optimizer_stats = optimizer.get_stats()
         self.assertEqual(optimizer_stats['persistent_state_bytes'], 0)
         self.assertEqual(optimizer_stats['optimizer_rows_touched_total'], touched_rows)

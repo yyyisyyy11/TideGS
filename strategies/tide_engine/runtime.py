@@ -1588,6 +1588,14 @@ def run_gpu_stateless_optimizer_step(
             f"{step_stats.get('swan_gradnorm_fallback_components', 0)})\n",
             log_file=log_file,
         )
+        for component in step_stats.get('swan_diagnostic_components', []):
+            write_paper_phase1_log(
+                f"{log_prefix} SWAN diagnostic iter={iteration} "
+                f"component={component['name']} "
+                f"update_abs_max={component['update_abs_max']:.6g} "
+                f"parameter_abs_max={component['parameter_abs_max']:.6g}\n",
+                log_file=log_file,
+            )
         return dict(step_stats)
     finally:
         torch.cuda.nvtx.range_pop()

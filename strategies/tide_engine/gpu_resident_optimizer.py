@@ -33,6 +33,9 @@ class GPUStatelessSWAN:
         self.validate_finite = os.environ.get(
             'TIDEGS_SWAN_VALIDATE_FINITE', '0'
         ) == '1'
+        self.log_update_stats = os.environ.get(
+            'TIDEGS_SWAN_LOG_UPDATE_STATS', '0'
+        ) == '1'
         self._stats = {
             'state_mode': 'none',
             'persistent_state_bytes': 0,
@@ -180,6 +183,7 @@ class GPUStatelessSWAN:
         touched_rows = int(local_ids.numel())
         whitened_components = 0
         gradnorm_fallback_components = 0
+        diagnostic_components = []
         with torch.no_grad():
             for name, _, _ in self.COMPONENT_SPECS:
                 if name not in sparse_grad_components:
@@ -214,16 +218,35 @@ class GPUStatelessSWAN:
                     update.to(dtype=param.dtype),
                     alpha=-component_lrs[name],
                 )
+                if self.validate_finite or self.log_update_stats:
+                    updated_parameters = param.data.index_select(0, local_ids)
+                    self._require_finite(
+                        updated_parameters,
+                        f'iteration={iteration} component={name} '
+                        'post-update parameter',
+                    )
+                    if self.log_update_stats:
+                        diagnostic_components.append({
+                            'name': name,
+                            'update_abs_max': float(update.abs().amax()),
+                            'parameter_abs_max': float(
+                                updated_parameters.abs().amax()
+                            ),
+                        })
+                    del updated_parameters
 
         self._stats['optimizer_rows_touched_total'] += touched_rows
         self._stats['swan_whitened_components_total'] += whitened_components
         self._stats['swan_gradnorm_fallback_components_total'] += gradnorm_fallback_components
-        return {
+        step_stats = {
             'touched_rows': touched_rows,
             'state_bytes': 0,
             'swan_whitened_components': whitened_components,
             'swan_gradnorm_fallback_components': gradnorm_fallback_components,
         }
+        if self.log_update_stats:
+            step_stats['swan_diagnostic_components'] = diagnostic_components
+        return step_stats
 
     def get_stats(self) -> Dict[str, Any]:
         return dict(self._stats)
