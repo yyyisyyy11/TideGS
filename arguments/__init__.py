@@ -191,7 +191,7 @@ class AuxiliaryParams(ParamGroup):
         self.max_ram_gb = 32.0
         self.num_clusters = 64
         self.visualize_ssd_schedule = False  # Generate TSP schedule visualization
-        self.ssd_schedule_ordering = "trajectory"  # {trajectory, shuffle}
+        self.ssd_schedule_ordering = "trajectory"  # {trajectory, shuffle, microbatch_shuffle}
         self.tide_storage_max_patch_files = 32  # Legacy idle-compaction high watermark
         self.tide_storage_max_patch_gb = 64.0  # Compact after this much stale delta data accumulates
         self.tide_storage_min_free_gb = 64.0  # Refuse writes that consume this reserve

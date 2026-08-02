@@ -86,7 +86,7 @@ Options:
   --ply PATH                  1B PLY path
   --manifest PATH             Prebuilt streaming_init_manifest.json
   --schedule-cache DIR        Camera schedule cache dir
-  --schedule-ordering MODE    trajectory|shuffle (default: ${SCHEDULE_ORDERING})
+  --schedule-ordering MODE    trajectory|shuffle|microbatch_shuffle (default: ${SCHEDULE_ORDERING})
   --decode-dataset-path DIR   Optional decoded raw image cache dir
   --iterations N              Iterations for sweep mode (default: ${ITERATIONS})
   --debug-max-train-cameras N Camera cap; -1 uses all training cameras (default: ${DEBUG_MAX_TRAIN_CAMERAS})
@@ -232,7 +232,7 @@ case "${DEBUG_CAMERA_SAMPLE_MODE}" in
   *) echo "Invalid --debug-camera-sample-mode '${DEBUG_CAMERA_SAMPLE_MODE}'" >&2; usage >&2; exit 1 ;;
 esac
 case "${SCHEDULE_ORDERING}" in
-  trajectory|shuffle) ;;
+  trajectory|shuffle|microbatch_shuffle) ;;
   *) echo "Invalid --schedule-ordering '${SCHEDULE_ORDERING}'" >&2; usage >&2; exit 1 ;;
 esac
 case "${DISTRIBUTED_MODE}" in
