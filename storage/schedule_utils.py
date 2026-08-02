@@ -53,6 +53,18 @@ def get_camera_batch_schedule(
         epoch_schedule = rng.permutation(np.asarray(training_schedule, dtype=np.int64)).tolist()
         batch_start_cam = within_epoch_idx * batch_size
         batch_indices = _circular_slice(epoch_schedule, batch_start_cam, batch_size)
+    elif schedule_ordering == "microbatch_shuffle":
+        epoch_camera_offset = 0
+        # Build micro-batches from canonical TSP schedule; tail batch wraps via _circular_slice.
+        batches = [
+            _circular_slice(training_schedule, b * batch_size, batch_size)
+            for b in range(num_batches)
+        ]
+        # Deterministically shuffle batch execution order per epoch.
+        batch_order = rng.permutation(num_batches).tolist()
+        selected_batch_idx = int(batch_order[within_epoch_idx])
+        batch_indices = batches[selected_batch_idx]
+        batch_start_cam = selected_batch_idx * batch_size
     else:
         if epoch == 0:
             epoch_camera_offset = 0
