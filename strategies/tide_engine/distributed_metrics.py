@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import csv
+import json
+import os
+import socket
+import threading
 from pathlib import Path
 from typing import Dict, Iterable, List
 
@@ -228,6 +232,9 @@ class DistributedMetricsWriter:
         self.enabled = bool(getattr(args, "tide_detailed_metrics", False))
         self.rank_path = Path(args.log_folder) / f"metrics_batch_rank{context.rank}.tsv"
         self.io_path = Path(args.log_folder) / f"metrics_io_rank{context.rank}.tsv"
+        self.timeline_path = (
+            Path(args.log_folder) / f"timeline_events_rank{context.rank}.jsonl"
+        )
         self.global_path = Path(args.log_folder) / "metrics_batch_global.tsv"
         self.async_rank_path = (
             Path(args.log_folder)
@@ -245,6 +252,63 @@ class DistributedMetricsWriter:
         )
         self._async_by_iteration: Dict[int, Dict[str, float]] = {}
         self._async_finalized = False
+        self._timeline_lock = threading.Lock()
+        self._timeline_host = socket.gethostname()
+        self._timeline_pid = os.getpid()
+
+    def write_timeline_event(
+        self,
+        *,
+        name: str,
+        lane: str,
+        start_ns: int,
+        end_ns: int | None = None,
+        iteration: int | None = None,
+        target_iteration: int | None = None,
+        timing_source: str = "host_monotonic",
+        **fields,
+    ) -> None:
+        """Append one interval to this rank's JSONL timeline.
+
+        Background I/O is drained in batches, so JSONL append order is not a
+        temporal guarantee; consumers must sort events by ``start_ns``.
+
+        ``host_monotonic`` events use ``time.perf_counter_ns()`` from the
+        shared host clock.  GPU events deliberately use
+        ``host_submit_plus_cuda_event`` instead: their location is an
+        approximate host submission point while their duration comes from a
+        CUDA event.
+        """
+        if not self.enabled:
+            return
+        start_ns = int(start_ns)
+        end_ns = start_ns if end_ns is None else int(end_ns)
+        if end_ns < start_ns:
+            raise ValueError(
+                f"Timeline event {name!r} ends before it starts: "
+                f"{end_ns} < {start_ns}"
+            )
+        event = {
+            "clock": "perf_counter_ns",
+            "host": self._timeline_host,
+            "pid": self._timeline_pid,
+            "rank": int(self.context.rank),
+            "name": str(name),
+            "lane": str(lane),
+            "start_ns": start_ns,
+            "end_ns": end_ns,
+            "duration_ns": end_ns - start_ns,
+            "iteration": None if iteration is None else int(iteration),
+            "target_iteration": (
+                None if target_iteration is None else int(target_iteration)
+            ),
+            "timing_source": str(timing_source),
+            **fields,
+        }
+        with self._timeline_lock:
+            self.timeline_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.timeline_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, sort_keys=True) + "\n")
 
     def write_io_events(self, events: Iterable[Dict[str, object]]) -> None:
         if not self.enabled:
@@ -255,6 +319,28 @@ class DistributedMetricsWriter:
             row = dict(event)
             row["rank"] = self.context.rank
             _append_tsv(self.io_path, IO_FIELDS, row)
+            start_ns = row.get("start_ns")
+            if start_ns is not None:
+                self.write_timeline_event(
+                    name=str(row.get("operation", "io")),
+                    lane=str(row.get("lane", row.get("tier", "io"))),
+                    start_ns=int(start_ns),
+                    end_ns=(
+                        None
+                        if row.get("end_ns") is None
+                        else int(row["end_ns"])
+                    ),
+                    iteration=row.get("origin_iteration"),
+                    target_iteration=row.get("target_iteration"),
+                    timing_source=str(
+                        row.get("timing_source", "host_monotonic")
+                    ),
+                    thread_id=row.get("thread_id"),
+                    blocks=row.get("blocks"),
+                    bytes=row.get("bytes"),
+                    tier=row.get("tier"),
+                    status=row.get("status"),
+                )
             operation = str(row.get("operation", ""))
             field_spec = ASYNC_OPERATION_FIELDS.get(operation)
             if field_spec is None:

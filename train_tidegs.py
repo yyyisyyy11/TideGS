@@ -713,6 +713,17 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     gaussians._paper_optimizer_backend = 'gpu_resident'
     _enable_optimizer_churn_logging("pure_ssd_gpu_resident")
     camera_batch_prefetcher = CameraBatchPrefetcher(train_dataset)
+    timeline_writer = (
+        get_distributed_metrics_writer(gaussians, distributed_context)
+        if distributed_enabled and args.tide_detailed_metrics
+        else None
+    )
+    if timeline_writer is not None:
+        set_timeline_enabled = getattr(
+            storage_adapter.cache, "set_timeline_enabled", None
+        )
+        if callable(set_timeline_enabled):
+            set_timeline_enabled(True)
     current_distributed_plan = None
     if distributed_enabled:
         current_distributed_plan, _ = _build_distributed_plan(
@@ -860,6 +871,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         next_distributed_rank0_preview = None
         if distributed_enabled and next_iteration <= opt_args.iterations:
             nvtx.range_push("Outer: distributed_predictive_prefetch")
+            preview_start_ns = time.perf_counter_ns()
             (
                 next_distributed_prediction,
                 _,
@@ -875,6 +887,16 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     args, "ssd_schedule_ordering", "trajectory"
                 ),
             )
+            preview_end_ns = time.perf_counter_ns()
+            if timeline_writer is not None:
+                timeline_writer.write_timeline_event(
+                    name="preview_plan",
+                    lane="cpu",
+                    start_ns=preview_start_ns,
+                    end_ns=preview_end_ns,
+                    iteration=iteration,
+                    target_iteration=next_iteration,
+                )
             rank = distributed_context.rank
             current_resident = set(
                 current_distributed_plan.rank_resident_blocks[rank]
@@ -1065,6 +1087,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     raise RuntimeError(
                         f"Missing distributed prediction for iteration {next_iteration}"
                     )
+                finalize_start_ns = time.perf_counter_ns()
                 next_distributed_plan, _ = _finalize_distributed_plan(
                     context=distributed_context,
                     planner=distributed_planner,
@@ -1076,6 +1099,16 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     predicted_plan=next_distributed_prediction,
                     rank0_preview=next_distributed_rank0_preview,
                 )
+                finalize_end_ns = time.perf_counter_ns()
+                if timeline_writer is not None:
+                    timeline_writer.write_timeline_event(
+                        name="finalize_plan",
+                        lane="cpu",
+                        start_ns=finalize_start_ns,
+                        end_ns=finalize_end_ns,
+                        iteration=iteration,
+                        target_iteration=next_iteration,
+                    )
                 rank = distributed_context.rank
                 current_resident = set(
                     current_distributed_plan.rank_resident_blocks[rank]

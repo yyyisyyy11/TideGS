@@ -246,6 +246,7 @@ class TieredCacheSingleFlightTest(unittest.TestCase):
         storage = FakeStorage()
         storage.block_first_read = True
         cache = self.make_cache(storage)
+        cache.set_timeline_enabled(True)
 
         self.assertEqual(cache.prefetch_future([7]), 1)
         self.assertTrue(storage.read_started.wait(timeout=2.0))
@@ -267,9 +268,37 @@ class TieredCacheSingleFlightTest(unittest.TestCase):
         self.assertEqual(stats["future_prefetch_reserved"], 1)
         self.assertGreaterEqual(stats["inflight_wait_blocks"], 1)
         events = cache.drain_io_events()
+        service_events = [
+            event["operation"]
+            for event in events
+            if event["operation"] in {
+                "ssd_read_future",
+                "cpu_materialize_future",
+            }
+        ]
         self.assertEqual(
-            [event["operation"] for event in events[-2:]],
+            service_events,
             ["ssd_read_future", "cpu_materialize_future"],
+        )
+        timeline_events = [
+            event
+            for event in events
+            if event.get("start_ns") is not None
+        ]
+        self.assertEqual(
+            [event["operation"] for event in timeline_events],
+            [
+                "prefetch_hint_enqueue",
+                "prefetch_queue_wait",
+                "ssd_read_future",
+                "prefetch_end_to_end",
+            ],
+        )
+        self.assertTrue(
+            all(
+                int(event["end_ns"]) >= int(event["start_ns"])
+                for event in timeline_events
+            )
         )
 
     def test_future_hint_skips_block_already_claimed_by_urgent(self):

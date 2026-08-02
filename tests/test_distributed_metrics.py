@@ -1,4 +1,5 @@
 import csv
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -44,6 +45,55 @@ def _read_rows(path):
 
 
 class DistributedMetricsTest(unittest.TestCase):
+    def test_timeline_events_preserve_host_clock_intervals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = DistributedMetricsWriter(
+                args=SimpleNamespace(
+                    log_folder=directory,
+                    tide_detailed_metrics=True,
+                ),
+                context=_Context(),
+            )
+            writer.write_timeline_event(
+                name="preview_plan",
+                lane="cpu",
+                start_ns=1_000,
+                end_ns=1_025,
+                iteration=1,
+                target_iteration=5,
+            )
+            writer.write_io_events(
+                [
+                    {
+                        "operation": "ssd_read_future",
+                        "tier": "ssd",
+                        "lane": "ssd",
+                        "origin_iteration": 1,
+                        "target_iteration": 5,
+                        "blocks": 2,
+                        "bytes": 200,
+                        "service_ms": 0.02,
+                        "start_ns": 2_000,
+                        "end_ns": 2_020,
+                        "thread_id": 99,
+                    }
+                ]
+            )
+
+            with open(
+                Path(directory) / "timeline_events_rank0.jsonl",
+                encoding="utf-8",
+            ) as handle:
+                events = [json.loads(line) for line in handle]
+
+            self.assertEqual([event["name"] for event in events], [
+                "preview_plan",
+                "ssd_read_future",
+            ])
+            self.assertEqual(events[0]["duration_ns"], 25)
+            self.assertEqual(events[1]["lane"], "ssd")
+            self.assertEqual(events[1]["thread_id"], 99)
+
     def test_async_io_uses_causal_iteration_and_global_aggregation(self):
         with tempfile.TemporaryDirectory() as directory:
             writer = DistributedMetricsWriter(

@@ -114,6 +114,7 @@ class TieredCacheManager:
         # Prefetch tracking， 防止重复预取同一个block
         self.prefetch_history: Set[int] = set()
         self._foreground_iteration: Optional[int] = None
+        self.timeline_enabled = False
         self._io_events: List[Dict[str, object]] = []
         self._io_events_lock = threading.Lock()
 
@@ -171,7 +172,14 @@ class TieredCacheManager:
             None if iteration is None else int(iteration)
         )
 
+    def set_timeline_enabled(self, enabled: bool) -> None:
+        """Enable precise host-clock events for an explicit profiling run."""
+        self.timeline_enabled = bool(enabled)
+
     def _record_io_event(self, **event) -> None:
+        if self.timeline_enabled:
+            event.setdefault("thread_id", threading.get_native_id())
+            event.setdefault("timing_source", "host_monotonic")
         with self._io_events_lock:
             self._io_events.append(dict(event))
 
@@ -415,13 +423,24 @@ class TieredCacheManager:
         physical_bytes = 0
         read_elapsed = 0.0
         materialize_elapsed = 0.0
+        read_start_ns = None
+        read_end_ns = None
+        read_attempts = 0
 
         for _ in range(max_attempts):
             if not pending:
                 break
+            attempt_start_ns = (
+                time.perf_counter_ns() if self.timeline_enabled else None
+            )
             read_start = time.perf_counter()
             loaded, loaded_versions = self._read_storage_blocks(pending)
             read_elapsed += time.perf_counter() - read_start
+            read_attempts += 1
+            if attempt_start_ns is not None:
+                if read_start_ns is None:
+                    read_start_ns = attempt_start_ns
+                read_end_ns = time.perf_counter_ns()
             physical_blocks += len(loaded)
             physical_bytes += sum(
                 self._tensor_nbytes(tensor) for tensor in loaded.values()
@@ -467,6 +486,9 @@ class TieredCacheManager:
             "physical_bytes": physical_bytes,
             "read_elapsed": read_elapsed,
             "materialize_elapsed": materialize_elapsed,
+            "read_start_ns": read_start_ns,
+            "read_end_ns": read_end_ns,
+            "read_attempts": read_attempts,
         }
 
     def _storage_versions(self, block_ids: List[int]) -> Dict[int, int]:
@@ -777,7 +799,14 @@ class TieredCacheManager:
             except Empty:
                 continue
 
+            enqueue_ns = None
             if (
+                isinstance(item, tuple)
+                and len(item) == 4
+                and isinstance(item[2], (list, tuple, set))
+            ):
+                origin_iteration, target_iteration, block_ids, enqueue_ns = item
+            elif (
                 isinstance(item, tuple)
                 and len(item) == 3
                 and isinstance(item[2], (list, tuple, set))
@@ -792,6 +821,22 @@ class TieredCacheManager:
             else:
                 origin_iteration, target_iteration, block_ids = None, None, item
             block_ids = [int(block_id) for block_id in block_ids]
+            dequeue_ns = (
+                time.perf_counter_ns() if self.timeline_enabled else None
+            )
+            if enqueue_ns is not None and dequeue_ns is not None:
+                self._record_io_event(
+                    operation="prefetch_queue_wait",
+                    tier="cpu_queue",
+                    lane="cpu",
+                    origin_iteration=origin_iteration,
+                    target_iteration=target_iteration,
+                    blocks=len(block_ids),
+                    bytes=0,
+                    service_ms=(dequeue_ns - int(enqueue_ns)) / 1e6,
+                    start_ns=int(enqueue_ns),
+                    end_ns=dequeue_ns,
+                )
             loaded_count = 0
             t0 = time.time()
             try:
@@ -816,17 +861,26 @@ class TieredCacheManager:
                     self.stats['future_storage_read_blocks'] += read_blocks
                     self.stats['future_storage_read_time'] += read_elapsed
                     self.stats['ssd_bytes_read_future'] += bytes_read
-                    self._record_io_event(
-                        operation="ssd_read_future",
-                        tier="ssd",
-                        origin_iteration=origin_iteration,
-                        target_iteration=target_iteration,
-                        blocks=read_blocks,
-                        bytes=bytes_read,
-                        service_ms=read_elapsed * 1000.0,
-                    )
-                    loaded_count += int(loaded["inserted"])
-                    self.stats['future_materialize_time'] += materialize_elapsed
+                    read_event = {
+                        "operation": "ssd_read_future",
+                        "tier": "ssd",
+                        "origin_iteration": origin_iteration,
+                        "target_iteration": target_iteration,
+                        "blocks": read_blocks,
+                        "bytes": bytes_read,
+                        "service_ms": read_elapsed * 1000.0,
+                    }
+                    if (
+                        self.timeline_enabled
+                        and int(loaded["read_attempts"]) == 1
+                        and loaded["read_start_ns"] is not None
+                    ):
+                        read_event.update(
+                            lane="ssd",
+                            start_ns=int(loaded["read_start_ns"]),
+                            end_ns=int(loaded["read_end_ns"]),
+                        )
+                    self._record_io_event(**read_event)
                     self._record_io_event(
                         operation="cpu_materialize_future",
                         tier="cpu_cache",
@@ -839,6 +893,26 @@ class TieredCacheManager:
                         ),
                         service_ms=materialize_elapsed * 1000.0,
                     )
+                    loaded_count += int(loaded["inserted"])
+                    self.stats['future_materialize_time'] += materialize_elapsed
+
+                cache_ready_ns = (
+                    time.perf_counter_ns() if self.timeline_enabled else None
+                )
+                if enqueue_ns is not None and cache_ready_ns is not None:
+                    self._record_io_event(
+                        operation="prefetch_end_to_end",
+                        tier="ssd_to_ram",
+                        lane="cpu",
+                        origin_iteration=origin_iteration,
+                        target_iteration=target_iteration,
+                        blocks=len(block_ids),
+                        bytes=0,
+                        service_ms=(cache_ready_ns - int(enqueue_ns)) / 1e6,
+                        start_ns=int(enqueue_ns),
+                        end_ns=cache_ready_ns,
+                        status="cache_ready",
+                    )
 
                 elapsed = time.time() - t0
                 self.stats['future_prefetch_jobs'] += 1
@@ -848,6 +922,23 @@ class TieredCacheManager:
                     self.stats['prefetches'] += int(loaded_count)
                 self._maybe_evict()
             except Exception as e:
+                failed_ns = (
+                    time.perf_counter_ns() if self.timeline_enabled else None
+                )
+                if enqueue_ns is not None and failed_ns is not None:
+                    self._record_io_event(
+                        operation="prefetch_end_to_end",
+                        tier="ssd_to_ram",
+                        lane="cpu",
+                        origin_iteration=origin_iteration,
+                        target_iteration=target_iteration,
+                        blocks=len(block_ids),
+                        bytes=0,
+                        service_ms=(failed_ns - int(enqueue_ns)) / 1e6,
+                        start_ns=int(enqueue_ns),
+                        end_ns=failed_ns,
+                        status="failed",
+                    )
                 self.stats['future_prefetch_errors'] += 1
                 print(f"[TieredCache] Future prefetch worker error: {e}")
             finally:
@@ -1210,14 +1301,30 @@ class TieredCacheManager:
         if not to_prefetch:
             return 0
 
+        enqueue_ns = time.perf_counter_ns() if self.timeline_enabled else None
         try:
-            self.future_prefetch_queue.put_nowait(
-                (
+            item = (
                     self._foreground_iteration,
                     None if target_iteration is None else int(target_iteration),
                     to_prefetch,
                 )
-            )
+            if enqueue_ns is not None:
+                item += (enqueue_ns,)
+            self.future_prefetch_queue.put_nowait(item)
+            if enqueue_ns is not None:
+                self._record_io_event(
+                    operation="prefetch_hint_enqueue",
+                    tier="cpu_queue",
+                    lane="cpu",
+                    origin_iteration=self._foreground_iteration,
+                    target_iteration=target_iteration,
+                    blocks=len(to_prefetch),
+                    bytes=0,
+                    service_ms=0.0,
+                    start_ns=enqueue_ns,
+                    end_ns=enqueue_ns,
+                    status="submitted",
+                )
             self.stats['future_prefetch_submitted'] += len(to_prefetch)
             self.stats['future_prefetch_reserved'] += len(to_prefetch)
             return len(to_prefetch)
@@ -1226,6 +1333,21 @@ class TieredCacheManager:
             with self.future_lock:
                 for block_id in to_prefetch:
                     self.future_pending.discard(block_id)
+            if enqueue_ns is not None:
+                dropped_ns = time.perf_counter_ns()
+                self._record_io_event(
+                    operation="prefetch_hint_enqueue",
+                    tier="cpu_queue",
+                    lane="cpu",
+                    origin_iteration=self._foreground_iteration,
+                    target_iteration=target_iteration,
+                    blocks=len(to_prefetch),
+                    bytes=0,
+                    service_ms=(dropped_ns - enqueue_ns) / 1e6,
+                    start_ns=enqueue_ns,
+                    end_ns=dropped_ns,
+                    status="dropped_queue_full",
+                )
             self.stats['future_prefetch_dropped'] += len(to_prefetch)
             print(f"[TieredCache] Future prefetch queue full; dropped {len(to_prefetch)} blocks")
             return 0

@@ -647,6 +647,7 @@ class GPUWorkingSet:
         *,
         enable_retention: bool,
         block_reader,
+        capture_timeline: bool = False,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, object]]:
         """Materialize a distributed rank working set into stable GPU slots."""
         load_start = time.perf_counter()
@@ -747,6 +748,7 @@ class GPUWorkingSet:
                     "BlockReader returned a different persistent materialization order"
                 )
 
+        h2d_submit_ns = time.perf_counter_ns() if capture_timeline else None
         h2d_start_event = torch.cuda.Event(enable_timing=True)
         h2d_end_event = torch.cuda.Event(enable_timing=True)
         h2d_start_event.record()
@@ -877,6 +879,7 @@ class GPUWorkingSet:
                 (time.perf_counter() - load_start) * 1000.0 - foreground_read_ms,
             ),
             'h2d_events': (h2d_start_event, h2d_end_event),
+            'h2d_submit_ns': h2d_submit_ns,
             'h2d_bytes': h2d_bytes,
             'gpu_slot_capacity_blocks': self._persistent_slot_capacity,
             'gpu_slot_growth_blocks': growth_blocks,
@@ -891,6 +894,7 @@ class GPUWorkingSet:
         unified_params: 'torch.Tensor | None' = None,
         block_reader: 'Optional[object]' = None,
         allow_gpu_hotspots: bool = False,
+        capture_timeline: bool = False,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, int]]:
         """
         Load visible blocks with resident-block overlap reuse.
@@ -932,6 +936,7 @@ class GPUWorkingSet:
                 visible_block_ids,
                 enable_retention=enable_retention,
                 block_reader=block_reader,
+                capture_timeline=capture_timeline,
             )
 
         visible_set = set(int(block_id) for block_id in visible_block_ids if 0 <= int(block_id) < self.num_blocks)

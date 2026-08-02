@@ -280,6 +280,7 @@ def train_distributed_tide_batch(
     iteration = int(plan.iteration)
     batch_start = time.perf_counter()
     metrics_writer = get_distributed_metrics_writer(gaussians, context)
+    timeline_enabled = bool(metrics_writer.enabled)
     local_counts = context.all_gather_object(len(batched_cameras))
     if len(set(int(value) for value in local_counts)) != 1:
         raise RuntimeError(f"Distributed gsplat requires equal camera counts, got {local_counts}")
@@ -303,6 +304,7 @@ def train_distributed_tide_batch(
         unified_params=None,
         block_reader=gaussians._block_reader,
         allow_gpu_hotspots=True,
+        capture_timeline=timeline_enabled,
     )
     resident_load_ms = (time.perf_counter() - resident_load_start) * 1000.0
     _bind_working_set(gaussians, gpu_tensors)
@@ -339,6 +341,7 @@ def train_distributed_tide_batch(
     microbatch = int(getattr(args, "tide_camera_microbatch", len(batched_cameras)))
     losses = []
     metas = []
+    forward_submit_ns = time.perf_counter_ns() if timeline_enabled else None
     forward_start = torch.cuda.Event(enable_timing=True)
     forward_end = torch.cuda.Event(enable_timing=True)
     forward_start.record()
@@ -365,6 +368,7 @@ def train_distributed_tide_batch(
 
     if not losses:
         raise RuntimeError("Distributed TideGS produced no local losses")
+    backward_submit_ns = time.perf_counter_ns() if timeline_enabled else None
     backward_start = torch.cuda.Event(enable_timing=True)
     backward_end = torch.cuda.Event(enable_timing=True)
     backward_start.record()
@@ -380,6 +384,7 @@ def train_distributed_tide_batch(
         else:
             grad = leaf.grad
         sparse_grad_components[name] = grad.index_select(0, touched_active).contiguous()
+    optimizer_submit_ns = time.perf_counter_ns() if timeline_enabled else None
     optimizer_start = torch.cuda.Event(enable_timing=True)
     optimizer_end = torch.cuda.Event(enable_timing=True)
     optimizer_start.record()
@@ -420,6 +425,33 @@ def train_distributed_tide_batch(
     forward_ms = float(forward_start.elapsed_time(forward_end))
     backward_ms = float(backward_start.elapsed_time(backward_end))
     optimizer_ms = float(optimizer_start.elapsed_time(optimizer_end))
+    h2d_submit_ns = retention_stats.get("h2d_submit_ns")
+    if timeline_enabled and h2d_submit_ns is not None:
+        metrics_writer.write_timeline_event(
+            name="gaussian_materialize_h2d",
+            lane="gpu",
+            start_ns=int(h2d_submit_ns),
+            end_ns=int(h2d_submit_ns) + round(h2d_ms * 1e6),
+            iteration=iteration,
+            timing_source="host_submit_plus_cuda_event",
+            bytes=int(retention_stats.get("h2d_bytes", 0)),
+            detail="h2d_plus_gpu_unpack",
+        )
+    if timeline_enabled:
+        for name, submit_ns, duration_ms, detail in (
+            ("gaussian_cull_forward", forward_submit_ns, forward_ms, "includes_projection_cull"),
+            ("backward", backward_submit_ns, backward_ms, None),
+            ("adam", optimizer_submit_ns, optimizer_ms, None),
+        ):
+            metrics_writer.write_timeline_event(
+                name=name,
+                lane="gpu",
+                start_ns=submit_ns,
+                end_ns=submit_ns + round(duration_ms * 1e6),
+                iteration=iteration,
+                timing_source="host_submit_plus_cuda_event",
+                detail=detail,
+            )
     metrics_row = {
         "iteration": iteration,
         "local_cameras": len(batched_cameras),
