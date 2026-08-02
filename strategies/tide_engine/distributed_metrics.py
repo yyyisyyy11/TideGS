@@ -31,6 +31,12 @@ BATCH_FIELDS = [
     "gpu_slot_growth_blocks",
     "touched_gaussians",
     "block_cull_ms",
+    "block_cull_backend",
+    "block_cull_gpu_kernel_ms",
+    "block_cull_gpu_d2h_ms",
+    "block_cull_cache_hit_cameras",
+    "block_cull_gpu_cameras",
+    "block_cull_output_blocks",
     "plan_ms",
     "writeback_submit_ms",
     "resident_load_ms",
@@ -74,6 +80,9 @@ SUM_FIELDS = {
     "ssd_urgent_read_blocks",
     "ssd_urgent_read_bytes",
     "h2d_bytes",
+    "block_cull_cache_hit_cameras",
+    "block_cull_gpu_cameras",
+    "block_cull_output_blocks",
 }
 
 GLOBAL_ONCE_FIELDS = {

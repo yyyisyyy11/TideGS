@@ -104,12 +104,18 @@ class TideStorageAdapter:
         min_free_gb: float = 64.0,
         compaction_batch_files: int = 4,
         idle_compaction_seconds: float = 0.0,
+        block_cull_backend: str = "cpu",
+        block_cull_camera_chunk: int = 8,
     ):
         self.gaussians = gaussians
         self.cameras = cameras
         self.skip_camera_clustering = skip_camera_clustering
         self.use_6plane = use_6plane
         self.execution_mode = str(execution_mode).lower()
+        self.block_cull_backend = str(block_cull_backend).lower()
+        self.block_cull_camera_chunk = max(1, int(block_cull_camera_chunk))
+        self.gpu_culler = None
+        self._batch_cull_metrics = None
         self.max_patch_files = int(max_patch_files)
         self.max_patch_gb = float(max_patch_gb)
         self.min_free_gb = float(min_free_gb)
@@ -849,6 +855,25 @@ class TideStorageAdapter:
             verbose=self.paper_debug_logging,
         )
 
+        if self.block_cull_backend == "gpu":
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "tide_block_cull_backend=gpu requires a CUDA device"
+                )
+            from .gpu_block_culler import GpuBlockCuller
+            self.gpu_culler = GpuBlockCuller(
+                block_bounds=self.block_bounds,
+                block_size=self.block_size,
+                camera_chunk=self.block_cull_camera_chunk,
+                verbose=self.paper_debug_logging,
+            )
+            self._log("[Pipeline] GPU block culler initialized alongside CPU culler")
+        elif self.block_cull_backend != "cpu":
+            raise ValueError(
+                f"Unknown tide_block_cull_backend: {self.block_cull_backend!r}. "
+                "Expected 'cpu' or 'gpu'."
+            )
+
         self.pipeline = AsyncPipeline(
             cache_manager=self.cache,
             frustum_culler=self.culler,
@@ -879,24 +904,16 @@ class TideStorageAdapter:
         )
         return schedule
 
-    def get_visible_blocks(
-        self,
-        camera_idx: int,
-        *,
-        wait_for_refresh: bool = True,
-    ) -> List[int]:
-        if wait_for_refresh:
-            self.wait_for_bounds_refresh()
-        camera_idx = int(camera_idx)
-        with self._bounds_state_lock:
-            cached = self._visibility_cache.get(camera_idx)
-            if cached is not None and cached[0] == self._bounds_generation:
-                return list(cached[1])
+    def _build_camera_matrices(self, camera_idx: int):
+        """Return ``(view_mat, proj_mat)`` as (4,4) float32 numpy arrays.
 
-        cam_info = self.cameras[camera_idx]
-        R = np.array(cam_info.R).reshape(3, 3)
-        T = np.array(cam_info.T).reshape(3, 1)
-        camera_pos = (-R @ T).flatten()
+        Both matrices use the OpenGL convention (YZ-flipped from OpenCV).
+        This is the single source of truth for constructing frustum inputs;
+        both the CPU and GPU culler paths call it.
+        """
+        cam_info = self.cameras[int(camera_idx)]
+        R = np.array(cam_info.R, dtype=np.float32).reshape(3, 3)
+        T = np.array(cam_info.T, dtype=np.float32).reshape(3, 1)
 
         view_mat = np.eye(4, dtype=np.float32)
         view_mat[:3, :3] = R.T
@@ -930,6 +947,29 @@ class TideStorageAdapter:
             ],
             dtype=np.float32,
         )
+
+        return view_mat, proj_mat
+
+    def get_visible_blocks(
+        self,
+        camera_idx: int,
+        *,
+        wait_for_refresh: bool = True,
+    ) -> List[int]:
+        if wait_for_refresh:
+            self.wait_for_bounds_refresh()
+        camera_idx = int(camera_idx)
+        with self._bounds_state_lock:
+            cached = self._visibility_cache.get(camera_idx)
+            if cached is not None and cached[0] == self._bounds_generation:
+                return list(cached[1])
+
+        cam_info = self.cameras[camera_idx]
+        R = np.array(cam_info.R, dtype=np.float32).reshape(3, 3)
+        T = np.array(cam_info.T, dtype=np.float32).reshape(3, 1)
+        camera_pos = (-R @ T).flatten()
+
+        view_mat, proj_mat = self._build_camera_matrices(camera_idx)
 
         if self.paper_debug_logging and (
             not hasattr(self, "_coord_check_done") or not self._coord_check_done
@@ -1042,6 +1082,62 @@ class TideStorageAdapter:
         self.wait_for_bounds_refresh()
         with self._bounds_state_lock:
             generation = int(self._bounds_generation)
+
+        gpu_culler = getattr(self, "gpu_culler", None)
+        if gpu_culler is not None:
+            # --- GPU path: single batched kernel launch ---
+            view_mats = []
+            proj_mats = []
+            for cam_id in camera_ids:
+                v, p = self._build_camera_matrices(int(cam_id))
+                view_mats.append(v)
+                proj_mats.append(p)
+            view_mats = np.stack(view_mats, axis=0)
+            proj_mats = np.stack(proj_mats, axis=0)
+
+            t0 = time.perf_counter()
+            per_camera_visible = gpu_culler.cull_batch(view_mats, proj_mats)
+            gpu_kernel_ms = (time.perf_counter() - t0) * 1000.0
+
+            camera_blocks = {
+                int(cam_id): visible
+                for cam_id, visible in zip(camera_ids, per_camera_visible)
+            }
+
+            # Update visibility cache (same semantics as CPU path).
+            with self._bounds_state_lock:
+                if generation == self._bounds_generation:
+                    for cam_id, visible in camera_blocks.items():
+                        self._visibility_cache[int(cam_id)] = (
+                            generation,
+                            tuple(visible),
+                        )
+                    if len(self._visibility_cache) > 500:
+                        oldest_key = next(iter(self._visibility_cache))
+                        del self._visibility_cache[oldest_key]
+
+            total_output = sum(len(v) for v in per_camera_visible)
+            # Count cache hits: cameras whose cached generation matches current.
+            cache_hits = 0
+            with self._bounds_state_lock:
+                for cam_id in camera_ids:
+                    cached = self._visibility_cache.get(int(cam_id))
+                    if cached is not None and cached[0] == generation:
+                        cache_hits += 1
+
+            self._batch_cull_metrics = {
+                "block_cull_backend": "gpu",
+                "block_cull_gpu_kernel_ms": gpu_kernel_ms,
+                "block_cull_gpu_d2h_ms": 0.0,  # included in kernel_ms (D2H happens inside torch.nonzero→cpu)
+                "block_cull_cache_hit_cameras": cache_hits,
+                "block_cull_gpu_cameras": len(camera_ids),
+                "block_cull_output_blocks": total_output,
+            }
+
+            return generation, camera_blocks
+
+        # --- CPU path (unchanged) ---
+        with self._bounds_state_lock:
             camera_blocks = {
                 int(camera_id): self.get_visible_blocks(
                     int(camera_id),
@@ -1049,6 +1145,14 @@ class TideStorageAdapter:
                 )
                 for camera_id in camera_ids
             }
+        self._batch_cull_metrics = {
+            "block_cull_backend": "cpu",
+            "block_cull_gpu_kernel_ms": 0.0,
+            "block_cull_gpu_d2h_ms": 0.0,
+            "block_cull_cache_hit_cameras": 0,
+            "block_cull_gpu_cameras": 0,
+            "block_cull_output_blocks": 0,
+        }
         return generation, camera_blocks
 
     def prefetch_for_next_iteration(
@@ -1144,6 +1248,9 @@ class TideStorageAdapter:
             culler = getattr(self, "culler", None)
             if culler is not None and hasattr(culler, "update_block_bounds"):
                 culler.update_block_bounds(block_ids_np, bounds_np)
+            gpu_culler = getattr(self, "gpu_culler", None)
+            if gpu_culler is not None:
+                gpu_culler.update_block_bounds(block_ids_np, bounds_np)
             self._bounds_generation += 1
             if not hasattr(self, "_bounds_change_log"):
                 self._bounds_change_log = OrderedDict()

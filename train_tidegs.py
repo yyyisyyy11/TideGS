@@ -144,6 +144,9 @@ def _build_distributed_plan(
         payload = plan.to_dict()
         payload["block_cull_ms"] = block_cull_ms
         payload["plan_ms"] = (time.perf_counter() - plan_start) * 1000.0
+        cull_metrics = getattr(storage_adapter, "_batch_cull_metrics", None)
+        if cull_metrics:
+            payload.update(cull_metrics)
     return DistributedBatchPlan.from_dict(context.broadcast_object(payload)), schedule_info
 
 
@@ -189,6 +192,9 @@ def _preview_distributed_plan(
         payload = plan.to_dict()
         payload["block_cull_ms"] = block_cull_ms
         payload["plan_ms"] = plan_ms
+        cull_metrics = getattr(storage_adapter, "_batch_cull_metrics", None)
+        if cull_metrics:
+            payload.update(cull_metrics)
         rank0_preview = {
             "bounds_generation": int(bounds_generation),
             "camera_blocks": _normalize_camera_blocks(camera_blocks),
@@ -227,6 +233,7 @@ def _finalize_distributed_plan(
 
         repair_start = time.perf_counter()
         current_generation = storage_adapter.get_bounds_generation()
+        repair_cull_metrics = None
         if current_generation == rank0_preview["bounds_generation"]:
             camera_blocks = rank0_preview["camera_blocks"]
         else:
@@ -234,6 +241,7 @@ def _finalize_distributed_plan(
                 schedule_info.batch_indices
             )
             camera_blocks = _normalize_camera_blocks(repaired_blocks)
+            repair_cull_metrics = getattr(storage_adapter, "_batch_cull_metrics", None)
         repair_ms = (time.perf_counter() - repair_start) * 1000.0
 
         prediction_changed = camera_blocks != rank0_preview["camera_blocks"]
@@ -256,6 +264,8 @@ def _finalize_distributed_plan(
         payload = exact_plan.to_dict()
         payload["block_cull_ms"] = float(predicted_plan.block_cull_ms) + repair_ms
         payload["plan_ms"] = float(predicted_plan.plan_ms) + exact_plan_ms
+        if repair_cull_metrics:
+            payload.update(repair_cull_metrics)
         payload["predicted_stream_in_blocks"] = len(predicted_stream_in)
         payload["prediction_missing_blocks"] = len(
             exact_stream_in - predicted_stream_in
@@ -485,6 +495,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 min_free_gb=args.tide_storage_min_free_gb,
                 compaction_batch_files=args.tide_storage_compaction_batch_files,
                 idle_compaction_seconds=args.tide_storage_idle_compaction_seconds,
+                block_cull_backend=getattr(args, "tide_block_cull_backend", "cpu") or "cpu",
+                block_cull_camera_chunk=int(getattr(args, "tide_block_cull_camera_chunk", 8) or 8),
             )
 
         ssd_schedule_ordering = getattr(args, "ssd_schedule_ordering", "trajectory")
