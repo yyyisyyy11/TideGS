@@ -115,6 +115,12 @@ class DistributedBatchPlan:
     stream_in_blocks: List[int] = field(default_factory=list)
     evict_blocks: List[int] = field(default_factory=list)
     block_cull_ms: float = 0.0
+    block_cull_backend: str = "cpu"
+    block_cull_gpu_kernel_ms: float = 0.0
+    block_cull_gpu_d2h_ms: float = 0.0
+    block_cull_cache_hit_cameras: int = 0
+    block_cull_gpu_cameras: int = 0
+    block_cull_output_blocks: int = 0
     plan_ms: float = 0.0
     predicted_stream_in_blocks: int = 0
     prediction_missing_blocks: int = 0
@@ -158,6 +164,16 @@ class DistributedBatchPlan:
             stream_in_blocks=[int(v) for v in value.get("stream_in_blocks", [])],
             evict_blocks=[int(v) for v in value.get("evict_blocks", [])],
             block_cull_ms=float(value.get("block_cull_ms", 0.0)),
+            block_cull_backend=str(value.get("block_cull_backend", "cpu")),
+            block_cull_gpu_kernel_ms=float(
+                value.get("block_cull_gpu_kernel_ms", 0.0)
+            ),
+            block_cull_gpu_d2h_ms=float(value.get("block_cull_gpu_d2h_ms", 0.0)),
+            block_cull_cache_hit_cameras=int(
+                value.get("block_cull_cache_hit_cameras", 0)
+            ),
+            block_cull_gpu_cameras=int(value.get("block_cull_gpu_cameras", 0)),
+            block_cull_output_blocks=int(value.get("block_cull_output_blocks", 0)),
             plan_ms=float(value.get("plan_ms", 0.0)),
             predicted_stream_in_blocks=int(
                 value.get("predicted_stream_in_blocks", 0)

@@ -93,11 +93,12 @@ GLOBAL_ONCE_FIELDS = {
     "prediction_extra_blocks",
     "prediction_replanned",
 }
+GLOBAL_TEXT_ONCE_FIELDS = {"block_cull_backend"}
 
 TIME_FIELDS = [field for field in BATCH_FIELDS if field.endswith("_ms")]
 GLOBAL_FIELDS = (
     ["iteration", "world_size"]
-    + sorted(SUM_FIELDS | GLOBAL_ONCE_FIELDS)
+    + sorted(SUM_FIELDS | GLOBAL_ONCE_FIELDS | GLOBAL_TEXT_ONCE_FIELDS)
     + [f"{field}_max" for field in TIME_FIELDS]
     + [f"{field}_mean" for field in TIME_FIELDS]
 )
@@ -390,6 +391,9 @@ class DistributedMetricsWriter:
         for field in GLOBAL_ONCE_FIELDS:
             values = [float(value.get(field, 0)) for value in rank_rows]
             global_row[field] = max(values, default=0.0)
+        for field in GLOBAL_TEXT_ONCE_FIELDS:
+            values = {str(value.get(field, "")) for value in rank_rows}
+            global_row[field] = values.pop() if len(values) == 1 else "mixed"
         for field in TIME_FIELDS:
             values = [float(value.get(field, 0.0)) for value in rank_rows]
             global_row[f"{field}_max"] = max(values, default=0.0)

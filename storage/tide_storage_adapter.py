@@ -997,7 +997,7 @@ class TideStorageAdapter:
             print(f"[COORD_CHECK] Camera pos max  : {cam_positions.max(axis=0)}")
             print(f"[COORD_CHECK] Camera-Block AABB overlap: {overlap}")
             print(f"[COORD_CHECK] Proj[2,2]={proj_mat[2, 2]:.6f} (OpenGL: should be < 0)")
-            print(f"[COORD_CHECK] near={near}, far={far}, scene_radius={self.scene_radius}")
+            print(f"[COORD_CHECK] scene_radius={self.scene_radius}")
 
         with self._bounds_state_lock:
             bounds_generation = self._bounds_generation
@@ -1085,52 +1085,68 @@ class TideStorageAdapter:
 
         gpu_culler = getattr(self, "gpu_culler", None)
         if gpu_culler is not None:
-            # --- GPU path: single batched kernel launch ---
+            # Reuse same-generation visibility before launching GPU work.
+            cached_blocks = {}
+            missing_camera_ids = []
+            with self._bounds_state_lock:
+                for camera_id in camera_ids:
+                    camera_id = int(camera_id)
+                    cached = self._visibility_cache.get(camera_id)
+                    if cached is not None and cached[0] == generation:
+                        cached_blocks[camera_id] = list(cached[1])
+                    else:
+                        missing_camera_ids.append(camera_id)
+
+            # --- GPU path: one batched kernel launch for cache misses ---
             view_mats = []
             proj_mats = []
-            for cam_id in camera_ids:
-                v, p = self._build_camera_matrices(int(cam_id))
-                view_mats.append(v)
-                proj_mats.append(p)
-            view_mats = np.stack(view_mats, axis=0)
-            proj_mats = np.stack(proj_mats, axis=0)
-
-            t0 = time.perf_counter()
-            per_camera_visible = gpu_culler.cull_batch(view_mats, proj_mats)
-            gpu_kernel_ms = (time.perf_counter() - t0) * 1000.0
+            if missing_camera_ids:
+                for cam_id in missing_camera_ids:
+                    v, p = self._build_camera_matrices(cam_id)
+                    view_mats.append(v)
+                    proj_mats.append(p)
+                per_camera_visible = gpu_culler.cull_batch(
+                    np.stack(view_mats, axis=0),
+                    np.stack(proj_mats, axis=0),
+                )
+                fresh_blocks = {
+                    camera_id: visible
+                    for camera_id, visible in zip(missing_camera_ids, per_camera_visible)
+                }
+                with self._bounds_state_lock:
+                    if generation == self._bounds_generation:
+                        for camera_id, visible in fresh_blocks.items():
+                            self._visibility_cache[camera_id] = (
+                                generation,
+                                tuple(visible),
+                            )
+                        if len(self._visibility_cache) > 500:
+                            oldest_key = next(iter(self._visibility_cache))
+                            del self._visibility_cache[oldest_key]
+            else:
+                fresh_blocks = {}
 
             camera_blocks = {
-                int(cam_id): visible
-                for cam_id, visible in zip(camera_ids, per_camera_visible)
+                int(camera_id): (
+                    cached_blocks[int(camera_id)]
+                    if int(camera_id) in cached_blocks
+                    else fresh_blocks[int(camera_id)]
+                )
+                for camera_id in camera_ids
             }
-
-            # Update visibility cache (same semantics as CPU path).
-            with self._bounds_state_lock:
-                if generation == self._bounds_generation:
-                    for cam_id, visible in camera_blocks.items():
-                        self._visibility_cache[int(cam_id)] = (
-                            generation,
-                            tuple(visible),
-                        )
-                    if len(self._visibility_cache) > 500:
-                        oldest_key = next(iter(self._visibility_cache))
-                        del self._visibility_cache[oldest_key]
-
-            total_output = sum(len(v) for v in per_camera_visible)
-            # Count cache hits: cameras whose cached generation matches current.
-            cache_hits = 0
-            with self._bounds_state_lock:
-                for cam_id in camera_ids:
-                    cached = self._visibility_cache.get(int(cam_id))
-                    if cached is not None and cached[0] == generation:
-                        cache_hits += 1
+            timing = (
+                getattr(gpu_culler, "last_cull_timing", {})
+                if missing_camera_ids
+                else {}
+            )
+            total_output = sum(len(visible) for visible in fresh_blocks.values())
 
             self._batch_cull_metrics = {
                 "block_cull_backend": "gpu",
-                "block_cull_gpu_kernel_ms": gpu_kernel_ms,
-                "block_cull_gpu_d2h_ms": 0.0,  # included in kernel_ms (D2H happens inside torch.nonzero→cpu)
-                "block_cull_cache_hit_cameras": cache_hits,
-                "block_cull_gpu_cameras": len(camera_ids),
+                "block_cull_gpu_kernel_ms": float(timing.get("kernel_ms", 0.0)),
+                "block_cull_gpu_d2h_ms": float(timing.get("d2h_ms", 0.0)),
+                "block_cull_cache_hit_cameras": len(cached_blocks),
+                "block_cull_gpu_cameras": len(missing_camera_ids),
                 "block_cull_output_blocks": total_output,
             }
 

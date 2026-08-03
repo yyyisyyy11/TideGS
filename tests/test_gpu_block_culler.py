@@ -184,8 +184,8 @@ class GpuBlockCullerTest(unittest.TestCase):
         self.assertEqual(results[0], sorted(results[0]),
                          "GPU output must be sorted ascending")
 
-    def test_gpu_contains_cpu_superset(self):
-        """For every camera, every CPU-visible block is also GPU-visible."""
+    def test_gpu_matches_cpu_visible_blocks(self):
+        """GPU and CPU six-plane culling must return identical block IDs."""
         num_blocks = 200
         num_cameras = 8
         bounds = _random_blocks(num_blocks, seed=42)
@@ -205,11 +205,10 @@ class GpuBlockCullerTest(unittest.TestCase):
             ))
             gpu_visible = set(gpu_results[i])
 
-            missing = cpu_visible - gpu_visible
             self.assertEqual(
-                len(missing), 0,
-                f"Camera {i}: GPU missed {len(missing)} blocks that CPU found: "
-                f"{sorted(missing)[:10]}"
+                gpu_visible,
+                cpu_visible,
+                f"Camera {i}: CPU/GPU visible block mismatch",
             )
 
     def test_boundary_tangent_block(self):

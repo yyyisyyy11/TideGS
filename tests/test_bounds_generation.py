@@ -43,6 +43,16 @@ class _RepairCuller(_Culler):
         return sorted(ids & self.visible)
 
 
+class _GpuCuller:
+    def __init__(self):
+        self.calls = []
+        self.last_cull_timing = {"kernel_ms": 1.5, "d2h_ms": 0.5}
+
+    def cull_batch(self, view_matrices, proj_matrices):
+        self.calls.append(len(view_matrices))
+        return [[index] for index in range(len(view_matrices))]
+
+
 class _BoundsPayload:
     block_ids = [1]
 
@@ -137,6 +147,58 @@ class BoundsGenerationTest(unittest.TestCase):
         self.assertEqual(adapter.culler.subset_culls[-1], {2})
         self.assertEqual(adapter.execution_metrics["visibility_incremental_repairs"], 2)
         self.assertEqual(adapter.execution_metrics["visibility_repaired_blocks"], 2)
+
+    def test_debug_coordinate_check_does_not_require_clip_variables(self):
+        adapter = TideStorageAdapter.__new__(TideStorageAdapter)
+        adapter._bounds_state_lock = threading.RLock()
+        adapter._bounds_generation = 0
+        adapter._bounds_change_log = __import__("collections").OrderedDict()
+        adapter._visibility_cache = {}
+        adapter.block_bounds = np.asarray(
+            [[-1, -1, -1, 1, 1, 1]], dtype=np.float32
+        )
+        adapter.culler = _RepairCuller({0})
+        adapter.cameras = [_Camera()]
+        adapter.scene_radius = 10.0
+        adapter.use_6plane = True
+        adapter.paper_debug_logging = True
+        adapter.execution_metrics = {}
+
+        self.assertEqual(adapter.get_visible_blocks(0, wait_for_refresh=False), [0])
+
+    def test_gpu_batch_cull_reuses_same_generation_cache(self):
+        adapter = TideStorageAdapter.__new__(TideStorageAdapter)
+        adapter._bounds_state_lock = threading.RLock()
+        adapter._bounds_generation = 0
+        adapter._visibility_cache = {}
+        adapter.cameras = [_Camera(), _Camera()]
+        adapter.scene_radius = 10.0
+        adapter.gpu_culler = _GpuCuller()
+        adapter.wait_for_bounds_refresh = lambda: None
+
+        _, first = adapter.get_visible_blocks_batch([0, 1])
+        self.assertEqual(first, {0: [0], 1: [1]})
+        self.assertEqual(adapter.gpu_culler.calls, [2])
+        self.assertEqual(adapter._batch_cull_metrics, {
+            "block_cull_backend": "gpu",
+            "block_cull_gpu_kernel_ms": 1.5,
+            "block_cull_gpu_d2h_ms": 0.5,
+            "block_cull_cache_hit_cameras": 0,
+            "block_cull_gpu_cameras": 2,
+            "block_cull_output_blocks": 2,
+        })
+
+        _, second = adapter.get_visible_blocks_batch([0, 1])
+        self.assertEqual(second, first)
+        self.assertEqual(adapter.gpu_culler.calls, [2])
+        self.assertEqual(adapter._batch_cull_metrics, {
+            "block_cull_backend": "gpu",
+            "block_cull_gpu_kernel_ms": 0.0,
+            "block_cull_gpu_d2h_ms": 0.0,
+            "block_cull_cache_hit_cameras": 2,
+            "block_cull_gpu_cameras": 0,
+            "block_cull_output_blocks": 0,
+        })
 
     def test_subset_culling_matches_full_six_plane_result(self):
         rng = np.random.default_rng(7)

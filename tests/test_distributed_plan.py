@@ -9,6 +9,7 @@ from strategies.tide_engine.distributed_plan import (
     build_balanced_block_owner,
     build_stable_block_owner,
 )
+from strategies.tide_engine.resident_policy import compute_topc_resident_transition
 
 
 class DistributedPlanTest(unittest.TestCase):
@@ -221,6 +222,35 @@ class DistributedPlanTest(unittest.TestCase):
         self.assertEqual(baseline.resident, ())
         self.assertEqual(set(predicted.stream_in_blocks), {0, 1})
         self.assertEqual(exact, reference)
+
+    def test_cull_metadata_round_trips_through_plan_payload(self):
+        plan = DistributedBatchPlan(
+            iteration=1,
+            epoch=0,
+            global_camera_ids=[0, 1],
+            rank_camera_ids=[[0], [1]],
+            rank_resident_blocks=[[0], [1]],
+            rank_active_blocks=[[0], [1]],
+            block_cull_ms=12.0,
+            block_cull_backend="gpu",
+            block_cull_gpu_kernel_ms=4.0,
+            block_cull_gpu_d2h_ms=1.5,
+            block_cull_cache_hit_cameras=3,
+            block_cull_gpu_cameras=5,
+            block_cull_output_blocks=42,
+        )
+        self.assertEqual(DistributedBatchPlan.from_dict(plan.to_dict()), plan)
+
+    def test_lambda_one_prioritizes_next_active_blocks_over_recency(self):
+        transition = compute_topc_resident_transition(
+            current_active_blocks=[0],
+            next_active_blocks=[1],
+            current_resident_blocks=[0],
+            previous_recency_scores={0: 1.0},
+            lambda_weight=1.0,
+            resident_capacity_blocks=1,
+        )
+        self.assertEqual(transition.next_resident_blocks, [1])
 
 
 if __name__ == "__main__":

@@ -133,6 +133,12 @@ class DistributedMetricsTest(unittest.TestCase):
                 "prediction_replanned": 1,
                 "prediction_repair_ms": 4.0,
                 "prediction_exact_plan_ms": 3.0,
+                "block_cull_backend": "gpu",
+                "block_cull_gpu_kernel_ms": 1.5,
+                "block_cull_gpu_d2h_ms": 0.5,
+                "block_cull_cache_hit_cameras": 2,
+                "block_cull_gpu_cameras": 3,
+                "block_cull_output_blocks": 12,
                 "gpu_slot_capacity_blocks": 4,
                 "gpu_slot_growth_blocks": 1,
                 "h2d_bytes": 400,
@@ -170,6 +176,12 @@ class DistributedMetricsTest(unittest.TestCase):
             self.assertEqual(global_rows[0]["prediction_missing_blocks"], "1.0")
             self.assertEqual(global_rows[0]["prediction_extra_blocks"], "2.0")
             self.assertEqual(global_rows[0]["prediction_replanned"], "1.0")
+            self.assertEqual(rank_rows[0]["block_cull_backend"], "gpu")
+            self.assertEqual(global_rows[0]["block_cull_backend"], "gpu")
+            self.assertEqual(global_rows[0]["block_cull_gpu_cameras"], "6.0")
+            self.assertEqual(global_rows[0]["block_cull_output_blocks"], "24.0")
+            self.assertEqual(global_rows[0]["block_cull_gpu_kernel_ms_max"], "1.5")
+            self.assertEqual(global_rows[0]["block_cull_gpu_d2h_ms_mean"], "0.5")
             self.assertEqual(global_rows[0]["prediction_repair_ms_max"], "4.0")
             self.assertEqual(
                 global_rows[0]["prediction_exact_plan_ms_mean"], "3.0"

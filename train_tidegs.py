@@ -73,6 +73,16 @@ from strategies.tide_engine.distributed_metrics import (
 from utils.distributed import DistributedContext, get_distributed_context
 
 
+CULL_METRIC_FIELDS = (
+    "block_cull_backend",
+    "block_cull_gpu_kernel_ms",
+    "block_cull_gpu_d2h_ms",
+    "block_cull_cache_hit_cameras",
+    "block_cull_gpu_cameras",
+    "block_cull_output_blocks",
+)
+
+
 def _prepare_distributed_block_owner(
     *,
     args,
@@ -264,8 +274,29 @@ def _finalize_distributed_plan(
         payload = exact_plan.to_dict()
         payload["block_cull_ms"] = float(predicted_plan.block_cull_ms) + repair_ms
         payload["plan_ms"] = float(predicted_plan.plan_ms) + exact_plan_ms
+        payload.update(
+            {
+                field: getattr(predicted_plan, field)
+                for field in CULL_METRIC_FIELDS
+            }
+        )
         if repair_cull_metrics:
-            payload.update(repair_cull_metrics)
+            repair_backend = str(repair_cull_metrics["block_cull_backend"])
+            payload["block_cull_backend"] = (
+                predicted_plan.block_cull_backend
+                if repair_backend == predicted_plan.block_cull_backend
+                else "mixed"
+            )
+            for field in (
+                "block_cull_gpu_kernel_ms",
+                "block_cull_gpu_d2h_ms",
+                "block_cull_cache_hit_cameras",
+                "block_cull_gpu_cameras",
+                "block_cull_output_blocks",
+            ):
+                payload[field] = (
+                    getattr(predicted_plan, field) + repair_cull_metrics[field]
+                )
         payload["predicted_stream_in_blocks"] = len(predicted_stream_in)
         payload["prediction_missing_blocks"] = len(
             exact_stream_in - predicted_stream_in

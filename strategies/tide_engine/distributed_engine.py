@@ -475,6 +475,14 @@ def train_distributed_tide_batch(
         ),
         "touched_gaussians": int(touched_active.numel()),
         "block_cull_ms": float(plan.block_cull_ms),
+        "block_cull_backend": str(plan.block_cull_backend),
+        "block_cull_gpu_kernel_ms": float(plan.block_cull_gpu_kernel_ms),
+        "block_cull_gpu_d2h_ms": float(plan.block_cull_gpu_d2h_ms),
+        "block_cull_cache_hit_cameras": int(
+            plan.block_cull_cache_hit_cameras
+        ),
+        "block_cull_gpu_cameras": int(plan.block_cull_gpu_cameras),
+        "block_cull_output_blocks": int(plan.block_cull_output_blocks),
         "plan_ms": float(plan.plan_ms),
         "writeback_submit_ms": writeback_submit_ms,
         "resident_load_ms": resident_load_ms,

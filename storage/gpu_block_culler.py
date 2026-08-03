@@ -62,6 +62,10 @@ class GpuBlockCuller:
         # Homogeneous centers built lazily after dirty.
         self._centers_homo: torch.Tensor | None = None
         self._centers_dirty = True
+        self.last_cull_timing = {
+            "kernel_ms": 0.0,
+            "d2h_ms": 0.0,
+        }
 
         self._lock = threading.Lock()
 
@@ -179,6 +183,7 @@ class GpuBlockCuller:
 
         num_cameras = view_matrices.shape[0]
         if num_cameras == 0:
+            self.last_cull_timing = {"kernel_ms": 0.0, "d2h_ms": 0.0}
             return []
 
         # Ensure homogeneous centers are fresh.
@@ -186,6 +191,8 @@ class GpuBlockCuller:
 
         device = self._centers.device
         all_visible: List[List[int]] = []
+        kernel_ms = 0.0
+        d2h_ms = 0.0
 
         chunk = self.camera_chunk
         for chunk_start in range(0, num_cameras, chunk):
@@ -214,6 +221,9 @@ class GpuBlockCuller:
                 centers_h = self._centers_homo  # (N, 4)
                 radii = self._radii            # (N,)
 
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
             signed_distances = torch.matmul(
                 planes_t,          # (c, 6, 4)
                 centers_h.T,       # (4, N)
@@ -226,8 +236,19 @@ class GpuBlockCuller:
             )  # → (c, N) bool
 
             # Compact: torch.nonzero per camera, ascending by construction.
+            indices_per_camera = []
             for i in range(c):
-                indices = torch.nonzero(visible_mask[i]).squeeze(-1)
-                all_visible.append(indices.cpu().tolist())
+                indices_per_camera.append(torch.nonzero(visible_mask[i]).squeeze(-1))
+            end_event.record()
+            end_event.synchronize()
+            kernel_ms += float(start_event.elapsed_time(end_event))
 
+            d2h_start = time.perf_counter()
+            all_visible.extend(indices.cpu().tolist() for indices in indices_per_camera)
+            d2h_ms += (time.perf_counter() - d2h_start) * 1000.0
+
+        self.last_cull_timing = {
+            "kernel_ms": kernel_ms,
+            "d2h_ms": d2h_ms,
+        }
         return all_visible
