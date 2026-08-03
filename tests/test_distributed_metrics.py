@@ -142,6 +142,9 @@ class DistributedMetricsTest(unittest.TestCase):
                 "gpu_slot_capacity_blocks": 4,
                 "gpu_slot_growth_blocks": 1,
                 "h2d_bytes": 400,
+                "block_reader_foreground_ms": 7.0,
+                "ssd_urgent_read_ms": 1.5,
+                "prefetch_inflight_wait_ms": 1.0,
                 "optimizer_ms": 6.0,
             }
             writer.write_batch(row)
@@ -182,6 +185,9 @@ class DistributedMetricsTest(unittest.TestCase):
             self.assertEqual(global_rows[0]["block_cull_output_blocks"], "24.0")
             self.assertEqual(global_rows[0]["block_cull_gpu_kernel_ms_max"], "1.5")
             self.assertEqual(global_rows[0]["block_cull_gpu_d2h_ms_mean"], "0.5")
+            self.assertEqual(global_rows[0]["block_reader_foreground_ms_max"], "7.0")
+            self.assertEqual(global_rows[0]["ssd_urgent_read_ms_max"], "1.5")
+            self.assertEqual(global_rows[0]["prefetch_inflight_wait_ms_mean"], "1.0")
             self.assertEqual(global_rows[0]["prediction_repair_ms_max"], "4.0")
             self.assertEqual(
                 global_rows[0]["prediction_exact_plan_ms_mean"], "3.0"

@@ -421,6 +421,13 @@ def train_distributed_tide_batch(
     def cache_delta(name):
         return float(cache_after.get(name, 0)) - float(cache_before.get(name, 0))
 
+    # ``block_reader.read_batch`` covers RAM-cache lookup and CPU packing in
+    # addition to any storage wait.  Record that full foreground path
+    # separately from direct SSD misses and waits for an N+1 prefetch to
+    # become cache-ready.
+    ssd_urgent_read_ms = cache_delta("urgent_storage_read_time") * 1000.0
+    prefetch_inflight_wait_ms = cache_delta("inflight_wait_time") * 1000.0
+
     projection_ms = sum(projection_elapsed_ms(meta) for meta in metas)
     forward_ms = float(forward_start.elapsed_time(forward_end))
     backward_ms = float(backward_start.elapsed_time(backward_end))
@@ -486,10 +493,11 @@ def train_distributed_tide_batch(
         "plan_ms": float(plan.plan_ms),
         "writeback_submit_ms": writeback_submit_ms,
         "resident_load_ms": resident_load_ms,
-        "ssd_foreground_wait_ms": float(
+        "block_reader_foreground_ms": float(
             retention_stats.get("foreground_read_ms", 0.0)
         ),
-        "ssd_inflight_wait_ms": cache_delta("inflight_wait_time") * 1000.0,
+        "ssd_urgent_read_ms": ssd_urgent_read_ms,
+        "prefetch_inflight_wait_ms": prefetch_inflight_wait_ms,
         "cpu_materialize_ms": float(
             retention_stats.get("cpu_materialize_ms", 0.0)
         ),

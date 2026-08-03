@@ -62,8 +62,8 @@ class DistributedContext:
         rank = int(os.environ["RANK"])
         local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
-        if world_size <= 1:
-            raise RuntimeError("gaussian_sharded mode requires WORLD_SIZE > 1")
+        if world_size < 1:
+            raise RuntimeError("gaussian_sharded mode requires WORLD_SIZE >= 1")
         if not torch.cuda.is_available():
             raise RuntimeError("gaussian_sharded mode requires CUDA")
 
