@@ -5,7 +5,10 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from strategies.tide_engine.distributed_metrics import DistributedMetricsWriter
+from strategies.tide_engine.distributed_metrics import (
+    DistributedMetricsWriter,
+    LegacyCudaMetricsCollector,
+)
 
 
 class _Context:
@@ -39,12 +42,99 @@ class _Context:
         return [value, peer]
 
 
+class _SingleRankContext:
+    rank = 0
+    world_size = 1
+    is_rank0 = True
+
+    def all_gather_object(self, value):
+        return [value]
+
+
+class _Event:
+    def __init__(self, elapsed_ms, ready=False):
+        self.elapsed_ms = elapsed_ms
+        self.ready = ready
+
+    def query(self):
+        return self.ready
+
+    def synchronize(self):
+        self.ready = True
+
+    def elapsed_time(self, end):
+        assert end.ready
+        return self.elapsed_ms
+
+
 def _read_rows(path):
     with open(path, newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle, delimiter="\t"))
 
 
 class DistributedMetricsTest(unittest.TestCase):
+    def test_legacy_collector_defers_cuda_read_and_writes_single_rank_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = DistributedMetricsWriter(
+                args=SimpleNamespace(
+                    log_folder=directory,
+                    tide_detailed_metrics=True,
+                ),
+                context=_SingleRankContext(),
+            )
+            collector = LegacyCudaMetricsCollector(writer)
+            forward_start = _Event(3.0, ready=True)
+            forward_end = _Event(3.0, ready=False)
+            backward_start = _Event(4.0, ready=True)
+            backward_end = _Event(4.0, ready=False)
+            adam_start = _Event(2.0, ready=True)
+            adam_end = _Event(2.0, ready=False)
+            collector.enqueue(
+                {
+                    "iteration": 1,
+                    "local_cameras": 64,
+                    "block_cull_backend": "cpu",
+                    "next_plan_target_iteration": 65,
+                    "next_plan_service_ms": 1.25,
+                },
+                {
+                    "gsplat_forward_ms": [{
+                        "start": forward_start,
+                        "end": forward_end,
+                        "start_ns": 100,
+                        "name": "gaussian_cull_forward",
+                    }],
+                    "backward_ms": [{
+                        "start": backward_start,
+                        "end": backward_end,
+                        "start_ns": 200,
+                        "name": "backward",
+                    }],
+                    "optimizer_ms": [{
+                        "start": adam_start,
+                        "end": adam_end,
+                        "start_ns": 300,
+                        "name": "adam",
+                    }],
+                },
+            )
+            self.assertFalse((Path(directory) / "metrics_batch_rank0.tsv").exists())
+
+            forward_end.ready = True
+            backward_end.ready = True
+            adam_end.ready = True
+            collector.flush_ready()
+
+            rank_rows = _read_rows(Path(directory) / "metrics_batch_rank0.tsv")
+            global_rows = _read_rows(Path(directory) / "metrics_batch_global.tsv")
+            self.assertEqual(rank_rows[0]["gsplat_forward_ms"], "3.0")
+            self.assertEqual(rank_rows[0]["backward_ms"], "4.0")
+            self.assertEqual(rank_rows[0]["optimizer_ms"], "2.0")
+            self.assertEqual(rank_rows[0]["train_ms"], "9.0")
+            self.assertEqual(rank_rows[0]["next_plan_target_iteration"], "65")
+            self.assertEqual(global_rows[0]["world_size"], "1")
+            self.assertEqual(global_rows[0]["next_plan_service_ms_max"], "1.25")
+
     def test_timeline_events_preserve_host_clock_intervals(self):
         with tempfile.TemporaryDirectory() as directory:
             writer = DistributedMetricsWriter(

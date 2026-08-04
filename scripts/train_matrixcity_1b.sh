@@ -75,7 +75,7 @@ Modes:
 Options:
   --mode MODE                 train|checkpoint|resume|summary
   --gpu ID                    GPU id (default: ${GPU})
-  --gpus LIST                 One or more comma-separated GPUs; enables gaussian_sharded mode
+  --gpus LIST                 Comma-separated GPUs; enables gaussian_sharded mode
   --distributed-mode MODE     off|gaussian_sharded (default: ${DISTRIBUTED_MODE})
   --camera-assignment MODE    equal|gaussian_balanced (default: ${CAMERA_ASSIGNMENT})
   --camera-microbatch N       Cameras per rank per gsplat call (default: ${CAMERA_MICROBATCH})
@@ -263,6 +263,10 @@ IFS=',' read -r -a GPU_IDS <<< "${GPUS}"
 GPU_COUNT="${#GPU_IDS[@]}"
 if [[ "${MODE}" != "summary" ]]; then
   if [[ "${DISTRIBUTED_MODE}" == "gaussian_sharded" ]]; then
+    if (( GPU_COUNT <= 1 )); then
+      echo "gaussian_sharded mode requires at least two GPU ids" >&2
+      exit 1
+    fi
     if [[ "${CHECKPOINT_MODE}" != "incremental" ]]; then
       echo "gaussian_sharded mode supports only incremental checkpoints" >&2
       exit 1

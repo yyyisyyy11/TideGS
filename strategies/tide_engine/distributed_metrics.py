@@ -56,6 +56,19 @@ BATCH_FIELDS = [
     "bounds_sync_ms",
     "barrier_ms",
     "batch_total_ms",
+    # Legacy single-rank pipeline details.  These are intentionally separate
+    # from the common fields above: the N+1 planner is asynchronous and must
+    # not be added to the foreground critical path.
+    "legacy_stage4_wall_ms",
+    "bounds_refresh_submit_ms",
+    "prefetch_buffer_wait_ms",
+    "next_plan_cull_ms",
+    "next_plan_select_ms",
+    "next_plan_hint_submit_ms",
+    "next_plan_buffer_submit_ms",
+    "next_plan_service_ms",
+    "next_plan_finalize_wait_ms",
+    "next_plan_target_iteration",
 ]
 
 IO_FIELDS = [
@@ -93,6 +106,7 @@ GLOBAL_ONCE_FIELDS = {
     "prediction_missing_blocks",
     "prediction_extra_blocks",
     "prediction_replanned",
+    "next_plan_target_iteration",
 }
 GLOBAL_TEXT_ONCE_FIELDS = {"block_cull_backend"}
 
@@ -528,9 +542,94 @@ class DistributedMetricsWriter:
         )
 
 
+class LegacyCudaMetricsCollector:
+    """Defer legacy CUDA-event reads without adding a per-batch GPU sync.
+
+    ``torch.cuda.Event.elapsed_time`` is only valid after its end event has
+    completed.  The legacy engine records event pairs while submitting work and
+    queues the row here.  Later batches opportunistically flush completed rows;
+    shutdown performs the only blocking flush.  This keeps the measured
+    ``batch_total_ms`` on the original foreground path.
+    """
+
+    def __init__(self, writer: DistributedMetricsWriter):
+        self.writer = writer
+        self._pending: List[tuple[Dict[str, object], Dict[str, List[Dict[str, object]]]]] = []
+
+    def enqueue(
+        self,
+        row: Dict[str, object],
+        cuda_ranges: Dict[str, List[Dict[str, object]]],
+    ) -> None:
+        if not self.writer.enabled:
+            return
+        self._pending.append((dict(row), dict(cuda_ranges)))
+        self.flush_ready()
+
+    def flush_ready(self) -> None:
+        while self._pending:
+            row, cuda_ranges = self._pending[0]
+            if any(
+                not spec["end"].query()
+                for specs in cuda_ranges.values()
+                for spec in specs
+            ):
+                return
+            self._pending.pop(0)
+            self._write_resolved(row, cuda_ranges)
+
+    def finalize(self) -> None:
+        """Resolve the remaining rows during shutdown only."""
+        for _, cuda_ranges in self._pending:
+            for specs in cuda_ranges.values():
+                for spec in specs:
+                    spec["end"].synchronize()
+        self.flush_ready()
+
+    def _write_resolved(
+        self,
+        row: Dict[str, object],
+        cuda_ranges: Dict[str, List[Dict[str, object]]],
+    ) -> None:
+        for field, specs in cuda_ranges.items():
+            total_ms = 0.0
+            for spec in specs:
+                duration_ms = float(spec["start"].elapsed_time(spec["end"]))
+                total_ms += duration_ms
+                start_ns = spec.get("start_ns")
+                if start_ns is not None:
+                    self.writer.write_timeline_event(
+                        name=str(spec.get("name", field)),
+                        lane=str(spec.get("lane", "gpu")),
+                        start_ns=int(start_ns),
+                        end_ns=int(start_ns) + round(duration_ms * 1e6),
+                        iteration=row.get("iteration"),
+                        timing_source="host_submit_plus_cuda_event",
+                        detail=spec.get("detail"),
+                    )
+            row[field] = total_ms
+
+        row["train_ms"] = (
+            float(row.get("gsplat_forward_ms", 0.0))
+            + float(row.get("backward_ms", 0.0))
+            + float(row.get("optimizer_ms", 0.0))
+        )
+        self.writer.write_batch(row)
+
+
 def get_distributed_metrics_writer(gaussians, context) -> DistributedMetricsWriter:
     writer = getattr(gaussians, "_tide_distributed_metrics_writer", None)
     if writer is None:
         writer = DistributedMetricsWriter(args=gaussians.args, context=context)
         gaussians._tide_distributed_metrics_writer = writer
     return writer
+
+
+def get_legacy_cuda_metrics_collector(gaussians, context) -> LegacyCudaMetricsCollector:
+    collector = getattr(gaussians, "_tide_legacy_cuda_metrics_collector", None)
+    if collector is None:
+        collector = LegacyCudaMetricsCollector(
+            get_distributed_metrics_writer(gaussians, context)
+        )
+        gaussians._tide_legacy_cuda_metrics_collector = collector
+    return collector

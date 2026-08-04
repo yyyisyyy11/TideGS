@@ -758,7 +758,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     camera_batch_prefetcher = CameraBatchPrefetcher(train_dataset)
     timeline_writer = (
         get_distributed_metrics_writer(gaussians, distributed_context)
-        if distributed_enabled and args.tide_detailed_metrics
+        if args.tide_detailed_metrics
         else None
     )
     if timeline_writer is not None:
@@ -1383,6 +1383,12 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         from strategies.tide_engine.engine import shutdown_double_buffer_gpu
 
         distributed_context.barrier()
+        if args.tide_detailed_metrics:
+            legacy_collector = getattr(
+                gaussians, "_tide_legacy_cuda_metrics_collector", None
+            )
+            if legacy_collector is not None:
+                legacy_collector.finalize()
         if not final_storage_maintenance_complete:
             storage_adapter.flush_resident_dirty()
             compaction_result = run_compaction_maintenance(
@@ -1406,7 +1412,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     distributed_context,
                 ).write_compaction(compaction_result)
         storage_adapter.shutdown(compact_storage=False)
-        if distributed_enabled:
+        if args.tide_detailed_metrics:
             metrics_writer = get_distributed_metrics_writer(
                 gaussians,
                 distributed_context,

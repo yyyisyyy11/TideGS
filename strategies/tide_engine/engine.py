@@ -1,5 +1,6 @@
 import torch
 import math
+import time
 import utils.general_utils as utils
 import clm_kernels
 import fast_tsp
@@ -9,6 +10,11 @@ import gc
 from typing import Optional, List, Dict, Tuple
 
 from strategies.tide_engine.gpu_resident_optimizer import GPUResidentAdam
+from strategies.tide_engine.distributed_metrics import (
+    get_distributed_metrics_writer,
+    get_legacy_cuda_metrics_collector,
+)
+from utils.distributed import get_distributed_context
 
 def get_gpu_resident_optimizer(gaussians, batch_size):
     desired_block_size = int(
@@ -832,6 +838,51 @@ def clm_offload_train_one_batch(
     iteration = utils.get_cur_iter()
     log_file = utils.get_log_file()
 
+    # Detailed metrics use the existing writer with an ``off`` context.  This
+    # is observability only: the legacy engine remains the execution path.
+    legacy_metrics_enabled = bool(
+        storage_adapter is not None
+        and getattr(args, "tide_detailed_metrics", False)
+    )
+    legacy_metrics_writer = None
+    legacy_metrics_collector = None
+    legacy_cache_before = None
+    legacy_batch_start = time.perf_counter()
+    legacy_gpu_ranges = {}
+    if legacy_metrics_enabled:
+        legacy_context = get_distributed_context(args)
+        legacy_metrics_writer = get_distributed_metrics_writer(
+            gaussians, legacy_context
+        )
+        legacy_metrics_collector = get_legacy_cuda_metrics_collector(
+            gaussians, legacy_context
+        )
+        legacy_metrics_collector.flush_ready()
+        legacy_cache_before = storage_adapter.cache.get_stats()
+
+    def _legacy_cuda_range(field, *, name, detail=None):
+        if not legacy_metrics_enabled:
+            return None
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start_ns = time.perf_counter_ns()
+        start.record()
+        return {
+            "field": field,
+            "start": start,
+            "end": end,
+            "start_ns": start_ns,
+            "name": name,
+            "detail": detail,
+            "lane": "gpu",
+        }
+
+    def _legacy_cuda_range_end(token):
+        if token is None:
+            return
+        token["end"].record()
+        legacy_gpu_ranges.setdefault(token["field"], []).append(token)
+
     # ========================================================================
     # [PERF PROFILE] Lightweight per-iteration stage timer (prints every 50 iters)
     # ========================================================================
@@ -853,6 +904,14 @@ def clm_offload_train_one_batch(
 
     current_camera_ids = [cam.global_idx for cam in batched_cameras]
     bsz = len(batched_cameras)
+    legacy_block_cull_ms = 0.0
+    legacy_block_cull_metrics = {}
+    legacy_resident_load_ms = 0.0
+    legacy_retention_stats = {}
+    legacy_bounds_refresh_submit_ms = 0.0
+    legacy_writeback_submit_ms = 0.0
+    legacy_next_plan_finalize_wait_ms = 0.0
+    legacy_next_plan_metrics = {}
 
     stage0_execution_mode = _run_stage0_schedule_interaction(
         storage_adapter=storage_adapter,
@@ -935,9 +994,26 @@ def clm_offload_train_one_batch(
 
         # Step 1: collect coarse block visibility for this camera batch.
         with torch.cuda.nvtx.range("Tide activation: current block culling"):
+            legacy_cull_start_ns = time.perf_counter_ns()
             _, current_camera_blocks = storage_adapter.get_visible_blocks_batch(
                 current_camera_ids
             )
+            legacy_block_cull_ms = (
+                time.perf_counter_ns() - legacy_cull_start_ns
+            ) / 1e6
+            legacy_block_cull_metrics = dict(
+                getattr(storage_adapter, "_batch_cull_metrics", {}) or {}
+            )
+            if legacy_metrics_writer is not None:
+                legacy_metrics_writer.write_timeline_event(
+                    name="block_cull_current",
+                    lane="cpu",
+                    start_ns=legacy_cull_start_ns,
+                    end_ns=time.perf_counter_ns(),
+                    iteration=iteration,
+                    timing_source="host_monotonic",
+                    detail="legacy_Kt_get_visible_blocks_batch",
+                )
             visible_block_ids_set = set()
             cam_to_blocks = {}  # Track per-camera block visibility
             for cam_global_idx in current_camera_ids:
@@ -1137,6 +1213,7 @@ def clm_offload_train_one_batch(
                         torch.cuda.nvtx.range_pop()
                         return [], list(range(len(batched_cameras))), 0.0
                 
+                legacy_load_start_ns = time.perf_counter_ns()
                 if is_paper_ssd_mode:
                     gpu_tensors, retention_stats, used_paper_prefetch_buffer, paper_ab_buffer_source = _load_paper_stage1_working_set(
                         gaussians=gaussians,
@@ -1166,6 +1243,20 @@ def clm_offload_train_one_batch(
                         enable_retention=enable_retention,
                         unified_params=gaussians._unified_params if (active_block_reader is None and use_fast_ram_ssd_path) else None,
                         block_reader=active_block_reader,
+                    )
+                legacy_resident_load_ms = (
+                    time.perf_counter_ns() - legacy_load_start_ns
+                ) / 1e6
+                legacy_retention_stats = dict(retention_stats or {})
+                if legacy_metrics_writer is not None:
+                    legacy_metrics_writer.write_timeline_event(
+                        name="resident_load",
+                        lane="cpu",
+                        start_ns=legacy_load_start_ns,
+                        end_ns=time.perf_counter_ns(),
+                        iteration=iteration,
+                        timing_source="host_monotonic",
+                        detail="legacy_resident_activation_or_sync_materialization",
                     )
                 
                 # Create nn.Parameters for training (gradients will accumulate here)
@@ -1429,6 +1520,11 @@ def clm_offload_train_one_batch(
                 inside = (cam0_pos >= xyz_min).all() and (cam0_pos <= xyz_max).all()
                 print(f"  Camera[0] inside Gaussian bounds: {inside}")
             
+            legacy_filter_range = _legacy_cuda_range(
+                "gaussian_projection_cull_ms",
+                name="legacy_gaussian_filter",
+                detail="calculate_filters_on_compact_resident_set",
+            )
             filters_compact, _, _ = calculate_filters(
                 batched_cameras,
                 xyz_compact,
@@ -1436,6 +1532,7 @@ def clm_offload_train_one_batch(
                 scaling_compact,
                 rotation_compact,
             )
+            _legacy_cuda_range_end(legacy_filter_range)
             
             # ====================================================================
             # Optional debug-frustum diagnostics after calculate_filters.
@@ -1521,6 +1618,11 @@ def clm_offload_train_one_batch(
 
             torch.cuda.nvtx.range_push("calculate_filters")
             # Filters: list of indices indicating which gaussians are visible per camera
+            legacy_filter_range = _legacy_cuda_range(
+                "gaussian_projection_cull_ms",
+                name="legacy_gaussian_filter",
+                detail="calculate_filters",
+            )
             filters, camera_ids, gaussian_ids = calculate_filters(
                 batched_cameras,
                 xyz_gpu,
@@ -1528,6 +1630,7 @@ def clm_offload_train_one_batch(
                 scaling_gpu_origin,
                 rotation_gpu_origin,
             )
+            _legacy_cuda_range_end(legacy_filter_range)
             del opacity_gpu_origin, scaling_gpu_origin, rotation_gpu_origin
             torch.cuda.nvtx.range_pop()
     
@@ -2243,6 +2346,11 @@ def clm_offload_train_one_batch(
         # 4.3: Forward pass - Render image with filtered gaussian parameters
         # ------------------------------------------------------------------------
         torch.cuda.nvtx.range_push("forward_pass")
+        legacy_forward_range = _legacy_cuda_range(
+            "gsplat_forward_ms",
+            name="gaussian_cull_forward",
+            detail="legacy_parameter_gather_render_and_loss",
+        )
         torch.cuda.nvtx.range_push("prepare filtered parameters")
 
         # ====================================================================
@@ -2306,6 +2414,7 @@ def clm_offload_train_one_batch(
         loss = torch_compiled_loss(
             rendered_image, batched_cameras[micro_idx].original_image
         )
+        _legacy_cuda_range_end(legacy_forward_range)
         torch.cuda.nvtx.range_pop()
 
         # ------------------------------------------------------------------------
@@ -2333,6 +2442,11 @@ def clm_offload_train_one_batch(
         # ====================================================================
         # SSD-backed path: one backward is enough; autograd handles gradients.
         # Archived split-feature path: two backward phases handle CPU SH features.
+        legacy_backward_range = _legacy_cuda_range(
+            "backward_ms",
+            name="backward",
+            detail="legacy_loss_backward_and_gradient_scatter",
+        )
         if gaussians.use_gpu_features:
             # SSD-backed path: simple single backward; autograd handles all gradients.
             loss.backward()
@@ -2517,6 +2631,8 @@ def clm_offload_train_one_batch(
         losses.append(loss.detach())
         del loss
 
+        _legacy_cuda_range_end(legacy_backward_range)
+
         # Mark completion of GPU computation for this micro-batch
         gpu2cpu_event = torch.cuda.Event(enable_timing=True)
         gpu2cpu_event.record(default_stream)
@@ -2698,6 +2814,7 @@ def clm_offload_train_one_batch(
 
     optimizer_updated_global_indices = None
     optimizer_updated_block_ids = None
+    optimizer_step_stats = {}
 
     assert microbatch_idx == bsz, f"microbatch_idx should be equal to bsz. Got {microbatch_idx} vs {bsz}"
 
@@ -2718,6 +2835,11 @@ def clm_offload_train_one_batch(
                 "Paper SSD release path only supports GPUResidentAdam. "
                 "Set --paper_optimizer_backend gpu_resident."
             )
+        legacy_optimizer_range = _legacy_cuda_range(
+            "optimizer_ms",
+            name="adam",
+            detail="legacy_gpu_resident_adam",
+        )
         optimizer_step_stats = _run_gpu_resident_adam_step(
             gaussians=gaussians,
             args=args,
@@ -2731,6 +2853,7 @@ def clm_offload_train_one_batch(
             log_prefix="[PAPER SSD MODE]",
             log_file=log_file,
         )
+        _legacy_cuda_range_end(legacy_optimizer_range)
         optimizer_updated_block_ids = optimizer_step_stats.get("updated_block_ids")
     else:
             # ================================================================
@@ -2872,11 +2995,15 @@ def clm_offload_train_one_batch(
                     double_buffer.mark_dirty_blocks(updated_block_ids)
 
                 with torch.cuda.nvtx.range("Tide writeback: stage block bounds"):
+                    legacy_bounds_refresh_start_ns = time.perf_counter_ns()
                     pending_bounds = gaussians.gpu_working_set_manager.stage_block_bounds(
                         updated_block_ids
                     )
                     if pending_bounds is not None:
                         storage_adapter.submit_bounds_refresh(pending_bounds)
+                    legacy_bounds_refresh_submit_ms = (
+                        time.perf_counter_ns() - legacy_bounds_refresh_start_ns
+                    ) / 1e6
             else:
                 updated_block_ids = _collect_updated_block_ids(
                     filters,
@@ -2894,7 +3021,39 @@ def clm_offload_train_one_batch(
                 if paper_plan_future is None:
                     raise RuntimeError("Tide resident plan was not submitted")
                 with torch.cuda.nvtx.range("Tide writeback: await resident plan"):
+                    legacy_next_plan_wait_start_ns = time.perf_counter_ns()
                     paper_plan_result = paper_plan_future.result()
+                    legacy_next_plan_finalize_wait_ms = (
+                        time.perf_counter_ns() - legacy_next_plan_wait_start_ns
+                    ) / 1e6
+                legacy_next_plan_metrics = dict(
+                    paper_plan_result.get("next_plan_metrics", {}) or {}
+                )
+                if legacy_metrics_writer is not None:
+                    target_iteration = legacy_next_plan_metrics.get(
+                        "next_plan_target_iteration"
+                    )
+                    next_plan_timeline = dict(
+                        paper_plan_result.get("next_plan_timeline", {}) or {}
+                    )
+                    for timeline_key, timeline_name in (
+                        ("cull", "next_plan_block_cull"),
+                        ("select", "next_plan_select"),
+                        ("hint_submit", "next_plan_hint_submit"),
+                        ("buffer_submit", "next_plan_buffer_submit"),
+                    ):
+                        interval = next_plan_timeline.get(timeline_key)
+                        if interval is None:
+                            continue
+                        legacy_metrics_writer.write_timeline_event(
+                            name=timeline_name,
+                            lane="cpu_background",
+                            start_ns=int(interval[0]),
+                            end_ns=int(interval[1]),
+                            iteration=iteration,
+                            target_iteration=target_iteration,
+                            timing_source="host_monotonic",
+                        )
                 with torch.cuda.nvtx.range("Tide writeback: publish resident plan"):
                     paper_block_sets = paper_plan_result["block_sets"]
                     gaussians._paper_expected_resident_blocks = list(
@@ -2949,6 +3108,7 @@ def clm_offload_train_one_batch(
 
                 keep_resident_blocks = list(paper_block_sets['keep_resident_blocks']) if paper_block_sets is not None else []
                 evicted_blocks = list(paper_block_sets['evict_blocks']) if paper_block_sets is not None else []
+                legacy_writeback_submit_start_ns = time.perf_counter_ns()
                 with torch.cuda.nvtx.range("Tide writeback: dirty eviction selection"):
                     writeback_block_ids = double_buffer.dirty_blocks_for_eviction(evicted_blocks)
                 with torch.cuda.nvtx.range("Tide writeback: stage eviction payload"):
@@ -2978,6 +3138,9 @@ def clm_offload_train_one_batch(
                         f"expected={len(writeback_block_ids)} staged={staged_writeback_blocks}"
                     )
                 double_buffer.mark_blocks_written_back(writeback_block_ids)
+                legacy_writeback_submit_ms = (
+                    time.perf_counter_ns() - legacy_writeback_submit_start_ns
+                ) / 1e6
 
                 if ready_omega > 0:
                     _log_delta_handoff(
@@ -3131,7 +3294,134 @@ def clm_offload_train_one_batch(
                 gpu_mem_percent = torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated() if torch.cuda.max_memory_allocated() > 0 else 0
                 if gpu_mem_percent > 0.9:
                     torch.cuda.empty_cache()
-    
+
+    # Keep legacy metrics in the same files and units as gaussian_sharded.
+    # Event timings are queued and resolved later, so this block never inserts
+    # a per-batch CUDA synchronization into the paper pipeline.
+    if legacy_metrics_writer is not None and legacy_metrics_collector is not None:
+        legacy_cache_after = storage_adapter.cache.get_stats()
+
+        def _legacy_cache_delta(name):
+            return float(legacy_cache_after.get(name, 0.0)) - float(
+                legacy_cache_before.get(name, 0.0)
+            )
+
+        h2d_events = legacy_retention_stats.get("h2d_events")
+        if h2d_events is not None:
+            legacy_gpu_ranges.setdefault("h2d_ms", []).append(
+                {
+                    "start": h2d_events[0],
+                    "end": h2d_events[1],
+                    "start_ns": legacy_retention_stats.get("h2d_submit_ns"),
+                    "name": "gaussian_materialize_h2d",
+                    "detail": "h2d_plus_gpu_unpack",
+                    "lane": "gpu",
+                }
+            )
+
+        current_loaded_blocks = list(
+            getattr(gaussians.gpu_working_set_manager, "loaded_blocks", []) or []
+        )
+        current_cull_output = int(
+            legacy_block_cull_metrics.get("block_cull_output_blocks", 0)
+        )
+        if current_cull_output == 0:
+            current_cull_output = sum(
+                len(blocks) for blocks in current_camera_blocks.values()
+            )
+
+        legacy_metrics_row = {
+            "iteration": iteration,
+            "local_cameras": bsz,
+            "global_active_blocks": len(visible_block_ids),
+            "global_resident_blocks": len(current_loaded_blocks),
+            "predicted_stream_in_blocks": 0,
+            "prediction_missing_blocks": 0,
+            "prediction_extra_blocks": 0,
+            "prediction_replanned": 0,
+            "prediction_repair_ms": 0.0,
+            "prediction_exact_plan_ms": 0.0,
+            "rank_active_blocks": len(visible_block_ids),
+            "rank_resident_blocks": len(current_loaded_blocks),
+            "cold_blocks": int(legacy_retention_stats.get("cold_count", 0)),
+            "retained_blocks": int(legacy_retention_stats.get("hotspot_count", 0)),
+            "gpu_slot_capacity_blocks": int(
+                legacy_retention_stats.get("gpu_slot_capacity_blocks", 0)
+            ),
+            "gpu_slot_growth_blocks": int(
+                legacy_retention_stats.get("gpu_slot_growth_blocks", 0)
+            ),
+            "touched_gaussians": int(optimizer_step_stats.get("touched_rows", 0)),
+            "block_cull_ms": legacy_block_cull_ms,
+            "block_cull_backend": str(
+                legacy_block_cull_metrics.get("block_cull_backend", "cpu")
+            ),
+            "block_cull_gpu_kernel_ms": float(
+                legacy_block_cull_metrics.get("block_cull_gpu_kernel_ms", 0.0)
+            ),
+            "block_cull_gpu_d2h_ms": float(
+                legacy_block_cull_metrics.get("block_cull_gpu_d2h_ms", 0.0)
+            ),
+            "block_cull_cache_hit_cameras": int(
+                legacy_block_cull_metrics.get("block_cull_cache_hit_cameras", 0)
+            ),
+            "block_cull_gpu_cameras": int(
+                legacy_block_cull_metrics.get("block_cull_gpu_cameras", 0)
+            ),
+            "block_cull_output_blocks": current_cull_output,
+            "plan_ms": float(legacy_next_plan_metrics.get("next_plan_select_ms", 0.0)),
+            "writeback_submit_ms": legacy_writeback_submit_ms,
+            "resident_load_ms": legacy_resident_load_ms,
+            "block_reader_foreground_ms": float(
+                legacy_retention_stats.get("foreground_read_ms", 0.0)
+            ),
+            "ssd_urgent_read_ms": _legacy_cache_delta("urgent_storage_read_time") * 1000.0,
+            "prefetch_inflight_wait_ms": _legacy_cache_delta("inflight_wait_time") * 1000.0,
+            "cpu_materialize_ms": float(
+                legacy_retention_stats.get("cpu_materialize_ms", 0.0)
+            ),
+            "ssd_urgent_read_blocks": _legacy_cache_delta("urgent_storage_read_blocks"),
+            "ssd_urgent_read_bytes": _legacy_cache_delta("ssd_bytes_read_urgent"),
+            "h2d_bytes": int(legacy_retention_stats.get("h2d_bytes", 0)),
+            "h2d_ms": 0.0,
+            "gsplat_forward_ms": 0.0,
+            "gaussian_projection_cull_ms": 0.0,
+            "backward_ms": 0.0,
+            "optimizer_ms": 0.0,
+            "train_ms": 0.0,
+            "bounds_sync_ms": 0.0,
+            "barrier_ms": 0.0,
+            "batch_total_ms": (time.perf_counter() - legacy_batch_start) * 1000.0,
+            "legacy_stage4_wall_ms": (
+                _perf_t["stage4_train_done"] - _perf_t["stage2_3_culling_done"]
+            ) * 1000.0,
+            "bounds_refresh_submit_ms": legacy_bounds_refresh_submit_ms,
+            "prefetch_buffer_wait_ms": float(
+                legacy_retention_stats.get("prefetch_buffer_wait_ms", 0.0)
+            ),
+            "next_plan_cull_ms": float(
+                legacy_next_plan_metrics.get("next_plan_cull_ms", 0.0)
+            ),
+            "next_plan_select_ms": float(
+                legacy_next_plan_metrics.get("next_plan_select_ms", 0.0)
+            ),
+            "next_plan_hint_submit_ms": float(
+                legacy_next_plan_metrics.get("next_plan_hint_submit_ms", 0.0)
+            ),
+            "next_plan_buffer_submit_ms": float(
+                legacy_next_plan_metrics.get("next_plan_buffer_submit_ms", 0.0)
+            ),
+            "next_plan_service_ms": float(
+                legacy_next_plan_metrics.get("next_plan_service_ms", 0.0)
+            ),
+            "next_plan_finalize_wait_ms": legacy_next_plan_finalize_wait_ms,
+            "next_plan_target_iteration": int(
+                legacy_next_plan_metrics.get("next_plan_target_iteration", 0)
+            ),
+        }
+        legacy_metrics_writer.write_io_events(storage_adapter.cache.drain_io_events())
+        legacy_metrics_collector.enqueue(legacy_metrics_row, legacy_gpu_ranges)
+
     # ============================================================================
     # [STATS] Log double buffer and prefetch statistics periodically
     # ============================================================================

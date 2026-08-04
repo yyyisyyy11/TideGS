@@ -815,8 +815,8 @@ def init_args(args):
 
     if getattr(args, "tide_distributed_mode", "off") == "gaussian_sharded":
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        assert world_size >= 1, (
-            "gaussian_sharded mode must be launched with torchrun and WORLD_SIZE >= 1"
+        assert world_size > 1, (
+            "gaussian_sharded mode must be launched with torchrun and WORLD_SIZE > 1"
         )
         assert int(args.bsz) % world_size == 0, (
             f"global --bsz={args.bsz} must be divisible by WORLD_SIZE={world_size}"

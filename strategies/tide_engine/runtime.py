@@ -7,6 +7,7 @@ It keeps release training constrained to the TideGS out-of-core configuration.
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -399,6 +400,7 @@ def plan_and_start_resident_prefetch(
     active_block_reader,
     double_buffer,
 ) -> Dict[str, object]:
+    plan_start_ns = time.perf_counter_ns()
     _, next_batch = get_current_and_next_camera_batches(
         training_schedule=training_schedule,
         iteration=iteration,
@@ -406,10 +408,14 @@ def plan_and_start_resident_prefetch(
         schedule_ordering=schedule_ordering,
     )
     next_camera_ids = list(next_batch.batch_indices)
+    target_iteration = int(iteration) + int(batch_size)
+    cull_start_ns = time.perf_counter_ns()
     with torch.cuda.nvtx.range("Tide N+1: coarse culling"):
         bounds_generation, next_camera_blocks = storage_adapter.get_visible_blocks_batch(
             next_camera_ids
         )
+    cull_end_ns = time.perf_counter_ns()
+    selection_start_ns = time.perf_counter_ns()
     with torch.cuda.nvtx.range("Tide N+1: resident selection"):
         block_sets = compute_paper_block_sets(
             storage_adapter=storage_adapter,
@@ -428,19 +434,23 @@ def plan_and_start_resident_prefetch(
             next_camera_ids_override=next_camera_ids,
             next_camera_blocks_override=next_camera_blocks,
         )
+    selection_end_ns = time.perf_counter_ns()
 
     stream_in_blocks = list(block_sets.get("stream_in_blocks", []))
     future_submitted = 0
+    hint_start_ns = time.perf_counter_ns()
     if active_block_reader is not None and stream_in_blocks:
         with torch.cuda.nvtx.range("Tide N+1: cache hint"):
             future_submitted = int(active_block_reader.hint_future(stream_in_blocks) or 0)
+    hint_end_ns = time.perf_counter_ns()
 
     prefetch_started = False
     next_resident_blocks = list(block_sets.get("next_resident_blocks", []))
+    buffer_submit_start_ns = time.perf_counter_ns()
     if active_block_reader is not None and next_resident_blocks:
         with torch.cuda.nvtx.range("Tide N+1: launch materialization"):
             double_buffer.start_prefetch(
-                iteration=iteration + batch_size,
+                iteration=target_iteration,
                 visible_block_ids=next_resident_blocks,
                 filters_global=[],
                 ram_cache={},
@@ -452,12 +462,30 @@ def plan_and_start_resident_prefetch(
                 before_target_reuse=storage_adapter.wait_for_pending_gpu_copies,
             )
         prefetch_started = True
+    buffer_submit_end_ns = time.perf_counter_ns()
+    plan_end_ns = time.perf_counter_ns()
 
     return {
         "block_sets": block_sets,
         "bounds_generation": bounds_generation,
         "future_submitted": future_submitted,
         "prefetch_started": prefetch_started,
+        "next_plan_metrics": {
+            "next_plan_target_iteration": target_iteration,
+            "next_plan_cull_ms": (cull_end_ns - cull_start_ns) / 1e6,
+            "next_plan_select_ms": (selection_end_ns - selection_start_ns) / 1e6,
+            "next_plan_hint_submit_ms": (hint_end_ns - hint_start_ns) / 1e6,
+            "next_plan_buffer_submit_ms": (
+                buffer_submit_end_ns - buffer_submit_start_ns
+            ) / 1e6,
+            "next_plan_service_ms": (plan_end_ns - plan_start_ns) / 1e6,
+        },
+        "next_plan_timeline": {
+            "cull": (cull_start_ns, cull_end_ns),
+            "select": (selection_start_ns, selection_end_ns),
+            "hint_submit": (hint_start_ns, hint_end_ns),
+            "buffer_submit": (buffer_submit_start_ns, buffer_submit_end_ns),
+        },
     }
 
 
@@ -1618,8 +1646,10 @@ def load_paper_stage1_working_set(
             block_size=args.gaussian_block_size,
             device="cuda",
         )
+        prefetch_wait_start_ns = time.perf_counter_ns()
         with torch.cuda.nvtx.range("Tide activation: wait N+1 preparation"):
             prefetch_ready = double_buffer.wait_for_prefetch(iteration)
+        prefetch_wait_ms = (time.perf_counter_ns() - prefetch_wait_start_ns) / 1e6
         if prefetch_ready:
             with torch.cuda.nvtx.range("Tide activation: persistent slot update"):
                 double_buffer.swap_buffers()
@@ -1631,6 +1661,8 @@ def load_paper_stage1_working_set(
                 )
             used_prefetch_buffer = True
             load_source = "prefetched_ab_buffer"
+            retention_stats = dict(retention_stats or {})
+            retention_stats["prefetch_buffer_wait_ms"] = prefetch_wait_ms
             gaussians._paper_ab_runtime_stats["prefetch_hits"] += 1
             if should_log:
                 log_ab_buffer_activation(
@@ -1720,6 +1752,8 @@ def load_paper_stage1_working_set(
         )
     if load_source is None:
         load_source = "sync_ram_to_gpu"
+    retention_stats = dict(retention_stats or {})
+    retention_stats.setdefault("prefetch_buffer_wait_ms", prefetch_wait_ms if training_schedule is not None else 0.0)
     return gpu_tensors, retention_stats, used_prefetch_buffer, load_source
 
 
