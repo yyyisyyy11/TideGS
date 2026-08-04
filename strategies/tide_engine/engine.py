@@ -858,6 +858,10 @@ def clm_offload_train_one_batch(
             gaussians, legacy_context
         )
         legacy_metrics_collector.flush_ready()
+        # TieredCache tags foreground urgent reads with this value.  The
+        # gaussian-sharded engine already does this before resident loading;
+        # keep the legacy metrics path semantically identical.
+        storage_adapter.cache.set_foreground_iteration(iteration)
         legacy_cache_before = storage_adapter.cache.get_stats()
 
     def _legacy_cuda_range(field, *, name, detail=None):
@@ -3419,7 +3423,17 @@ def clm_offload_train_one_batch(
                 legacy_next_plan_metrics.get("next_plan_target_iteration", 0)
             ),
         }
-        legacy_metrics_writer.write_io_events(storage_adapter.cache.drain_io_events())
+        legacy_io_events = storage_adapter.cache.drain_io_events()
+        for legacy_io_event in legacy_io_events:
+            if (
+                legacy_io_event.get("operation") == "ssd_read_urgent"
+                and legacy_io_event.get("target_iteration") is None
+            ):
+                # Events emitted before the foreground tag was introduced are
+                # necessarily foreground reads for this legacy batch.
+                legacy_io_event["target_iteration"] = iteration
+                legacy_io_event.setdefault("origin_iteration", iteration)
+        legacy_metrics_writer.write_io_events(legacy_io_events)
         legacy_metrics_collector.enqueue(legacy_metrics_row, legacy_gpu_ranges)
 
     # ============================================================================
