@@ -184,6 +184,67 @@ class DistributedMetricsTest(unittest.TestCase):
             self.assertEqual(events[1]["lane"], "ssd")
             self.assertEqual(events[1]["thread_id"], 99)
 
+    def test_memory_points_are_rank_local_and_detailed_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = DistributedMetricsWriter(
+                args=SimpleNamespace(
+                    log_folder=directory,
+                    tide_detailed_metrics=True,
+                ),
+                context=_SingleRankContext(),
+            )
+            writer.write_memory_point(
+                iteration=65,
+                phase="after_backward",
+                microbatch_index=2,
+                microbatch_count=4,
+                camera_uids=[17, 23],
+                active_gaussians=1234,
+                rank_active_blocks=12,
+                rank_resident_blocks=18,
+                gpu_slot_capacity_blocks=32,
+                cuda_allocated_bytes=100,
+                cuda_reserved_bytes=200,
+                cuda_peak_allocated_bytes=300,
+                cuda_peak_reserved_bytes=400,
+                cuda_free_bytes=500,
+                cuda_total_bytes=600,
+            )
+            with open(
+                Path(directory) / "timeline_events_rank0.jsonl",
+                encoding="utf-8",
+            ) as handle:
+                events = [json.loads(line) for line in handle]
+
+            self.assertEqual(len(events), 1)
+            event = events[0]
+            self.assertEqual(event["name"], "cuda_memory_point")
+            self.assertEqual(event["lane"], "gpu")
+            self.assertEqual(event["duration_ns"], 0)
+            self.assertEqual(event["phase"], "after_backward")
+            self.assertEqual(event["microbatch_index"], 2)
+            self.assertEqual(event["microbatch_count"], 4)
+            self.assertEqual(event["camera_uids"], [17, 23])
+            self.assertEqual(event["cuda_peak_allocated_bytes"], 300)
+
+            disabled_writer = DistributedMetricsWriter(
+                args=SimpleNamespace(
+                    log_folder=directory,
+                    tide_detailed_metrics=False,
+                ),
+                context=_SingleRankContext(),
+            )
+            disabled_writer.write_memory_point(
+                iteration=65,
+                phase="batch_start",
+                cuda_allocated_bytes=1,
+            )
+            with open(
+                Path(directory) / "timeline_events_rank0.jsonl",
+                encoding="utf-8",
+            ) as handle:
+                self.assertEqual(len(list(handle)), 1)
+
     def test_async_io_uses_causal_iteration_and_global_aggregation(self):
         with tempfile.TemporaryDirectory() as directory:
             writer = DistributedMetricsWriter(

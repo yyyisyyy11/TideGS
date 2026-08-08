@@ -438,12 +438,16 @@ def _build_updated_blocks_dict_from_gpu(
     total_n_gaussians: int,
     block_size: int,
     gpu_working_set_manager,
+    origin_iteration: Optional[int] = None,
 ):
     """Start a pinned, batched D2H writeback for the updated resident blocks."""
     if gpu_working_set_manager is None or not updated_block_ids:
         return {}
     _ = total_n_gaussians, block_size
-    pending = gpu_working_set_manager.stage_updated_blocks(updated_block_ids)
+    pending = gpu_working_set_manager.stage_updated_blocks(
+        updated_block_ids,
+        origin_iteration=origin_iteration,
+    )
     return pending if pending is not None else {}
 
 
@@ -3433,6 +3437,14 @@ def clm_offload_train_one_batch(
                 # necessarily foreground reads for this legacy batch.
                 legacy_io_event["target_iteration"] = iteration
                 legacy_io_event.setdefault("origin_iteration", iteration)
+            if (
+                legacy_io_event.get("operation")
+                in {"gpu_d2h", "cpu_cache_commit", "ssd_write_async", "ssd_write_sync"}
+                and legacy_io_event.get("origin_iteration") is None
+            ):
+                # Compatibility path for writeback jobs emitted before origin
+                # propagation was added.  New payloads carry this at source.
+                legacy_io_event["origin_iteration"] = iteration
         legacy_metrics_writer.write_io_events(legacy_io_events)
         legacy_metrics_collector.enqueue(legacy_metrics_row, legacy_gpu_ranges)
 

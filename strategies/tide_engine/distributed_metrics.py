@@ -7,6 +7,7 @@ import json
 import os
 import socket
 import threading
+import time
 from pathlib import Path
 from typing import Dict, Iterable, List
 
@@ -334,6 +335,43 @@ class DistributedMetricsWriter:
             self.timeline_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.timeline_path, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(event, sort_keys=True) + "\n")
+
+    def write_memory_point(
+        self,
+        *,
+        iteration: int,
+        phase: str,
+        microbatch_index: int | None = None,
+        microbatch_count: int | None = None,
+        camera_uids: Iterable[int] | None = None,
+        **fields,
+    ) -> None:
+        """Append a zero-duration CUDA allocator snapshot to the rank timeline.
+
+        Memory points intentionally remain rank-local JSONL events: they are
+        useful when a rank OOMs before the collective batch metric can be
+        emitted, and do not belong on the global critical-path timeline.
+        """
+        if not self.enabled:
+            return
+        self.write_timeline_event(
+            name="cuda_memory_point",
+            lane="gpu",
+            start_ns=time.perf_counter_ns(),
+            iteration=int(iteration),
+            timing_source="cuda_allocator_snapshot",
+            phase=str(phase),
+            microbatch_index=(
+                None if microbatch_index is None else int(microbatch_index)
+            ),
+            microbatch_count=(
+                None if microbatch_count is None else int(microbatch_count)
+            ),
+            camera_uids=(
+                [] if camera_uids is None else [int(value) for value in camera_uids]
+            ),
+            **fields,
+        )
 
     def write_io_events(self, events: Iterable[Dict[str, object]]) -> None:
         if not self.enabled:

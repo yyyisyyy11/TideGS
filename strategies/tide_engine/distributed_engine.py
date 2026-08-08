@@ -18,7 +18,11 @@ from utils.distributed import DistributedContext
 from .distributed_plan import DistributedBatchPlan
 from .distributed_metrics import get_distributed_metrics_writer
 from .engine import get_gpu_resident_optimizer
-from .gsplat_backend import distributed_rasterize, projection_elapsed_ms
+from .gsplat_backend import (
+    PROJECTION_TIMING_FIX,
+    distributed_rasterize,
+    projection_elapsed_ms,
+)
 
 
 @dataclass
@@ -232,10 +236,13 @@ def _active_leaves(gaussians, active_local_ids: torch.Tensor) -> Dict[str, torch
     }
 
 
-def _touched_active_ids(meta_values: Sequence[Dict], active_count: int, device) -> torch.Tensor:
+def _touched_active_ids(
+    gaussian_id_values: Sequence[torch.Tensor],
+    active_count: int,
+    device,
+) -> torch.Tensor:
     ids = []
-    for meta in meta_values:
-        gaussian_ids = meta.get("gaussian_ids")
+    for gaussian_ids in gaussian_id_values:
         if gaussian_ids is not None and gaussian_ids.numel() > 0:
             ids.append(gaussian_ids.detach().to(device=device, dtype=torch.long))
     if not ids:
@@ -284,6 +291,10 @@ def train_distributed_tide_batch(
     local_counts = context.all_gather_object(len(batched_cameras))
     if len(set(int(value) for value in local_counts)) != 1:
         raise RuntimeError(f"Distributed gsplat requires equal camera counts, got {local_counts}")
+    if timeline_enabled:
+        # A batch-level reset makes the microbatch probes comparable while
+        # leaving the allocator state and execution streams untouched.
+        torch.cuda.reset_peak_memory_stats()
 
     manager = gaussians.gpu_working_set_manager
     cache = storage_adapter.cache
@@ -329,53 +340,183 @@ def train_distributed_tide_batch(
             f"iteration={iteration} active_counts={active_counts}"
         )
     leaves = _active_leaves(gaussians, active_local_ids)
-    scales = gaussians.scaling_activation(leaves["scaling"])
-    rotations = gaussians.rotation_activation(leaves["rotation"])
-    opacities = gaussians.opacity_activation(leaves["opacity"]).squeeze(-1)
-    sh_coefficients = torch.cat(
-        [leaves["features_dc"], leaves["features_rest"]], dim=1
-    ).reshape(-1, 16, 3)
-
     image_width = int(utils.get_img_width())
     image_height = int(utils.get_img_height())
     microbatch = int(getattr(args, "tide_camera_microbatch", len(batched_cameras)))
-    losses = []
-    metas = []
-    forward_submit_ns = time.perf_counter_ns() if timeline_enabled else None
-    forward_start = torch.cuda.Event(enable_timing=True)
-    forward_end = torch.cuda.Event(enable_timing=True)
-    forward_start.record()
-    for start in range(0, len(batched_cameras), microbatch):
-        cameras = batched_cameras[start:start + microbatch]
-        rendered, _, meta = distributed_rasterize(
-            means=leaves["xyz"],
-            quats=rotations,
-            scales=scales,
-            opacities=opacities,
-            sh_coefficients=sh_coefficients,
-            cameras=cameras,
-            width=image_width,
-            height=image_height,
-            sh_degree=gaussians.active_sh_degree,
-            background=background,
-            radius_clip=float(getattr(args, "radius_clip", 0.0)),
+    microbatch_count = (len(batched_cameras) + microbatch - 1) // microbatch
+    detached_losses = []
+    touched_gaussian_ids = []
+    projection_event_pairs = []
+    forward_ranges = []
+    backward_ranges = []
+    probe_device = leaves["xyz"].device
+    slot_capacity_blocks = int(
+        retention_stats.get("gpu_slot_capacity_blocks", 0)
+    )
+
+    def camera_uids(cameras) -> List[int]:
+        if cameras is None:
+            return []
+        return [
+            int(getattr(camera, "uid", getattr(camera, "global_idx", -1)))
+            for camera in cameras
+        ]
+
+    def write_memory_point(
+        *,
+        phase: str,
+        microbatch_index: int | None = None,
+        cameras=None,
+        error: BaseException | None = None,
+    ) -> None:
+        if not timeline_enabled:
+            return
+        point = {
+            "active_gaussians": int(active_local_ids.numel()),
+            "rank_active_blocks": int(len(active_blocks)),
+            "rank_resident_blocks": int(len(target_resident)),
+            "gpu_slot_capacity_blocks": slot_capacity_blocks,
+        }
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(probe_device)
+            point.update(
+                {
+                    "cuda_allocated_bytes": int(
+                        torch.cuda.memory_allocated(probe_device)
+                    ),
+                    "cuda_reserved_bytes": int(
+                        torch.cuda.memory_reserved(probe_device)
+                    ),
+                    "cuda_peak_allocated_bytes": int(
+                        torch.cuda.max_memory_allocated(probe_device)
+                    ),
+                    "cuda_peak_reserved_bytes": int(
+                        torch.cuda.max_memory_reserved(probe_device)
+                    ),
+                    "cuda_free_bytes": int(free_bytes),
+                    "cuda_total_bytes": int(total_bytes),
+                }
+            )
+        except Exception as snapshot_error:
+            # Never hide the original CUDA OOM because a diagnostic query
+            # itself failed after the allocator entered an error state.
+            point["snapshot_error"] = (
+                f"{type(snapshot_error).__name__}: {snapshot_error}"
+            )
+        if error is not None:
+            point["status"] = "oom"
+            point["error_type"] = type(error).__name__
+            point["error_message"] = str(error)
+        metrics_writer.write_memory_point(
+            iteration=iteration,
+            phase=phase,
+            microbatch_index=microbatch_index,
+            microbatch_count=microbatch_count,
+            camera_uids=camera_uids(cameras),
+            **point,
         )
-        metas.append(meta)
-        for local_index, camera in enumerate(cameras):
-            image = rendered[local_index].permute(2, 0, 1).contiguous()
-            losses.append(torch_compiled_loss(image, camera.original_image))
-    forward_end.record()
 
-    if not losses:
+    write_memory_point(phase="batch_start")
+    for microbatch_index, start in enumerate(
+        range(0, len(batched_cameras), microbatch)
+    ):
+        cameras = batched_cameras[start:start + microbatch]
+        try:
+            write_memory_point(
+                phase="before_forward",
+                microbatch_index=microbatch_index,
+                cameras=cameras,
+            )
+            # Recompute every non-leaf transform for this microbatch.  This
+            # lets backward free its graph without retain_graph=True while
+            # gradients accumulate into the shared leaf tensors.
+            scales = gaussians.scaling_activation(leaves["scaling"])
+            rotations = gaussians.rotation_activation(leaves["rotation"])
+            opacities = gaussians.opacity_activation(leaves["opacity"]).squeeze(-1)
+            sh_coefficients = torch.cat(
+                [leaves["features_dc"], leaves["features_rest"]], dim=1
+            ).reshape(-1, 16, 3)
+
+            forward_submit_ns = time.perf_counter_ns() if timeline_enabled else None
+            forward_start = torch.cuda.Event(enable_timing=True)
+            forward_end = torch.cuda.Event(enable_timing=True)
+            forward_start.record()
+            rendered, _, meta = distributed_rasterize(
+                means=leaves["xyz"],
+                quats=rotations,
+                scales=scales,
+                opacities=opacities,
+                sh_coefficients=sh_coefficients,
+                cameras=cameras,
+                width=image_width,
+                height=image_height,
+                sh_degree=gaussians.active_sh_degree,
+                background=background,
+                radius_clip=float(getattr(args, "radius_clip", 0.0)),
+            )
+            micro_losses = []
+            for local_index, camera in enumerate(cameras):
+                image = rendered[local_index].permute(2, 0, 1).contiguous()
+                micro_losses.append(torch_compiled_loss(image, camera.original_image))
+            forward_end.record()
+            forward_ranges.append(
+                (forward_start, forward_end, forward_submit_ns, cameras)
+            )
+
+            gaussian_ids = meta.get("gaussian_ids")
+            if gaussian_ids is not None:
+                touched_gaussian_ids.append(gaussian_ids.detach())
+            projection_events = meta.get(PROJECTION_TIMING_FIX)
+            if projection_events is not None:
+                projection_event_pairs.append(projection_events)
+            detached_losses.extend(loss.detach() for loss in micro_losses)
+            write_memory_point(
+                phase="after_forward",
+                microbatch_index=microbatch_index,
+                cameras=cameras,
+            )
+
+            backward_submit_ns = time.perf_counter_ns() if timeline_enabled else None
+            backward_start = torch.cuda.Event(enable_timing=True)
+            backward_end = torch.cuda.Event(enable_timing=True)
+            backward_start.record()
+            torch.stack(micro_losses).sum().backward()
+            backward_end.record()
+            backward_ranges.append(
+                (backward_start, backward_end, backward_submit_ns, cameras)
+            )
+            write_memory_point(
+                phase="after_backward",
+                microbatch_index=microbatch_index,
+                cameras=cameras,
+            )
+            del (
+                rendered,
+                meta,
+                image,
+                micro_losses,
+                scales,
+                rotations,
+                opacities,
+                sh_coefficients,
+            )
+        except torch.OutOfMemoryError as error:
+            write_memory_point(
+                phase="oom",
+                microbatch_index=microbatch_index,
+                cameras=cameras,
+                error=error,
+            )
+            raise
+
+    if not detached_losses:
         raise RuntimeError("Distributed TideGS produced no local losses")
-    backward_submit_ns = time.perf_counter_ns() if timeline_enabled else None
-    backward_start = torch.cuda.Event(enable_timing=True)
-    backward_end = torch.cuda.Event(enable_timing=True)
-    backward_start.record()
-    torch.stack(losses).sum().backward()
-    backward_end.record()
 
-    touched_active = _touched_active_ids(metas, active_local_ids.numel(), active_local_ids.device)
+    touched_active = _touched_active_ids(
+        touched_gaussian_ids,
+        active_local_ids.numel(),
+        active_local_ids.device,
+    )
     touched_local = active_local_ids.index_select(0, touched_active)
     sparse_grad_components = {}
     for name, leaf in leaves.items():
@@ -428,9 +569,18 @@ def train_distributed_tide_batch(
     ssd_urgent_read_ms = cache_delta("urgent_storage_read_time") * 1000.0
     prefetch_inflight_wait_ms = cache_delta("inflight_wait_time") * 1000.0
 
-    projection_ms = sum(projection_elapsed_ms(meta) for meta in metas)
-    forward_ms = float(forward_start.elapsed_time(forward_end))
-    backward_ms = float(backward_start.elapsed_time(backward_end))
+    projection_ms = sum(
+        projection_elapsed_ms({PROJECTION_TIMING_FIX: events})
+        for events in projection_event_pairs
+    )
+    forward_range_ms = [
+        float(start.elapsed_time(end)) for start, end, _, _ in forward_ranges
+    ]
+    backward_range_ms = [
+        float(start.elapsed_time(end)) for start, end, _, _ in backward_ranges
+    ]
+    forward_ms = sum(forward_range_ms)
+    backward_ms = sum(backward_range_ms)
     optimizer_ms = float(optimizer_start.elapsed_time(optimizer_end))
     h2d_submit_ns = retention_stats.get("h2d_submit_ns")
     if timeline_enabled and h2d_submit_ns is not None:
@@ -445,20 +595,45 @@ def train_distributed_tide_batch(
             detail="h2d_plus_gpu_unpack",
         )
     if timeline_enabled:
-        for name, submit_ns, duration_ms, detail in (
-            ("gaussian_cull_forward", forward_submit_ns, forward_ms, "includes_projection_cull"),
-            ("backward", backward_submit_ns, backward_ms, None),
-            ("adam", optimizer_submit_ns, optimizer_ms, None),
-        ):
+        for microbatch_index, (
+            (_, _, submit_ns, cameras),
+            duration_ms,
+        ) in enumerate(zip(forward_ranges, forward_range_ms)):
             metrics_writer.write_timeline_event(
-                name=name,
+                name="gaussian_cull_forward",
                 lane="gpu",
                 start_ns=submit_ns,
                 end_ns=submit_ns + round(duration_ms * 1e6),
                 iteration=iteration,
                 timing_source="host_submit_plus_cuda_event",
-                detail=detail,
+                detail="includes_projection_cull",
+                microbatch_index=microbatch_index,
+                microbatch_count=microbatch_count,
+                camera_uids=camera_uids(cameras),
             )
+        for microbatch_index, (
+            (_, _, submit_ns, cameras),
+            duration_ms,
+        ) in enumerate(zip(backward_ranges, backward_range_ms)):
+            metrics_writer.write_timeline_event(
+                name="backward",
+                lane="gpu",
+                start_ns=submit_ns,
+                end_ns=submit_ns + round(duration_ms * 1e6),
+                iteration=iteration,
+                timing_source="host_submit_plus_cuda_event",
+                microbatch_index=microbatch_index,
+                microbatch_count=microbatch_count,
+                camera_uids=camera_uids(cameras),
+            )
+        metrics_writer.write_timeline_event(
+            name="adam",
+            lane="gpu",
+            start_ns=optimizer_submit_ns,
+            end_ns=optimizer_submit_ns + round(optimizer_ms * 1e6),
+            iteration=iteration,
+            timing_source="host_submit_plus_cuda_event",
+        )
     metrics_row = {
         "iteration": iteration,
         "local_cameras": len(batched_cameras),
@@ -524,5 +699,4 @@ def train_distributed_tide_batch(
         "resident_blocks": len(target_resident),
         "active_blocks": len(active_blocks),
     }
-    detached_losses = [loss.detach() for loss in losses]
     return detached_losses, list(range(len(batched_cameras))), float(active_local_ids.numel())

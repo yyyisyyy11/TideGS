@@ -1408,7 +1408,7 @@ def apply_paper_writeback_payload(
     materialize_updated_blocks_from_cpu_views_fn: Callable,
     get_double_buffer_gpu_fn: Callable,
 ) -> Tuple[int, int, int, int]:
-    _ = payload_iteration, current_iteration
+    _ = current_iteration
 
     use_direct_gpu_path = (
         original_xyz is None
@@ -1445,6 +1445,7 @@ def apply_paper_writeback_payload(
                 total_n_gaussians=total_n_gaussians,
                 block_size=args.gaussian_block_size,
                 gpu_working_set_manager=gpu_working_set_manager,
+                origin_iteration=payload_iteration,
             )
     else:
         if gpu_working_set_manager is not None and len(updated_block_ids) > 0:
