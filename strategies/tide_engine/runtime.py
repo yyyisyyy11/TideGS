@@ -6,6 +6,7 @@ It keeps release training constrained to the TideGS out-of-core configuration.
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -690,6 +691,96 @@ def log_batch_kt_metrics(
         f"resident_blocks={int(metrics['resident_blocks'])} "
         f"resident_intersection={int(metrics['resident_intersection'])} "
         f"resident_coverage={metrics['resident_coverage']:.4f}\n",
+        log_file=log_file,
+    )
+
+
+def log_paper_gaussian_projection_metrics(
+    *,
+    iteration: int,
+    num_cameras: int,
+    resident_gaussians: int,
+    camera_ids: torch.Tensor,
+    gaussian_ids: torch.Tensor,
+    log_file=None,
+) -> None:
+    """Log exact camera--Gaussian projection incidence for one resident batch.
+
+    ``calculate_filters(..., packed=True)`` emits one pair for every Gaussian
+    that survives projection culling in one camera.  The statistics here are
+    therefore computed *after* resident-set truncation, not from coarse K_t
+    block visibility.
+    """
+    if num_cameras <= 0:
+        return
+    if camera_ids.numel() != gaussian_ids.numel():
+        raise RuntimeError(
+            "Packed projection camera_ids and gaussian_ids must have the same length"
+        )
+
+    projection_pairs = int(gaussian_ids.numel())
+    image_counts = torch.bincount(camera_ids, minlength=num_cameras)
+
+    if projection_pairs == 0:
+        write_paper_phase1_log(
+            f"[PAPER GAUSSIAN PROJECTION METRICS] Iter {iteration}: "
+            f"cameras={num_cameras} resident_gaussians={resident_gaussians} "
+            "projection_pairs=0 projected_gaussians=0 "
+            "gaussian_views_mean=0.000 gaussian_views_p50=0 gaussian_views_p95=0 "
+            "gaussian_multiview_fraction=0.000 image_gaussians_mean=0.000 "
+            "image_gaussians_p50=0 image_gaussians_p95=0 "
+            "image_gaussians_min=0 image_gaussians_max=0 gaussian_view_hist=empty\n",
+            log_file=log_file,
+        )
+        return
+
+    # Gaussian ids are compact local ids in [0, resident_gaussians).  A
+    # bincount is considerably lighter than sorting all projection pairs with
+    # torch.unique on a billion-Gaussian run.
+    per_gaussian_views = torch.bincount(
+        gaussian_ids, minlength=resident_gaussians
+    )
+    gaussian_view_hist = torch.bincount(
+        per_gaussian_views, minlength=num_cameras + 1
+    )
+    projected_gaussians = resident_gaussians - int(gaussian_view_hist[0].item())
+
+    def _quantile(values: torch.Tensor, quantile: float) -> int:
+        ordered = torch.sort(values).values
+        index = min(
+            int(math.ceil(float(quantile) * int(ordered.numel()))) - 1,
+            int(ordered.numel()) - 1,
+        )
+        return int(ordered[max(index, 0)].item())
+
+    def _positive_hist_quantile(quantile: float) -> int:
+        cumulative = torch.cumsum(gaussian_view_hist[1:], dim=0)
+        rank = max(1, int(math.ceil(float(quantile) * projected_gaussians)))
+        return int(torch.nonzero(cumulative >= rank, as_tuple=False)[0].item()) + 1
+
+    view_hist_values = gaussian_view_hist.cpu().tolist()
+    view_hist = ";".join(
+        f"{views}:{count}"
+        for views, count in enumerate(view_hist_values[1:], start=1)
+        if count > 0
+    )
+    multiview_fraction = float(sum(view_hist_values[2:])) / float(projected_gaussians)
+    image_mean = float(projection_pairs) / float(num_cameras)
+    gaussian_view_mean = float(projection_pairs) / float(projected_gaussians)
+    write_paper_phase1_log(
+        f"[PAPER GAUSSIAN PROJECTION METRICS] Iter {iteration}: "
+        f"cameras={num_cameras} resident_gaussians={resident_gaussians} "
+        f"projection_pairs={projection_pairs} projected_gaussians={projected_gaussians} "
+        f"gaussian_views_mean={gaussian_view_mean:.3f} "
+        f"gaussian_views_p50={_positive_hist_quantile(0.50)} "
+        f"gaussian_views_p95={_positive_hist_quantile(0.95)} "
+        f"gaussian_multiview_fraction={multiview_fraction:.3f} "
+        f"image_gaussians_mean={image_mean:.3f} "
+        f"image_gaussians_p50={_quantile(image_counts, 0.50)} "
+        f"image_gaussians_p95={_quantile(image_counts, 0.95)} "
+        f"image_gaussians_min={int(image_counts.min().item())} "
+        f"image_gaussians_max={int(image_counts.max().item())} "
+        f"gaussian_view_hist={view_hist}\n",
         log_file=log_file,
     )
 

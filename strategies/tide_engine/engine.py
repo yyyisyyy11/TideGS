@@ -159,6 +159,7 @@ from strategies.tide_engine.runtime import (
     log_empty_paper_projection_cameras as _log_empty_paper_projection_cameras,
     log_empty_stage2_loaded_gaussians as _log_empty_stage2_loaded_gaussians,
     log_filters_local_reordered as _log_filters_local_reordered,
+    log_paper_gaussian_projection_metrics as _log_paper_gaussian_projection_metrics,
     log_paper_block_sets as _log_paper_block_sets,
     log_paper_batch_debug as _log_paper_batch_debug,
     log_paper_block_visibility_debug as _log_paper_block_visibility_debug,
@@ -1533,7 +1534,7 @@ def clm_offload_train_one_batch(
                 name="legacy_gaussian_filter",
                 detail="calculate_filters_on_compact_resident_set",
             )
-            filters_compact, _, _ = calculate_filters(
+            filters_compact, projection_camera_ids, projection_gaussian_ids = calculate_filters(
                 batched_cameras,
                 xyz_compact,
                 opacity_compact,
@@ -1541,6 +1542,16 @@ def clm_offload_train_one_batch(
                 rotation_compact,
             )
             _legacy_cuda_range_end(legacy_filter_range)
+
+            if should_log_paper_sets:
+                _log_paper_gaussian_projection_metrics(
+                    iteration=iteration,
+                    num_cameras=len(batched_cameras),
+                    resident_gaussians=num_loaded,
+                    camera_ids=projection_camera_ids,
+                    gaussian_ids=projection_gaussian_ids,
+                    log_file=log_file,
+                )
             
             # ====================================================================
             # Optional debug-frustum diagnostics after calculate_filters.
@@ -1612,6 +1623,8 @@ def clm_offload_train_one_batch(
 
             camera_ids = None
             gaussian_ids = None
+            projection_camera_ids = None
+            projection_gaussian_ids = None
 
             # Cleanup - but keep filters_compact info in filters_local
             del xyz_compact, opacity_compact, scaling_compact, rotation_compact, filters_compact
