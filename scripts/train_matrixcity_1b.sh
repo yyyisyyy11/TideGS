@@ -44,6 +44,16 @@ CHECKPOINT_KEEP_LAST=2
 MAX_PATCH_FILES=32
 MAX_PATCH_GB=64
 MIN_FREE_GB=64
+OPTIMIZER_ALGORITHM="${OPTIMIZER_ALGORITHM:-adam}"
+SOPHIA_BETA1="${SOPHIA_BETA1:-0.9}"
+SOPHIA_BETA2="${SOPHIA_BETA2:-0.999}"
+SOPHIA_CURVATURE_INTERVAL="${SOPHIA_CURVATURE_INTERVAL:-10}"
+SOPHIA_HUTCHINSON_SAMPLES="${SOPHIA_HUTCHINSON_SAMPLES:-1}"
+SOPHIA_CURVATURE_SEED="${SOPHIA_CURVATURE_SEED:-1}"
+SOPHIA_GAMMA="${SOPHIA_GAMMA:-1.0}"
+SOPHIA_EPSILON="${SOPHIA_EPSILON:-1e-15}"
+TR_EPSILON_INIT="${TR_EPSILON_INIT:-1e-6}"
+TR_EPSILON_FINAL="${TR_EPSILON_FINAL:-1e-8}"
 COMPACTION_INTERVAL=5000
 COMPACTION_TARGET_PATCHES=8
 COMPACTION_RANK_CONCURRENCY=2
@@ -55,6 +65,7 @@ BALANCED_SEED_FRACTION_LIST="0.25"
 BSZ_LIST="16"
 CAPACITY_LIST="2048"
 CHECKPOINT_ITER=500
+CHECKPOINT_ITER_SET=0
 RESUME_TO_ITER=1000
 START_CHECKPOINT=""
 DISTRIBUTED_MODE="${DISTRIBUTED_MODE:-off}"
@@ -104,6 +115,16 @@ Options:
   --max-patch-files N         Compact at this active patch count (default: ${MAX_PATCH_FILES})
   --max-patch-gb N            Compact at this stale patch size in GiB (default: ${MAX_PATCH_GB})
   --min-free-gb N             Refuse writes that consume this free-space reserve (default: ${MIN_FREE_GB})
+  --optimizer NAME            adam|3dgs2_tr (default: ${OPTIMIZER_ALGORITHM})
+  --sophia-beta1 VALUE        Gradient EMA beta (default: ${SOPHIA_BETA1})
+  --sophia-beta2 VALUE        Curvature EMA beta (default: ${SOPHIA_BETA2})
+  --curvature-interval N      Curvature update interval in optimizer steps (default: ${SOPHIA_CURVATURE_INTERVAL})
+  --hutchinson-samples N      Rademacher probes per S2 sample (default: ${SOPHIA_HUTCHINSON_SAMPLES})
+  --curvature-seed N          Independent S2/probe base seed (default: ${SOPHIA_CURVATURE_SEED})
+  --sophia-gamma VALUE        Sophia proposal multiplier (default: ${SOPHIA_GAMMA})
+  --sophia-epsilon VALUE      Sophia denominator epsilon (default: ${SOPHIA_EPSILON})
+  --tr-epsilon-init VALUE     Initial Hellinger trust radius (default: ${TR_EPSILON_INIT})
+  --tr-epsilon-final VALUE    Final Hellinger trust radius (default: ${TR_EPSILON_FINAL})
   --compaction-interval N      Periodic compaction interval; 0 disables it (default: ${COMPACTION_INTERVAL})
   --compaction-target-patches N
                               Per-rank patch low watermark (default: ${COMPACTION_TARGET_PATCHES})
@@ -120,7 +141,7 @@ Options:
   --resident-decay-list "LIST"  resident recency decay values for sweeps (default: "${RESIDENT_DECAY_LIST}")
   --balanced-seed-fraction-list "LIST"
                               topc_balanced seed-capacity fractions (default: "${BALANCED_SEED_FRACTION_LIST}")
-  --checkpoint-iter N         Checkpoint iteration for checkpoint mode (default: ${CHECKPOINT_ITER})
+  --checkpoint-iter N         Checkpoint iteration; applies to train/resume when explicitly set
   --resume-to-iter N          Final iteration for resume mode (default: ${RESUME_TO_ITER})
   --start-checkpoint DIR      Checkpoint dir for resume mode
   --debug-logging             Enable detailed TideGS runtime logs while keeping terminal quiet
@@ -132,7 +153,9 @@ Environment overrides:
   PYTHON_BIN, GPU, GPUS, DISTRIBUTED_MODE, CAMERA_ASSIGNMENT, DETAILED_METRICS,
   CAMERA_MICROBATCH, OWNER_BALANCE_SAMPLES, ROOT, SRC, PLY, MANIFEST, MATRIXCITY_SCENE_DIR,
   TIDEGS_DENSE_PLY, TIDEGS_PREBUILT_MANIFEST, SCHED_CACHE, OUT_ROOT,
-  CACHE_ROOT, RUN_TAG
+  CACHE_ROOT, RUN_TAG, OPTIMIZER_ALGORITHM, SOPHIA_BETA1, SOPHIA_BETA2,
+  SOPHIA_CURVATURE_INTERVAL, SOPHIA_HUTCHINSON_SAMPLES, SOPHIA_CURVATURE_SEED,
+  SOPHIA_GAMMA, SOPHIA_EPSILON, TR_EPSILON_INIT, TR_EPSILON_FINAL
 USAGE
 }
 
@@ -177,6 +200,16 @@ while [[ $# -gt 0 ]]; do
     --max-patch-files) MAX_PATCH_FILES="$2"; shift 2 ;;
     --max-patch-gb) MAX_PATCH_GB="$2"; shift 2 ;;
     --min-free-gb) MIN_FREE_GB="$2"; shift 2 ;;
+    --optimizer) OPTIMIZER_ALGORITHM="$2"; shift 2 ;;
+    --sophia-beta1) SOPHIA_BETA1="$2"; shift 2 ;;
+    --sophia-beta2) SOPHIA_BETA2="$2"; shift 2 ;;
+    --curvature-interval) SOPHIA_CURVATURE_INTERVAL="$2"; shift 2 ;;
+    --hutchinson-samples) SOPHIA_HUTCHINSON_SAMPLES="$2"; shift 2 ;;
+    --curvature-seed) SOPHIA_CURVATURE_SEED="$2"; shift 2 ;;
+    --sophia-gamma) SOPHIA_GAMMA="$2"; shift 2 ;;
+    --sophia-epsilon) SOPHIA_EPSILON="$2"; shift 2 ;;
+    --tr-epsilon-init) TR_EPSILON_INIT="$2"; shift 2 ;;
+    --tr-epsilon-final) TR_EPSILON_FINAL="$2"; shift 2 ;;
     --compaction-interval) COMPACTION_INTERVAL="$2"; shift 2 ;;
     --compaction-target-patches) COMPACTION_TARGET_PATCHES="$2"; shift 2 ;;
     --compaction-rank-concurrency) COMPACTION_RANK_CONCURRENCY="$2"; shift 2 ;;
@@ -188,7 +221,7 @@ while [[ $# -gt 0 ]]; do
     --resident-decay-list) RESIDENT_DECAY_LIST="$2"; shift 2 ;;
     --balanced-seed-fraction) BALANCED_SEED_FRACTION_LIST="$2"; shift 2 ;;
     --balanced-seed-fraction-list) BALANCED_SEED_FRACTION_LIST="$2"; shift 2 ;;
-    --checkpoint-iter) CHECKPOINT_ITER="$2"; shift 2 ;;
+    --checkpoint-iter) CHECKPOINT_ITER="$2"; CHECKPOINT_ITER_SET=1; shift 2 ;;
     --resume-to-iter) RESUME_TO_ITER="$2"; shift 2 ;;
     --start-checkpoint) START_CHECKPOINT="$2"; shift 2 ;;
     --debug-logging) DEBUG_LOGGING=1; shift ;;
@@ -203,6 +236,10 @@ done
 case "${MODE}" in
   train|checkpoint|resume|summary) ;;
   *) echo "Invalid --mode '${MODE}'" >&2; usage >&2; exit 1 ;;
+esac
+case "${OPTIMIZER_ALGORITHM}" in
+  adam|3dgs2_tr) ;;
+  *) echo "Invalid --optimizer '${OPTIMIZER_ALGORITHM}'" >&2; exit 1 ;;
 esac
 
 if [[ "${MODE}" != "summary" ]]; then
@@ -285,6 +322,7 @@ DISTRIBUTED_TAG=""
 if [[ "${DISTRIBUTED_MODE}" == "gaussian_sharded" ]]; then
   DISTRIBUTED_TAG="_dist${GPU_COUNT}_${CAMERA_ASSIGNMENT}"
 fi
+OPTIMIZER_TAG="_${OPTIMIZER_ALGORITHM}"
 
 RUN_ROOT="${OUT_ROOT}/${RUN_TAG}"
 COMMANDS="${RUN_ROOT}/commands.sh"
@@ -384,6 +422,18 @@ append_train_command() {
     printf '  --num_clusters %q \\\n' "${NUM_CLUSTERS}"
     printf '  --ssd_schedule_ordering %q \\\n' "${SCHEDULE_ORDERING}"
     printf '  --tide_optimizer_backend gpu_resident \\\n'
+    printf '  --optimizer %q \\\n' "${OPTIMIZER_ALGORITHM}"
+    if [[ "${OPTIMIZER_ALGORITHM}" == "3dgs2_tr" ]]; then
+      printf '  --paper_sophia_beta1 %q \\\n' "${SOPHIA_BETA1}"
+      printf '  --paper_sophia_beta2 %q \\\n' "${SOPHIA_BETA2}"
+      printf '  --paper_sophia_curvature_interval %q \\\n' "${SOPHIA_CURVATURE_INTERVAL}"
+      printf '  --paper_sophia_hutchinson_samples %q \\\n' "${SOPHIA_HUTCHINSON_SAMPLES}"
+      printf '  --paper_sophia_curvature_seed %q \\\n' "${SOPHIA_CURVATURE_SEED}"
+      printf '  --paper_sophia_gamma %q \\\n' "${SOPHIA_GAMMA}"
+      printf '  --paper_sophia_epsilon %q \\\n' "${SOPHIA_EPSILON}"
+      printf '  --paper_tr_epsilon_init %q \\\n' "${TR_EPSILON_INIT}"
+      printf '  --paper_tr_epsilon_final %q \\\n' "${TR_EPSILON_FINAL}"
+    fi
     printf '  --tide_block_reader_backend tiered_cache \\\n'
     printf '  --tide_optimizer_deferred_mode off \\\n'
     printf '  --tide_resident_selection_policy %q \\\n' "${RESIDENT_POLICY}"
@@ -425,6 +475,10 @@ append_train_command() {
 }
 
 if [[ "${MODE}" == "train" ]]; then
+  train_checkpoint_iter=""
+  if [[ "${CHECKPOINT_ITER_SET}" == "1" ]]; then
+    train_checkpoint_iter="${CHECKPOINT_ITER}"
+  fi
   for bsz in ${BSZ_LIST}; do
     for capacity in ${CAPACITY_LIST}; do
       for resident_lambda in ${RESIDENT_LAMBDA_LIST}; do
@@ -435,8 +489,8 @@ if [[ "${MODE}" == "train" ]]; then
             decay_tag="${resident_decay//./p}"
             append_train_command \
               "train" \
-              "train_bsz${bsz}_cap${capacity}_lam${lambda_tag}_decay${decay_tag}_seed${fraction_tag}_iter${ITERATIONS}${DISTRIBUTED_TAG}" \
-              "${bsz}" "${capacity}" "${resident_lambda}" "${resident_decay}" "${balanced_seed_fraction}" "${ITERATIONS}" "" ""
+              "train_bsz${bsz}_cap${capacity}_lam${lambda_tag}_decay${decay_tag}_seed${fraction_tag}${OPTIMIZER_TAG}_iter${ITERATIONS}${DISTRIBUTED_TAG}" \
+              "${bsz}" "${capacity}" "${resident_lambda}" "${resident_decay}" "${balanced_seed_fraction}" "${ITERATIONS}" "${train_checkpoint_iter}" ""
           done
         done
       done
@@ -453,12 +507,16 @@ elif [[ "${MODE}" == "checkpoint" ]]; then
   decay_tag="${resident_decay//./p}"
   append_train_command \
     "checkpoint" \
-    "ckpt_bsz${bsz}_cap${capacity}_lam${lambda_tag}_decay${decay_tag}_seed${fraction_tag}_iter1000_ckpt${CHECKPOINT_ITER}${DISTRIBUTED_TAG}" \
+    "ckpt_bsz${bsz}_cap${capacity}_lam${lambda_tag}_decay${decay_tag}_seed${fraction_tag}${OPTIMIZER_TAG}_iter1000_ckpt${CHECKPOINT_ITER}${DISTRIBUTED_TAG}" \
     "${bsz}" "${capacity}" "${resident_lambda}" "${resident_decay}" "${balanced_seed_fraction}" "1000" "${CHECKPOINT_ITER}" ""
 elif [[ "${MODE}" == "resume" ]]; then
   if [[ -z "${START_CHECKPOINT}" ]]; then
     echo "--mode resume requires --start-checkpoint" >&2
     exit 1
+  fi
+  resume_checkpoint_iter=""
+  if [[ "${CHECKPOINT_ITER_SET}" == "1" ]]; then
+    resume_checkpoint_iter="${CHECKPOINT_ITER}"
   fi
   bsz="$(awk '{print $1}' <<< "${BSZ_LIST}")"
   capacity="$(awk '{print $1}' <<< "${CAPACITY_LIST}")"
@@ -470,8 +528,8 @@ elif [[ "${MODE}" == "resume" ]]; then
   decay_tag="${resident_decay//./p}"
   append_train_command \
     "resume" \
-    "resume_bsz${bsz}_cap${capacity}_lam${lambda_tag}_decay${decay_tag}_seed${fraction_tag}_to${RESUME_TO_ITER}${DISTRIBUTED_TAG}" \
-    "${bsz}" "${capacity}" "${resident_lambda}" "${resident_decay}" "${balanced_seed_fraction}" "${RESUME_TO_ITER}" "" "${START_CHECKPOINT}"
+    "resume_bsz${bsz}_cap${capacity}_lam${lambda_tag}_decay${decay_tag}_seed${fraction_tag}${OPTIMIZER_TAG}_to${RESUME_TO_ITER}${DISTRIBUTED_TAG}" \
+    "${bsz}" "${capacity}" "${resident_lambda}" "${resident_decay}" "${balanced_seed_fraction}" "${RESUME_TO_ITER}" "${resume_checkpoint_iter}" "${START_CHECKPOINT}"
 fi
 
 if [[ "${MODE}" == "summary" ]]; then

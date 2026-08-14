@@ -210,7 +210,38 @@ RAM cache budget: 32 GB
 checkpoint mode: incremental
 ```
 
-### Four-GPU Gaussian Sharding
+### 3DGS2-TR Optimizer
+
+Adam remains the default. Select 3DGS2-TR explicitly; the runner applies the
+paper defaults (`beta1=0.9`, `beta2=0.999`, curvature every 10 optimizer steps,
+one Hutchinson probe, and Hellinger epsilon decaying from `1e-6` to `1e-8`):
+
+```bash
+RUN_TAG=$(date +"%Y%m%d_%H%M%S")_3dgs2_tr_single \
+bash scripts/train_matrixcity_1b.sh \
+  --mode train \
+  --optimizer 3dgs2_tr \
+  --gpu 0 \
+  --iterations 176 \
+  --checkpoint-iter 160 \
+  --bsz 16 \
+  --capacity 2048 \
+  --debug-max-train-cameras -1 \
+  --src "$MATRIXCITY_SCENE_DIR" \
+  --ply "$TIDEGS_DENSE_PLY" \
+  --manifest "$TIDEGS_PREBUILT_MANIFEST" \
+  --decode-dataset-path "$TIDEGS_DECODE_CACHE" \
+  --root "$TIDEGS_ROOT"
+```
+
+The runner also exposes `--sophia-beta1`, `--sophia-beta2`,
+`--curvature-interval`, `--hutchinson-samples`, `--curvature-seed`,
+`--sophia-gamma`, `--sophia-epsilon`, `--tr-epsilon-init`, and
+`--tr-epsilon-final`. Densification is disabled for both release optimizers;
+3DGS2-TR rejects incompatible runtime or resume settings and never falls back
+to Adam.
+
+### Multi-GPU Gaussian Sharding
 
 Use one process per GPU. `--bsz` and `--capacity` are global; RAM cache limits
 remain per rank. A fresh distributed run requires a prebuilt SSD manifest so
@@ -220,6 +251,7 @@ all ranks can share the immutable base file.
 RUN_TAG=$(date +"%Y%m%d_%H%M%S")_tidegs_1b_4gpu \
 bash scripts/train_matrixcity_1b.sh \
   --mode train \
+  --optimizer 3dgs2_tr \
   --gpus 0,1,2,3 \
   --bsz 16 \
   --capacity 8192 \
@@ -234,9 +266,11 @@ bash scripts/train_matrixcity_1b.sh \
   --root "$TIDEGS_ROOT"
 ```
 
-This configuration assigns every block to exactly one rank, gives each rank
-four cameras per synchronized step, and enforces an 8192-block global resident
-cap. Distributed checkpoints must be resumed with the same world size.
+This path supports any `N >= 2`. The example assigns every block to exactly one
+of four ranks, gives each rank four cameras per synchronized step, and enforces
+an 8192-block global resident cap. Distributed checkpoints must be resumed with
+the same world size and optimizer, batch, capacity, trust-region, camera, and
+owner-map configuration.
 
 ## Checkpoint And Resume
 
@@ -295,6 +329,26 @@ checkpoints are retained by default. These limits can be adjusted with
 `--max-patch-files`, `--max-patch-gb`, `--min-free-gb`, and
 `--checkpoint-keep-last`; writes stop before consuming the configured free-space
 reserve.
+
+Distributed checkpoints use root manifest v3. Optimizer EMA and curvature EMA
+are intentionally not serialized, so resume cold-starts those per-rank states
+while preserving the global optimizer/curvature clock. Legacy distributed v1/v2
+checkpoints can only resume with Adam.
+
+Evaluate either a single-rank or distributed checkpoint without mutating it:
+
+```bash
+python tools/eval_pure_ssd_checkpoint.py \
+  --run-dir "$RUN_DIR" \
+  --iteration 160 \
+  --output-dir "$QUALITY_DIR" \
+  --gpu 0 \
+  --eval-batch-size 2
+```
+
+The evaluator routes blocks through every owner shard for distributed
+checkpoints and verifies the complete checkpoint tree fingerprint before and
+after evaluation.
 
 ## Outputs
 
