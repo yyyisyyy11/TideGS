@@ -7,6 +7,7 @@ It keeps release training constrained to the TideGS out-of-core configuration.
 from __future__ import annotations
 
 import math
+import operator
 import os
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -18,6 +19,8 @@ from .resident_policy import (
     compute_passthrough_resident_transition,
     compute_topc_resident_transition,
 )
+from .sophia_tr_math import should_update_curvature
+from .sophia_tr_sampling import sample_s2_camera_ids
 
 
 def _require_attr(args: Any, name: str, expected: Any) -> None:
@@ -383,6 +386,64 @@ def compute_paper_block_sets(
     return transition.to_dict()
 
 
+def resolve_next_resident_camera_ids(
+    *,
+    training_schedule,
+    iteration: int,
+    batch_size: int,
+    schedule_ordering: str,
+    optimizer_algorithm: str = "adam",
+    current_optimizer_step: Optional[int] = None,
+    curvature_interval: int = 10,
+    curvature_seed: int = 1,
+) -> Tuple[List[int], List[int], List[int]]:
+    """Resolve the next S1, optional S2, and de-duplicated resident batch."""
+
+    _, next_batch = get_current_and_next_camera_batches(
+        training_schedule=training_schedule,
+        iteration=iteration,
+        batch_size=batch_size,
+        schedule_ordering=schedule_ordering,
+    )
+    next_s1_camera_ids = [int(camera_id) for camera_id in next_batch.batch_indices]
+
+    algorithm = str(optimizer_algorithm).lower()
+    if algorithm == "adam":
+        next_s2_camera_ids: List[int] = []
+    elif algorithm == "3dgs2_tr":
+        if isinstance(current_optimizer_step, bool):
+            raise TypeError("current_optimizer_step must be an integer, not bool")
+        try:
+            next_optimizer_step = int(operator.index(current_optimizer_step)) + 1
+        except TypeError as error:
+            raise TypeError(
+                "current_optimizer_step is required for 3DGS2-TR N+1 planning"
+            ) from error
+        if next_optimizer_step < 1:
+            raise ValueError("next optimizer step must be positive")
+        if should_update_curvature(next_optimizer_step, int(curvature_interval)):
+            next_s2_camera_ids = sample_s2_camera_ids(
+                population_camera_ids=training_schedule,
+                s1_camera_ids=next_s1_camera_ids,
+                seed=int(curvature_seed),
+                optimizer_step=next_optimizer_step,
+            )
+        else:
+            next_s2_camera_ids = []
+    else:
+        raise RuntimeError(
+            f"Unsupported resident optimizer algorithm: {optimizer_algorithm!r}"
+        )
+
+    next_resident_camera_ids: List[int] = []
+    seen_camera_ids = set()
+    for camera_id in next_s1_camera_ids + next_s2_camera_ids:
+        if camera_id not in seen_camera_ids:
+            next_resident_camera_ids.append(camera_id)
+            seen_camera_ids.add(camera_id)
+    return next_s1_camera_ids, next_s2_camera_ids, next_resident_camera_ids
+
+
 def plan_and_start_resident_prefetch(
     *,
     storage_adapter,
@@ -400,20 +461,31 @@ def plan_and_start_resident_prefetch(
     balanced_seed_fraction: float,
     active_block_reader,
     double_buffer,
+    optimizer_algorithm: str = "adam",
+    current_optimizer_step: Optional[int] = None,
+    curvature_interval: int = 10,
+    curvature_seed: int = 1,
 ) -> Dict[str, object]:
     plan_start_ns = time.perf_counter_ns()
-    _, next_batch = get_current_and_next_camera_batches(
+    (
+        next_s1_camera_ids,
+        next_s2_camera_ids,
+        next_resident_camera_ids,
+    ) = resolve_next_resident_camera_ids(
         training_schedule=training_schedule,
         iteration=iteration,
         batch_size=batch_size,
         schedule_ordering=schedule_ordering,
+        optimizer_algorithm=optimizer_algorithm,
+        current_optimizer_step=current_optimizer_step,
+        curvature_interval=curvature_interval,
+        curvature_seed=curvature_seed,
     )
-    next_camera_ids = list(next_batch.batch_indices)
     target_iteration = int(iteration) + int(batch_size)
     cull_start_ns = time.perf_counter_ns()
     with torch.cuda.nvtx.range("Tide N+1: coarse culling"):
         bounds_generation, next_camera_blocks = storage_adapter.get_visible_blocks_batch(
-            next_camera_ids
+            next_resident_camera_ids
         )
     cull_end_ns = time.perf_counter_ns()
     selection_start_ns = time.perf_counter_ns()
@@ -432,7 +504,7 @@ def plan_and_start_resident_prefetch(
             resident_recency_decay=resident_recency_decay,
             resident_capacity_blocks=resident_capacity_blocks,
             balanced_seed_fraction=balanced_seed_fraction,
-            next_camera_ids_override=next_camera_ids,
+            next_camera_ids_override=next_resident_camera_ids,
             next_camera_blocks_override=next_camera_blocks,
         )
     selection_end_ns = time.perf_counter_ns()
@@ -469,6 +541,9 @@ def plan_and_start_resident_prefetch(
     return {
         "block_sets": block_sets,
         "bounds_generation": bounds_generation,
+        "next_s1_camera_ids": next_s1_camera_ids,
+        "next_s2_camera_ids": next_s2_camera_ids,
+        "next_resident_camera_ids": next_resident_camera_ids,
         "future_submitted": future_submitted,
         "prefetch_started": prefetch_started,
         "next_plan_metrics": {
@@ -1866,8 +1941,14 @@ def configure_gpu_resident_optimizer_state(
     resident_state_optimizer = get_gpu_resident_optimizer_fn(gaussians, args.bsz)
     resident_state_optimizer.set_resident_blocks(actual_current_resident_blocks)
     if iteration == 1:
+        optimizer_label = (
+            "3DGS2-TR"
+            if str(getattr(args, "paper_optimizer_algorithm", "adam")).lower()
+            == "3dgs2_tr"
+            else "Adam"
+        )
         write_paper_phase1_log(
-            "[PAPER OPTIMIZER STATE] gpu_resident backend enabled: optimizer moments "
+            f"[PAPER OPTIMIZER STATE] gpu_resident {optimizer_label} enabled: optimizer state "
             "exist only for resident blocks on GPU and cold-restart on block re-admission.\n",
             log_file=log_file,
         )
@@ -1882,19 +1963,27 @@ def run_gpu_resident_adam_step(
     sparse_visibility_indices,
     sparse_grad_local_ids,
     sparse_grad_components,
+    sparse_curvature_local_ids=None,
+    sparse_curvature_components=None,
+    curvature_due: bool = False,
+    optimizer_step: Optional[int] = None,
     get_gpu_resident_optimizer_fn: Callable,
     ensure_local_to_global_mapping_fn: Callable,
     log_prefix: str = "[PAPER SSD MODE]",
     log_file=None,
 ) -> Dict[str, Any]:
+    algorithm = str(getattr(args, "paper_optimizer_algorithm", "adam")).lower()
+    if algorithm not in {"adam", "3dgs2_tr"}:
+        raise RuntimeError(f"Unsupported resident optimizer algorithm: {algorithm!r}")
+    optimizer_label = "3DGS2-TR" if algorithm == "3dgs2_tr" else "Adam"
     write_paper_phase1_log(
-        f"{log_prefix} Using GPU resident Adam for optimization\n",
+        f"{log_prefix} Using GPU resident {optimizer_label} for optimization\n",
         log_file=log_file,
     )
     if args.stop_update_param:
         return {}
 
-    torch.cuda.nvtx.range_push("Paper SSD: GPU Resident Adam")
+    torch.cuda.nvtx.range_push(f"Paper SSD: GPU Resident {optimizer_label}")
     try:
         gpu_resident_optimizer = get_gpu_resident_optimizer_fn(gaussians, args.bsz)
         optimizer_updated_global_indices = sparse_visibility_indices
@@ -1908,15 +1997,24 @@ def run_gpu_resident_adam_step(
             optimizer_updated_global_indices = local_to_global[sparse_grad_local_ids].cpu()
         _ = optimizer_updated_global_indices
 
+        step_kwargs = {}
+        if algorithm == "3dgs2_tr":
+            step_kwargs = {
+                "sparse_curvature_local_ids": sparse_curvature_local_ids,
+                "sparse_curvature_components": sparse_curvature_components,
+                "curvature_due": curvature_due,
+                "optimizer_step": optimizer_step,
+            }
         step_stats = gpu_resident_optimizer.step(
             iteration=iteration,
             gaussians=gaussians,
             sparse_grad_local_ids=sparse_grad_local_ids,
             sparse_grad_components=sparse_grad_components,
+            **step_kwargs,
         )
         gaussians._paper_last_gpu_optimizer_step = dict(step_stats)
         write_paper_phase1_log(
-            f"{log_prefix} GPU resident Adam updated {step_stats['touched_rows']} rows "
+            f"{log_prefix} GPU resident {optimizer_label} updated {step_stats['touched_rows']} rows "
             f"across {step_stats['updated_blocks']} resident blocks "
             f"(cold_rows={step_stats['cold_rows']})\n",
             log_file=log_file,
@@ -1940,6 +2038,8 @@ def train_tide_batch(
     training_schedule,
     distributed_plan=None,
     distributed_context=None,
+    curvature_cameras=None,
+    optimizer_step=None,
 ):
     """Train one batch through the TideGS out-of-core engine."""
     args = getattr(gaussians, "args", None)
@@ -1969,6 +2069,8 @@ def train_tide_batch(
             storage_adapter=storage_adapter,
             plan=distributed_plan,
             context=distributed_context,
+            curvature_cameras=curvature_cameras,
+            optimizer_step=optimizer_step,
         )
 
     # Keep this import lazy while engine.py remains the shared execution core.
@@ -1987,4 +2089,6 @@ def train_tide_batch(
         perm_generator,
         storage_adapter=storage_adapter,
         training_schedule=training_schedule,
+        curvature_cameras=curvature_cameras,
+        optimizer_step=optimizer_step,
     )

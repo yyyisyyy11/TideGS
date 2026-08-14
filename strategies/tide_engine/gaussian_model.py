@@ -9,7 +9,7 @@ from simple_knn._C import distCUDA2
 from plyfile import PlyData, PlyElement
 from utils.graphics_utils import BasicPointCloud
 import utils.general_utils as utils
-from optimizer import ResidentAdamContext
+from optimizer import ResidentAdamContext, ResidentSophiaTRContext
 import numba.cuda
 
 from strategies.base_gaussian_model import BaseGaussianModel
@@ -835,50 +835,75 @@ class TideGaussianModel(BaseGaussianModel):
             log_file.write("✅ [LEGACY SPLIT-FEATURE] 4 params on CUDA, 1 param on CPU (pinned)\n")
         log_file.write(f"{'='*60}\n\n")
         
-        self.optimizer = ResidentAdamContext(
-            l,
-            column_sizes,
-            column_lrs,
-            lr=0.0,
-            bias_correction=True,  # This True is required.
-            betas=(0.9, 0.999),
-            eps=1e-15,
-            weight_decay=0,
-            amsgrad=False,
-            adamw_mode=False,
-            fp32_optimizer_states=True,
-            fused=True,
-            sparse=self.args.sparse_adam,
-        )
+        optimizer_algorithm = str(
+            getattr(args, "paper_optimizer_algorithm", "adam")
+        ).lower()
+        self._paper_optimizer_algorithm = optimizer_algorithm
+        if optimizer_algorithm == "3dgs2_tr":
+            self.optimizer = ResidentSophiaTRContext(
+                l,
+                column_sizes,
+                column_lrs,
+                betas=(args.paper_sophia_beta1, args.paper_sophia_beta2),
+                eps=args.paper_sophia_epsilon,
+                sparse=self.args.sparse_adam,
+            )
+            log_file.write(
+                "[OPTIMIZER] 3DGS2-TR enabled; Adam learning-rate scaling is disabled.\n"
+            )
+        else:
+            self.optimizer = ResidentAdamContext(
+                l,
+                column_sizes,
+                column_lrs,
+                lr=0.0,
+                bias_correction=True,
+                betas=(0.9, 0.999),
+                eps=1e-15,
+                weight_decay=0,
+                amsgrad=False,
+                adamw_mode=False,
+                fp32_optimizer_states=True,
+                fused=True,
+                sparse=self.args.sparse_adam,
+            )
 
         # Scale learning rates according to bsz.
         bsz = args.bsz
-        for param_group in self.optimizer.param_groups:
-            if training_args.lr_scale_mode == "linear":
-                lr_scale = bsz
-                param_group["lr"] *= lr_scale
-            elif training_args.lr_scale_mode == "sqrt":
-                lr_scale = np.sqrt(bsz)
-                param_group["lr"] *= lr_scale # TODO: 这里的param_group["lr"] 用到了吗？ 不是用的是 columns_lr 吗？
-                if "eps" in param_group:  # Adam
-                    param_group["eps"] /= lr_scale
-                    param_group["betas"] = [beta**bsz for beta in param_group["betas"]]
-                    log_file.write(
-                        param_group["name"]
-                        + " betas: "
-                        + str(param_group["betas"])
-                        + "\n"
+        lr_scale = 1.0
+        if optimizer_algorithm == "adam":
+            for param_group in self.optimizer.param_groups:
+                if training_args.lr_scale_mode == "linear":
+                    lr_scale = bsz
+                    param_group["lr"] *= lr_scale
+                elif training_args.lr_scale_mode == "sqrt":
+                    lr_scale = np.sqrt(bsz)
+                    param_group["lr"] *= lr_scale
+                    if "eps" in param_group:
+                        param_group["eps"] /= lr_scale
+                        param_group["betas"] = [
+                            beta**bsz for beta in param_group["betas"]
+                        ]
+                        log_file.write(
+                            param_group["name"]
+                            + " betas: "
+                            + str(param_group["betas"])
+                            + "\n"
+                        )
+                elif training_args.lr_scale_mode == "accumu":
+                    lr_scale = 1
+                else:
+                    raise AssertionError(
+                        f"lr_scale_mode {training_args.lr_scale_mode} not supported."
                     )
-            elif training_args.lr_scale_mode == "accumu":
-                lr_scale = 1
-            else:
-                assert (
-                    False
-                ), f"lr_scale_mode {training_args.lr_scale_mode} not supported."
 
         # Scale the per-column learning rates consumed by GPUResidentAdam.
         # Scale column-wise learning rates when the optimizer exposes them.
-        if hasattr(self.optimizer, 'columns_lr') and self.optimizer.columns_lr is not None:
+        if (
+            optimizer_algorithm == "adam"
+            and hasattr(self.optimizer, 'columns_lr')
+            and self.optimizer.columns_lr is not None
+        ):
             if training_args.lr_scale_mode == "linear":
                 lr_scale_cols = bsz
                 self.optimizer.columns_lr *= lr_scale_cols
@@ -909,6 +934,9 @@ class TideGaussianModel(BaseGaussianModel):
         and the unified layout stores per-column LRs in self.optimizer.columns_lr,
         so columns_lr[0] (the xyz column) is updated as well.
         """
+        if getattr(self, "_paper_optimizer_algorithm", "adam") == "3dgs2_tr":
+            return None
+
         lr = self.xyz_scheduler_args(iteration)
         
         for param_group in self.optimizer.param_groups:

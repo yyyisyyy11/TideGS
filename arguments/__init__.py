@@ -14,6 +14,7 @@
 #
 
 from argparse import ArgumentParser, Namespace
+import math
 import sys
 import os
 import utils.general_utils as utils
@@ -213,6 +214,18 @@ class AuxiliaryParams(ParamGroup):
         self.paper_resident_capacity_blocks = 2048  # Global cap in distributed mode
         self.paper_optimizer_state_mode = "full_cpu"  # {full_cpu, resident_blocks}; optimizer-state placement
         self.paper_optimizer_backend = "cpu"  # {cpu, gpu_resident}; optimizer update backend
+        self.paper_optimizer_algorithm = "adam"  # {adam, 3dgs2_tr}; Adam remains the default
+        self.paper_sophia_beta1 = 0.9
+        self.paper_sophia_beta2 = 0.999
+        self.paper_sophia_curvature_interval = 10
+        self.paper_sophia_hutchinson_samples = 1
+        self.paper_sophia_curvature_estimator = "residual_vjp"
+        self.paper_sophia_curvature_seed = 1
+        self.paper_sophia_gamma = 1.0
+        self.paper_sophia_epsilon = 1e-15
+        self.paper_tr_epsilon_init = 1e-6
+        self.paper_tr_epsilon_final = 1e-8
+        self.paper_tr_quat_norm = -1.0
         self.paper_block_reader_backend = "auto"  # {auto, unified_params, tiered_cache}; source for per-iteration block reads
         self.paper_free_unified_params = False  # release _unified_params after init to unlock >100GB scenes; requires paper_block_reader_backend != unified_params and paper_optimizer_backend=gpu_resident
         self.paper_debug_logging = False  # Enable verbose TideGS diagnostics for development runs
@@ -233,6 +246,8 @@ class AuxiliaryParams(ParamGroup):
         self.tide_resident_capacity_blocks = ""
         self.tide_optimizer_state_mode = ""
         self.tide_optimizer_backend = ""
+        self.tide_optimizer_algorithm = ""
+        self.optimizer = ""  # Public alias for paper_optimizer_algorithm
         self.tide_block_reader_backend = ""
         self.tide_free_unified_params = False
         self.tide_debug_logging = False
@@ -463,6 +478,8 @@ def _apply_tide_aliases(args):
         ("tide_resident_capacity_blocks", "paper_resident_capacity_blocks"),
         ("tide_optimizer_state_mode", "paper_optimizer_state_mode"),
         ("tide_optimizer_backend", "paper_optimizer_backend"),
+        ("tide_optimizer_algorithm", "paper_optimizer_algorithm"),
+        ("optimizer", "paper_optimizer_algorithm"),
         ("tide_block_reader_backend", "paper_block_reader_backend"),
     )
     for alias_name, internal_name in alias_pairs:
@@ -575,6 +592,54 @@ def init_args(args):
             )
             assert getattr(args, "paper_optimizer_deferred_mode", "off") == "off", (
                 "paper_optimizer_state_mode=resident_blocks currently requires --paper_optimizer_deferred_mode off"
+            )
+
+    if hasattr(args, "paper_optimizer_algorithm"):
+        algorithm = str(args.paper_optimizer_algorithm).lower()
+        if algorithm in {"3dgs2-tr", "sophia_tr", "sophia-tr"}:
+            algorithm = "3dgs2_tr"
+        assert algorithm in {"adam", "3dgs2_tr"}, (
+            f"Invalid paper_optimizer_algorithm={algorithm!r}; expected adam or 3dgs2_tr"
+        )
+        args.paper_optimizer_algorithm = algorithm
+        for name in ("paper_sophia_beta1", "paper_sophia_beta2"):
+            value = float(getattr(args, name))
+            assert math.isfinite(value) and 0.0 < value < 1.0, (
+                f"{name} must be finite and in (0, 1)"
+            )
+            setattr(args, name, value)
+        args.paper_sophia_curvature_interval = int(args.paper_sophia_curvature_interval)
+        args.paper_sophia_hutchinson_samples = int(args.paper_sophia_hutchinson_samples)
+        args.paper_sophia_curvature_seed = int(args.paper_sophia_curvature_seed)
+        assert args.paper_sophia_curvature_interval > 0
+        assert args.paper_sophia_hutchinson_samples > 0
+        assert args.paper_sophia_curvature_seed >= 0
+        args.paper_sophia_curvature_estimator = str(
+            args.paper_sophia_curvature_estimator
+        ).lower()
+        assert args.paper_sophia_curvature_estimator == "residual_vjp", (
+            "paper_sophia_curvature_estimator currently supports only residual_vjp"
+        )
+        for name in (
+            "paper_sophia_gamma",
+            "paper_sophia_epsilon",
+            "paper_tr_epsilon_init",
+            "paper_tr_epsilon_final",
+        ):
+            value = float(getattr(args, name))
+            assert math.isfinite(value) and value > 0.0, (
+                f"{name} must be finite and positive"
+            )
+            setattr(args, name, value)
+        args.paper_tr_quat_norm = float(args.paper_tr_quat_norm)
+        assert math.isfinite(args.paper_tr_quat_norm)
+        if algorithm == "3dgs2_tr":
+            assert str(getattr(args, "ssd_execution_mode", "fast_ram")).lower() == "paper"
+            assert getattr(args, "use_ssd_offload", False)
+            assert str(getattr(args, "paper_optimizer_backend", "cpu")).lower() == "gpu_resident"
+            assert str(getattr(args, "paper_optimizer_state_mode", "full_cpu")).lower() == "resident_blocks"
+            assert getattr(args, "disable_auto_densification", False), (
+                "3dgs2_tr requires --disable_auto_densification, matching the paper"
             )
 
     if hasattr(args, "paper_block_reader_backend"):

@@ -9,7 +9,10 @@ import torch.nn as nn
 import gc
 from typing import Optional, List, Dict, Tuple
 
-from strategies.tide_engine.gpu_resident_optimizer import GPUResidentAdam
+from strategies.tide_engine.gpu_resident_optimizer import (
+    GPUResidentAdam,
+    GPUResidentSophiaTR,
+)
 from strategies.tide_engine.distributed_metrics import (
     get_distributed_metrics_writer,
     get_legacy_cuda_metrics_collector,
@@ -17,6 +20,15 @@ from strategies.tide_engine.distributed_metrics import (
 from utils.distributed import get_distributed_context
 
 def get_gpu_resident_optimizer(gaussians, batch_size):
+    algorithm = str(
+        getattr(getattr(gaussians, "args", None), "paper_optimizer_algorithm", "adam")
+    ).lower()
+    if algorithm == "3dgs2_tr":
+        optimizer_type = GPUResidentSophiaTR
+    elif algorithm == "adam":
+        optimizer_type = GPUResidentAdam
+    else:
+        raise RuntimeError(f"Unsupported resident optimizer algorithm: {algorithm!r}")
     desired_block_size = int(
         getattr(
             gaussians,
@@ -27,11 +39,12 @@ def get_gpu_resident_optimizer(gaussians, batch_size):
     current_optimizer = getattr(gaussians, '_paper_gpu_resident_optimizer', None)
     needs_recreate = (
         current_optimizer is None
+        or getattr(current_optimizer, '_paper_optimizer_algorithm', None) != algorithm
         or getattr(current_optimizer, 'batch_size', None) != batch_size
         or getattr(current_optimizer, 'block_size', desired_block_size) != desired_block_size
     )
     if needs_recreate:
-        gaussians._paper_gpu_resident_optimizer = GPUResidentAdam(
+        resident_optimizer = optimizer_type(
             batch_size=batch_size,
             block_size=desired_block_size,
             # Planner capacity is global in distributed mode; storage grows from
@@ -39,6 +52,8 @@ def get_gpu_resident_optimizer(gaussians, batch_size):
             capacity_blocks=0,
             device='cuda',
         )
+        resident_optimizer._paper_optimizer_algorithm = algorithm
+        gaussians._paper_gpu_resident_optimizer = resident_optimizer
     return gaussians._paper_gpu_resident_optimizer
 
 
@@ -231,6 +246,13 @@ from clm_kernels import (
     send_shs2gpu_stream_retention,
     send_shs2cpu_grad_buffer_stream_retention,
     spherical_harmonics_bwd_inplace,
+)
+from strategies.tide_engine.sophia_tr_curvature import (
+    build_fused_3dgs2_curvature_residuals,
+    estimate_seeded_curvature_sample,
+)
+from strategies.tide_engine.sophia_tr_math import (
+    resolve_curvature_schedule,
 )
 from densification import update_densification_stats_offload_accum_grads
 from strategies.base_engine import (
@@ -579,6 +601,254 @@ def pipeline_forward_one_step_shs_inplace(
     )
 
 
+_SOPHIA_COMPONENT_WIDTHS = {
+    "xyz": 3,
+    "opacity": 1,
+    "scaling": 3,
+    "rotation": 4,
+    "features_dc": 3,
+    "features_rest": 45,
+}
+
+
+def _resolve_single_rank_sophia_batch(
+    *,
+    args,
+    iteration: int,
+    gradient_cameras,
+    curvature_cameras,
+    optimizer_step: Optional[int],
+):
+    """Validate the single-rank optimizer clock and optional S2 batch."""
+
+    algorithm = str(getattr(args, "paper_optimizer_algorithm", "adam")).lower()
+    if algorithm not in {"adam", "3dgs2_tr"}:
+        raise RuntimeError(f"Unsupported resident optimizer algorithm: {algorithm!r}")
+    if algorithm == "adam":
+        return False, None, False, [], list(gradient_cameras)
+
+    gradient_cameras = list(gradient_cameras)
+    gradient_batch_size = len(gradient_cameras)
+    configured_batch_size = int(getattr(args, "bsz", gradient_batch_size))
+    if gradient_batch_size <= 0:
+        raise ValueError("3DGS2-TR requires a non-empty S1 camera batch")
+    if configured_batch_size != gradient_batch_size:
+        raise ValueError(
+            "3DGS2-TR single-rank S1 batch size disagrees with args.bsz: "
+            f"actual={gradient_batch_size}, configured={configured_batch_size}"
+        )
+
+    resolved_step, curvature_due = resolve_curvature_schedule(
+        iteration=iteration,
+        batch_size=configured_batch_size,
+        interval=int(getattr(args, "paper_sophia_curvature_interval", 10)),
+        optimizer_step=optimizer_step,
+    )
+    resolved_curvature_cameras = (
+        [] if curvature_cameras is None else list(curvature_cameras)
+    )
+    if curvature_due:
+        if len(resolved_curvature_cameras) != gradient_batch_size:
+            raise ValueError(
+                "A curvature step requires an independent S2 camera batch with "
+                "the same global size as S1: "
+                f"S1={gradient_batch_size}, S2={len(resolved_curvature_cameras)}"
+            )
+    elif resolved_curvature_cameras:
+        raise ValueError("curvature_cameras must be empty when curvature is not due")
+
+    projection_cameras = gradient_cameras + resolved_curvature_cameras
+    return (
+        True,
+        resolved_step,
+        curvature_due,
+        resolved_curvature_cameras,
+        projection_cameras,
+    )
+
+
+def _allocate_sparse_sophia_components(
+    local_ids: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    return {
+        name: torch.zeros(
+            (int(local_ids.numel()), width),
+            dtype=torch.float32,
+            device=local_ids.device,
+        )
+        for name, width in _SOPHIA_COMPONENT_WIDTHS.items()
+    }
+
+
+def _run_single_rank_sophia_curvature_batch(
+    *,
+    gaussians,
+    scene,
+    curvature_cameras,
+    curvature_filters_local,
+    background,
+    pipe_args,
+    args,
+    optimizer_step: int,
+):
+    """Run an independent S2 forward/VJP and return sparse curvature rows."""
+
+    if len(curvature_cameras) != len(curvature_filters_local):
+        raise ValueError(
+            "S2 camera/filter count mismatch: "
+            f"cameras={len(curvature_cameras)}, filters={len(curvature_filters_local)}"
+        )
+
+    non_empty_filters = [
+        local_ids.to(device=gaussians._xyz.device, dtype=torch.long).contiguous()
+        for local_ids in curvature_filters_local
+        if local_ids is not None and local_ids.numel() > 0
+    ]
+    if non_empty_filters:
+        sparse_curvature_local_ids = torch.unique(
+            torch.cat(non_empty_filters, dim=0), sorted=True
+        )
+    else:
+        sparse_curvature_local_ids = torch.empty(
+            (0,), dtype=torch.long, device=gaussians._xyz.device
+        )
+    sparse_curvature_components = _allocate_sparse_sophia_components(
+        sparse_curvature_local_ids
+    )
+
+    sample_count = int(getattr(args, "paper_sophia_hutchinson_samples", 1))
+    if sample_count <= 0:
+        raise ValueError("paper_sophia_hutchinson_samples must be positive")
+    base_seed = int(getattr(args, "paper_sophia_curvature_seed", 1))
+
+    for microbatch_index, (camera, raw_filter_local) in enumerate(
+        zip(curvature_cameras, curvature_filters_local)
+    ):
+        if raw_filter_local is None or raw_filter_local.numel() == 0:
+            continue
+        filter_local = raw_filter_local.to(
+            device=gaussians._xyz.device, dtype=torch.long
+        ).contiguous()
+        if torch.unique(filter_local).numel() != filter_local.numel():
+            raise RuntimeError(
+                "3DGS2-TR requires unique per-camera S2 Gaussian ids before "
+                "squaring the residual VJP"
+            )
+        sparse_positions = torch.searchsorted(
+            sparse_curvature_local_ids, filter_local
+        )
+
+        filtered_xyz = (
+            gaussians._xyz.detach()
+            .index_select(0, filter_local)
+            .contiguous()
+            .requires_grad_(True)
+        )
+        raw_opacity = (
+            gaussians._opacity.detach()
+            .index_select(0, filter_local)
+            .contiguous()
+            .requires_grad_(True)
+        )
+        raw_scaling = (
+            gaussians._scaling.detach()
+            .index_select(0, filter_local)
+            .contiguous()
+            .requires_grad_(True)
+        )
+        raw_rotation = (
+            gaussians._rotation.detach()
+            .index_select(0, filter_local)
+            .contiguous()
+            .requires_grad_(True)
+        )
+        filtered_shs = torch.cat(
+            (
+                gaussians._features_dc.detach().index_select(0, filter_local),
+                gaussians._features_rest.detach().index_select(0, filter_local),
+            ),
+            dim=1,
+        ).contiguous().requires_grad_(True)
+
+        rendered_image, means2d, radii, colors, dirs = (
+            pipeline_forward_one_step_shs_inplace(
+                gaussians.opacity_activation(raw_opacity),
+                gaussians.scaling_activation(raw_scaling),
+                gaussians.rotation_activation(raw_rotation),
+                filtered_xyz,
+                filtered_shs,
+                camera,
+                scene,
+                gaussians,
+                background,
+                pipe_args,
+                use_autograd_for_sh=True,
+            )
+        )
+        target = torch.clamp(camera.original_image / 255.0, 0.0, 1.0).unsqueeze(0)
+        rendered_batch = rendered_image.unsqueeze(0)
+        residuals = build_fused_3dgs2_curvature_residuals(
+            rendered_batch,
+            target,
+            lambda_dssim=float(getattr(args, "lambda_dssim", 0.2)),
+        )
+        curvature_inputs = (
+            filtered_xyz,
+            raw_opacity,
+            raw_scaling,
+            raw_rotation,
+            filtered_shs,
+        )
+
+        for sample_index in range(sample_count):
+            curvature_vjps = estimate_seeded_curvature_sample(
+                residuals,
+                curvature_inputs,
+                base_seed=base_seed,
+                optimizer_step=optimizer_step,
+                microbatch_index=microbatch_index,
+                sample_index=sample_index,
+                sample_count=sample_count,
+                rank=0,
+            )
+            curvature_sample = {
+                "xyz": curvature_vjps[0],
+                "opacity": curvature_vjps[1],
+                "scaling": curvature_vjps[2],
+                "rotation": curvature_vjps[3],
+                "features_dc": curvature_vjps[4][:, :3],
+                "features_rest": curvature_vjps[4][:, 3:48],
+            }
+            with torch.no_grad():
+                for name, width in _SOPHIA_COMPONENT_WIDTHS.items():
+                    sparse_curvature_components[name].scatter_add_(
+                        dim=0,
+                        index=sparse_positions.reshape(-1, 1).expand(-1, width),
+                        src=curvature_sample[name].to(torch.float32),
+                    )
+
+        del (
+            rendered_image,
+            rendered_batch,
+            target,
+            residuals,
+            curvature_inputs,
+            curvature_vjps,
+            curvature_sample,
+            means2d,
+            radii,
+            colors,
+            dirs,
+            filtered_xyz,
+            raw_opacity,
+            raw_scaling,
+            raw_rotation,
+            filtered_shs,
+        )
+
+    return sparse_curvature_local_ids, sparse_curvature_components
+
+
 import queue
 import time
 
@@ -838,6 +1108,8 @@ def clm_offload_train_one_batch(
     perm_generator,
     storage_adapter=None,
     training_schedule=None,
+    curvature_cameras=None,
+    optimizer_step=None,
 ):
     args = utils.get_args()
     iteration = utils.get_cur_iter()
@@ -911,8 +1183,23 @@ def clm_offload_train_one_batch(
     # STAGE 0: SSD Prefetch (Async, Non_blocking)
     # ============================================================================
 
-    current_camera_ids = [cam.global_idx for cam in batched_cameras]
     bsz = len(batched_cameras)
+    (
+        sophia_enabled,
+        optimizer_step,
+        curvature_due,
+        curvature_cameras,
+        projection_cameras,
+    ) = _resolve_single_rank_sophia_batch(
+        args=args,
+        iteration=iteration,
+        gradient_cameras=batched_cameras,
+        curvature_cameras=curvature_cameras,
+        optimizer_step=optimizer_step,
+    )
+    current_camera_ids = [cam.global_idx for cam in batched_cameras]
+    curvature_camera_ids = [cam.global_idx for cam in curvature_cameras]
+    resident_camera_ids = current_camera_ids + curvature_camera_ids
     legacy_block_cull_ms = 0.0
     legacy_block_cull_metrics = {}
     legacy_resident_load_ms = 0.0
@@ -977,6 +1264,10 @@ def clm_offload_train_one_batch(
     has_unified_params = hasattr(gaussians, "_unified_params") and gaussians._unified_params is not None
     use_fast_ram_ssd_path = storage_adapter is not None and has_unified_params and ssd_execution_mode == "fast_ram"
     is_paper_ssd_mode = storage_adapter is not None and ssd_execution_mode == "paper"
+    if sophia_enabled and not is_paper_ssd_mode:
+        raise RuntimeError(
+            "3DGS2-TR single-rank training requires TideGS paper SSD mode"
+        )
     paper_debug_logging = _paper_debug_logging_enabled(args, is_paper_ssd_mode)
     paper_optimizer_deferred_mode, paper_optimizer_backend = _initialize_paper_mode_runtime_state(
         gaussians=gaussians,
@@ -1005,7 +1296,7 @@ def clm_offload_train_one_batch(
         with torch.cuda.nvtx.range("Tide activation: current block culling"):
             legacy_cull_start_ns = time.perf_counter_ns()
             _, current_camera_blocks = storage_adapter.get_visible_blocks_batch(
-                current_camera_ids
+                resident_camera_ids
             )
             legacy_block_cull_ms = (
                 time.perf_counter_ns() - legacy_cull_start_ns
@@ -1025,7 +1316,7 @@ def clm_offload_train_one_batch(
                 )
             visible_block_ids_set = set()
             cam_to_blocks = {}  # Track per-camera block visibility
-            for cam_global_idx in current_camera_ids:
+            for cam_global_idx in resident_camera_ids:
                 blocks = current_camera_blocks[int(cam_global_idx)]
                 visible_block_ids_set.update(blocks)
                 cam_to_blocks[cam_global_idx] = len(blocks)
@@ -1321,6 +1612,16 @@ def clm_offload_train_one_batch(
                         balanced_seed_fraction=float(getattr(args, 'paper_balanced_seed_fraction', 1.0)),
                         active_block_reader=active_block_reader,
                         double_buffer=double_buffer,
+                        optimizer_algorithm=(
+                            "3dgs2_tr" if sophia_enabled else "adam"
+                        ),
+                        current_optimizer_step=optimizer_step,
+                        curvature_interval=int(
+                            getattr(args, "paper_sophia_curvature_interval", 10)
+                        ),
+                        curvature_seed=int(
+                            getattr(args, "paper_sophia_curvature_seed", 1)
+                        ),
                     )
                     _configure_gpu_resident_optimizer_state(
                         gaussians=gaussians,
@@ -1442,6 +1743,7 @@ def clm_offload_train_one_batch(
     # ============================================================================
     # STAGE 2: Gaussian-level Culling (精细剔除)
     # ============================================================================
+    curvature_filters_local = []
     with torch.no_grad():
         if storage_adapter is not None:
             torch.cuda.nvtx.range_push("compact_and_calculate_filters")
@@ -1488,7 +1790,7 @@ def clm_offload_train_one_batch(
                 opacity_compact=opacity_compact,
                 scaling_compact=scaling_compact,
                 rotation_compact=rotation_compact,
-                batched_cameras=batched_cameras,
+                batched_cameras=projection_cameras,
                 log_file=log_file,
             )
             
@@ -1535,7 +1837,7 @@ def clm_offload_train_one_batch(
                 detail="calculate_filters_on_compact_resident_set",
             )
             filters_compact, projection_camera_ids, projection_gaussian_ids = calculate_filters(
-                batched_cameras,
+                projection_cameras,
                 xyz_compact,
                 opacity_compact,
                 scaling_compact,
@@ -1546,7 +1848,7 @@ def clm_offload_train_one_batch(
             if should_log_paper_sets:
                 _log_paper_gaussian_projection_metrics(
                     iteration=iteration,
-                    num_cameras=len(batched_cameras),
+                    num_cameras=len(projection_cameras),
                     resident_gaussians=num_loaded,
                     camera_ids=projection_camera_ids,
                     gaussian_ids=projection_gaussian_ids,
@@ -1580,7 +1882,7 @@ def clm_offload_train_one_batch(
                 print(f"    Cameras without Gaussians: {empty_cams}/{len(num_visible_per_cam)}")
                 
                 if empty_cams > 0:
-                    print(f"\n  ⚠️  {empty_cams}/{len(batched_cameras)} cameras see ZERO Gaussians after projection!")
+                    print(f"\n  ⚠️  {empty_cams}/{len(projection_cameras)} cameras see ZERO Gaussians after projection!")
                     print(f"  Possible causes:")
                     print(f"    1. Opacity too low (check mean opacity above)")
                     print(f"    2. Scale too small (projected radius < radius_clip={utils.get_args().radius_clip})")
@@ -1607,10 +1909,26 @@ def clm_offload_train_one_batch(
                 filters_compact=filters_compact,
                 local_to_global=local_to_global,
             )
+            if (
+                len(filters_local) != len(projection_cameras)
+                or len(filters_global) != len(projection_cameras)
+            ):
+                raise RuntimeError(
+                    "Gaussian culling did not return one filter per S1/S2 camera: "
+                    f"cameras={len(projection_cameras)}, "
+                    f"local_filters={len(filters_local)}, "
+                    f"global_filters={len(filters_global)}"
+                )
             
             # Store both for later use
             # filters_local: used in STAGE 4 for gaussians._xyz[this_filter_local]
             # filters_global: used for gradient scatter_add_ to full tensors
+            if curvature_due:
+                curvature_filters_local = filters_local[bsz:]
+                filters_local = filters_local[:bsz]
+                filters_global = filters_global[:bsz]
+            else:
+                curvature_filters_local = []
             gaussians.gpu_working_set_manager.filters_local = filters_local
             filters = filters_global
             _log_empty_paper_projection_cameras(
@@ -1645,7 +1963,7 @@ def clm_offload_train_one_batch(
                 detail="calculate_filters",
             )
             filters, camera_ids, gaussian_ids = calculate_filters(
-                batched_cameras,
+                projection_cameras,
                 xyz_gpu,
                 opacity_gpu_origin,
                 scaling_gpu_origin,
@@ -1917,6 +2235,8 @@ def clm_offload_train_one_batch(
     )
     sparse_grad_local_ids = None
     sparse_grad_components = None
+    sparse_curvature_local_ids = None
+    sparse_curvature_components = None
     sparse_visibility_indices = None
 
     if use_sparse_gpu_grad_accum:
@@ -1958,6 +2278,25 @@ def clm_offload_train_one_batch(
 
     # Stream management: default_stream for compute, comm_stream for CPU<->GPU transfers
     default_stream = torch.cuda.current_stream()
+
+    if curvature_due:
+        if not use_sparse_gpu_grad_accum:
+            raise RuntimeError(
+                "3DGS2-TR requires sparse GPU accumulation in TideGS paper SSD mode"
+            )
+        (
+            sparse_curvature_local_ids,
+            sparse_curvature_components,
+        ) = _run_single_rank_sophia_curvature_batch(
+            gaussians=gaussians,
+            scene=scene,
+            curvature_cameras=curvature_cameras,
+            curvature_filters_local=curvature_filters_local,
+            background=background,
+            pipe_args=pipe_args,
+            args=args,
+            optimizer_step=optimizer_step,
+        )
 
     # Training loop variables
     num_micro_batches = len(batched_cameras)
@@ -2853,13 +3192,17 @@ def clm_offload_train_one_batch(
             raise RuntimeError("Pure SSD release path requires --ssd_execution_mode paper.")
         if paper_optimizer_backend != 'gpu_resident':
             raise RuntimeError(
-                "Paper SSD release path only supports GPUResidentAdam. "
+                "Paper SSD release path only supports a GPU-resident optimizer. "
                 "Set --paper_optimizer_backend gpu_resident."
             )
         legacy_optimizer_range = _legacy_cuda_range(
             "optimizer_ms",
-            name="adam",
-            detail="legacy_gpu_resident_adam",
+            name="3dgs2_tr" if sophia_enabled else "adam",
+            detail=(
+                "single_rank_gpu_resident_3dgs2_tr"
+                if sophia_enabled
+                else "legacy_gpu_resident_adam"
+            ),
         )
         optimizer_step_stats = _run_gpu_resident_adam_step(
             gaussians=gaussians,
@@ -2869,6 +3212,10 @@ def clm_offload_train_one_batch(
             sparse_visibility_indices=sparse_visibility_indices,
             sparse_grad_local_ids=sparse_grad_local_ids,
             sparse_grad_components=sparse_grad_components,
+            sparse_curvature_local_ids=sparse_curvature_local_ids,
+            sparse_curvature_components=sparse_curvature_components,
+            curvature_due=curvature_due,
+            optimizer_step=optimizer_step,
             get_gpu_resident_optimizer_fn=get_gpu_resident_optimizer,
             ensure_local_to_global_mapping_fn=ensure_local_to_global_mapping,
             log_prefix="[PAPER SSD MODE]",

@@ -171,3 +171,34 @@ class ResidentAdamContext:
             with torch.enable_grad():
                 return closure()
         return None
+
+
+class ResidentSophiaTRContext(ResidentAdamContext):
+    """Metadata context for the resident 3DGS2-TR optimizer."""
+
+    def __init__(
+        self,
+        params,
+        columns_sizes,
+        columns_lr,
+        *,
+        betas=(0.9, 0.999),
+        eps=1e-15,
+        sparse=True,
+    ):
+        super().__init__(
+            params=params,
+            columns_sizes=columns_sizes,
+            columns_lr=columns_lr,
+            lr=1.0,
+            bias_correction=False,
+            betas=betas,
+            eps=eps,
+            weight_decay=0,
+            amsgrad=False,
+            adamw_mode=False,
+            fp32_optimizer_states=True,
+            fused=True,
+            sparse=sparse,
+        )
+        self.algorithm = "3dgs2_tr"
