@@ -278,6 +278,9 @@ class DistributedMetricsTest(unittest.TestCase):
             )
             row = {
                 "iteration": 33,
+                "optimizer_algorithm": "3dgs2_tr",
+                "optimizer_step": 2,
+                "curvature_due": 1,
                 "predicted_stream_in_blocks": 5,
                 "prediction_missing_blocks": 1,
                 "prediction_extra_blocks": 2,
@@ -292,11 +295,28 @@ class DistributedMetricsTest(unittest.TestCase):
                 "block_cull_output_blocks": 12,
                 "gpu_slot_capacity_blocks": 4,
                 "gpu_slot_growth_blocks": 1,
+                "rank_gradient_active_blocks": 3,
+                "rank_curvature_active_blocks": 4,
+                "owner_active_gaussians": 100,
+                "collective_participation_gaussians": 101,
+                "uses_zero_opacity_sentinel": 1,
+                "gradient_participation_rows": 80,
+                "curvature_participation_rows": 90,
+                "updated_blocks": 2,
+                "optimizer_touched_rows": 80,
+                "optimizer_cold_rows": 5,
+                "curvature_blocks": 4,
+                "curvature_rows": 90,
+                "clipped_values": 7,
+                "rows_skipped_without_curvature": 3,
+                "trust_region_epsilon": 1e-6,
                 "h2d_bytes": 400,
                 "block_reader_foreground_ms": 7.0,
                 "ssd_urgent_read_ms": 1.5,
                 "prefetch_inflight_wait_ms": 1.0,
                 "optimizer_ms": 6.0,
+                "curvature_forward_ms": 2.0,
+                "curvature_vjp_ms": 3.0,
             }
             writer.write_batch(row)
             writer.write_batch({**row, "iteration": 35})
@@ -325,6 +345,23 @@ class DistributedMetricsTest(unittest.TestCase):
             )
             self.assertEqual(global_rows[0]["gpu_slot_capacity_blocks"], "8.0")
             self.assertEqual(global_rows[0]["gpu_slot_growth_blocks"], "2.0")
+            self.assertEqual(rank_rows[0]["optimizer_algorithm"], "3dgs2_tr")
+            self.assertEqual(global_rows[0]["optimizer_algorithm"], "3dgs2_tr")
+            self.assertEqual(global_rows[0]["optimizer_step"], "2.0")
+            self.assertEqual(global_rows[0]["curvature_due"], "1.0")
+            self.assertEqual(global_rows[0]["rank_gradient_active_blocks"], "6.0")
+            self.assertEqual(global_rows[0]["rank_curvature_active_blocks"], "8.0")
+            self.assertEqual(global_rows[0]["owner_active_gaussians"], "200.0")
+            self.assertEqual(
+                global_rows[0]["collective_participation_gaussians"], "202.0"
+            )
+            self.assertEqual(global_rows[0]["uses_zero_opacity_sentinel"], "2.0")
+            self.assertEqual(global_rows[0]["optimizer_touched_rows"], "160.0")
+            self.assertEqual(global_rows[0]["curvature_rows"], "180.0")
+            self.assertEqual(global_rows[0]["clipped_values"], "14.0")
+            self.assertEqual(global_rows[0]["trust_region_epsilon"], "1e-06")
+            self.assertEqual(global_rows[0]["curvature_forward_ms_max"], "2.0")
+            self.assertEqual(global_rows[0]["curvature_vjp_ms_mean"], "3.0")
             self.assertEqual(global_rows[0]["h2d_bytes"], "800.0")
             self.assertEqual(global_rows[0]["predicted_stream_in_blocks"], "5.0")
             self.assertEqual(global_rows[0]["prediction_missing_blocks"], "1.0")

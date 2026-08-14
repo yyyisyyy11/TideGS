@@ -658,8 +658,32 @@ class GPUWorkingSet:
                 if 0 <= int(block_id) < self.num_blocks
             )
         )
-        if not sorted_visible:
-            raise ValueError("Distributed GPU working set requires resident blocks")
+        if self.gpu_xyz is None:
+            empty_widths = {
+                'xyz': 3,
+                'scaling': 3,
+                'rotation': 4,
+                'opacity': 1,
+                'features_dc': 3,
+                'features_rest': 45,
+            }
+            empty_tensors = {
+                name: torch.empty(
+                    (0, width),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                for name, width in empty_widths.items()
+            }
+            self.gpu_xyz = empty_tensors['xyz']
+            self.gpu_scaling = empty_tensors['scaling']
+            self.gpu_rotation = empty_tensors['rotation']
+            self.gpu_opacity = empty_tensors['opacity']
+            self.gpu_features_dc = empty_tensors['features_dc']
+            self.gpu_features_rest = empty_tensors['features_rest']
+            self.local_to_global_idx = torch.empty(
+                (0,), dtype=torch.long, device=self.device
+            )
 
         target_set = set(sorted_visible)
         current_set = set(self._persistent_block_to_slot)
@@ -869,7 +893,7 @@ class GPUWorkingSet:
             'hotspot_count': hotspot_count,
             'cold_count': cold_count,
             'total_count': total_count,
-            'hit_rate': hotspot_count / total_count,
+            'hit_rate': hotspot_count / total_count if total_count else 0.0,
             'memory_mb': allocated_rows * 59 * 4 / (1024 ** 2),
             'num_gaussians': num_gaussians,
             'data_reused_count': hotspot_count,

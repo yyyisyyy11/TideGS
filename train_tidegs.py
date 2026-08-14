@@ -63,9 +63,18 @@ from storage.distributed_checkpoint import (
 from strategies.tide_engine.distributed_plan import (
     DistributedBatchPlan,
     DistributedBatchPlanner,
+    DistributedPlannerState,
     build_stable_block_owner,
     validate_block_owner,
 )
+from strategies.tide_engine.checkpoint_validation import (
+    validate_pure_ssd_checkpoint_optimizer,
+)
+from strategies.tide_engine.sophia_tr_math import (
+    optimizer_step_from_iteration,
+    should_update_curvature,
+)
+from strategies.tide_engine.sophia_tr_sampling import sample_s2_camera_ids
 from strategies.tide_engine.gsplat_backend import prepare_distributed_gsplat
 from strategies.tide_engine.distributed_metrics import (
     get_distributed_metrics_writer,
@@ -83,6 +92,81 @@ CULL_METRIC_FIELDS = (
 )
 
 
+def _optimizer_algorithm(args):
+    return str(getattr(args, "paper_optimizer_algorithm", "adam")).lower()
+
+
+def _curvature_camera_ids_for_step(
+    *,
+    args,
+    training_schedule,
+    s1_camera_ids,
+    optimizer_step,
+):
+    if _optimizer_algorithm(args) != "3dgs2_tr":
+        return []
+    interval = int(getattr(args, "paper_sophia_curvature_interval", 10))
+    if not should_update_curvature(int(optimizer_step), interval):
+        return []
+    return sample_s2_camera_ids(
+        population_camera_ids=training_schedule,
+        s1_camera_ids=s1_camera_ids,
+        seed=int(getattr(args, "paper_sophia_curvature_seed", 1)),
+        optimizer_step=int(optimizer_step),
+    )
+
+
+def _union_camera_ids(s1_camera_ids, s2_camera_ids):
+    s1_ids = [int(value) for value in s1_camera_ids]
+    seen = set(s1_ids)
+    return s1_ids + [
+        int(value) for value in s2_camera_ids if int(value) not in seen
+    ]
+
+
+def _split_camera_blocks(camera_blocks, camera_ids):
+    return {
+        int(camera_id): camera_blocks[int(camera_id)]
+        for camera_id in camera_ids
+    }
+
+
+def _prepare_camera_batch_on_gpu(cameras, camera_ids):
+    if len(cameras) != len(camera_ids):
+        raise RuntimeError(
+            f"Camera batch size mismatch: cameras={len(cameras)} ids={len(camera_ids)}"
+        )
+    for uid, (camera, global_idx) in enumerate(zip(cameras, camera_ids)):
+        camera.uid = uid
+        camera.global_idx = int(global_idx)
+        camera.world_view_transform = camera.world_view_transform.cuda()
+        camera.full_proj_transform = camera.full_proj_transform.cuda()
+
+    if not cameras:
+        return
+    world_view_transforms = torch.stack(
+        [camera.world_view_transform.transpose(0, 1) for camera in cameras]
+    )
+    camera_to_world = torch.unbind(torch.inverse(world_view_transforms), dim=0)
+    for camera, inverse in zip(cameras, camera_to_world):
+        camera.K = camera.create_k_on_gpu()
+        camera.camtoworlds = inverse.unsqueeze(0)
+        camera.original_image = camera.original_image_backup.cuda()
+
+
+def _planner_state_from_manifest(value):
+    if value is None:
+        return None
+    return DistributedPlannerState(
+        resident=tuple(int(block_id) for block_id in value["resident"]),
+        active=tuple(int(block_id) for block_id in value["active"]),
+        recency={
+            int(block_id): float(score)
+            for block_id, score in value["recency"].items()
+        },
+    )
+
+
 def _prepare_distributed_block_owner(
     *,
     args,
@@ -91,12 +175,11 @@ def _prepare_distributed_block_owner(
     training_schedule,
     resume_manifest,
 ):
-    owner = None
-    if context.is_rank0:
+    def prepare_rank0_owner():
         owner_file = None if resume_manifest is None else resume_manifest.get("_tide_block_owner_file")
         if owner_file:
             owner = np.load(owner_file).astype(np.int32, copy=False)
-            args._tide_owner_policy = str(
+            owner_policy = str(
                 resume_manifest.get("_tide_owner_policy", "checkpoint")
             )
         else:
@@ -104,15 +187,34 @@ def _prepare_distributed_block_owner(
                 num_blocks=int(storage_adapter.num_blocks),
                 world_size=int(context.world_size),
             )
-            args._tide_owner_policy = "stable_round_robin"
-    owner_values = context.broadcast_object(None if owner is None else owner.tolist())
-    owner = np.asarray(owner_values, dtype=np.int32)
-    validate_block_owner(
-        owner,
-        num_blocks=int(storage_adapter.num_blocks),
-        world_size=int(context.world_size),
+            owner_policy = "stable_round_robin"
+        return {
+            "owner": owner.tolist(),
+            "owner_policy": owner_policy,
+        }
+
+    owner_payload = _run_synchronized_training_phase(
+        context,
+        phase="block owner preparation",
+        operation=prepare_rank0_owner if context.is_rank0 else None,
     )
-    storage_adapter.configure_block_ownership(owner, context.rank)
+    owner_payload = context.broadcast_object(owner_payload)
+    owner = np.asarray(owner_payload["owner"], dtype=np.int32)
+    args._tide_owner_policy = str(owner_payload["owner_policy"])
+
+    def configure_local_owner():
+        validate_block_owner(
+            owner,
+            num_blocks=int(storage_adapter.num_blocks),
+            world_size=int(context.world_size),
+        )
+        storage_adapter.configure_block_ownership(owner, context.rank)
+
+    _run_synchronized_training_phase(
+        context,
+        phase="block owner configuration",
+        operation=configure_local_owner,
+    )
     args._tide_block_owner = owner
     if context.is_rank0:
         counts = np.bincount(owner, minlength=context.world_size).tolist()
@@ -132,6 +234,7 @@ def _build_distributed_plan(
     iteration,
     batch_size,
     schedule_ordering,
+    curvature_camera_ids=None,
 ):
     schedule_info = get_camera_batch_schedule(
         training_schedule=training_schedule,
@@ -139,17 +242,36 @@ def _build_distributed_plan(
         batch_size=batch_size,
         schedule_ordering=schedule_ordering,
     )
-    payload = None
-    if context.is_rank0:
+    def build_rank0_payload():
+        rank0_curvature_camera_ids = [
+            int(value) for value in (curvature_camera_ids or [])
+        ]
+        union_camera_ids = _union_camera_ids(
+            schedule_info.batch_indices,
+            rank0_curvature_camera_ids,
+        )
         cull_start = time.perf_counter()
-        _, camera_blocks = storage_adapter.get_visible_blocks_batch(schedule_info.batch_indices)
+        _, union_camera_blocks = storage_adapter.get_visible_blocks_batch(
+            union_camera_ids
+        )
         block_cull_ms = (time.perf_counter() - cull_start) * 1000.0
+        camera_blocks = _split_camera_blocks(
+            union_camera_blocks,
+            schedule_info.batch_indices,
+        )
+        curvature_camera_blocks = (
+            _split_camera_blocks(union_camera_blocks, rank0_curvature_camera_ids)
+            if rank0_curvature_camera_ids
+            else None
+        )
         plan_start = time.perf_counter()
         plan = planner.plan(
             iteration=iteration,
             epoch=schedule_info.epoch,
             camera_ids=schedule_info.batch_indices,
             camera_blocks=camera_blocks,
+            curvature_camera_ids=(rank0_curvature_camera_ids or None),
+            curvature_camera_blocks=curvature_camera_blocks,
         )
         payload = plan.to_dict()
         payload["block_cull_ms"] = block_cull_ms
@@ -157,6 +279,13 @@ def _build_distributed_plan(
         cull_metrics = getattr(storage_adapter, "_batch_cull_metrics", None)
         if cull_metrics:
             payload.update(cull_metrics)
+        return payload
+
+    payload = _run_synchronized_training_phase(
+        context,
+        phase="initial distributed planning",
+        operation=build_rank0_payload if context.is_rank0 else None,
+    )
     return DistributedBatchPlan.from_dict(context.broadcast_object(payload)), schedule_info
 
 
@@ -176,6 +305,7 @@ def _preview_distributed_plan(
     iteration,
     batch_size,
     schedule_ordering,
+    curvature_camera_ids=None,
 ):
     schedule_info = get_camera_batch_schedule(
         training_schedule=training_schedule,
@@ -183,20 +313,37 @@ def _preview_distributed_plan(
         batch_size=batch_size,
         schedule_ordering=schedule_ordering,
     )
-    payload = None
     rank0_preview = None
-    if context.is_rank0:
+    def build_rank0_preview():
+        rank0_curvature_camera_ids = [
+            int(value) for value in (curvature_camera_ids or [])
+        ]
+        union_camera_ids = _union_camera_ids(
+            schedule_info.batch_indices,
+            rank0_curvature_camera_ids,
+        )
         cull_start = time.perf_counter()
-        bounds_generation, camera_blocks = storage_adapter.get_visible_blocks_batch(
-            schedule_info.batch_indices
+        bounds_generation, union_camera_blocks = (
+            storage_adapter.get_visible_blocks_batch(union_camera_ids)
         )
         block_cull_ms = (time.perf_counter() - cull_start) * 1000.0
+        camera_blocks = _split_camera_blocks(
+            union_camera_blocks,
+            schedule_info.batch_indices,
+        )
+        curvature_camera_blocks = (
+            _split_camera_blocks(union_camera_blocks, rank0_curvature_camera_ids)
+            if rank0_curvature_camera_ids
+            else None
+        )
         plan_start = time.perf_counter()
         plan, predicted_state = planner.preview(
             iteration=iteration,
             epoch=schedule_info.epoch,
             camera_ids=schedule_info.batch_indices,
             camera_blocks=camera_blocks,
+            curvature_camera_ids=(rank0_curvature_camera_ids or None),
+            curvature_camera_blocks=curvature_camera_blocks,
         )
         plan_ms = (time.perf_counter() - plan_start) * 1000.0
         payload = plan.to_dict()
@@ -205,11 +352,23 @@ def _preview_distributed_plan(
         cull_metrics = getattr(storage_adapter, "_batch_cull_metrics", None)
         if cull_metrics:
             payload.update(cull_metrics)
-        rank0_preview = {
+        preview = {
             "bounds_generation": int(bounds_generation),
-            "camera_blocks": _normalize_camera_blocks(camera_blocks),
+            "union_camera_blocks": _normalize_camera_blocks(
+                union_camera_blocks
+            ),
             "predicted_state": predicted_state,
         }
+        return payload, preview
+
+    preview_result = _run_synchronized_training_phase(
+        context,
+        phase="predictive distributed planning",
+        operation=build_rank0_preview if context.is_rank0 else None,
+    )
+    payload = None
+    if context.is_rank0:
+        payload, rank0_preview = preview_result
     plan = DistributedBatchPlan.from_dict(context.broadcast_object(payload))
     return plan, schedule_info, rank0_preview
 
@@ -225,6 +384,7 @@ def _finalize_distributed_plan(
     schedule_ordering,
     predicted_plan,
     rank0_preview,
+    curvature_camera_ids=None,
 ):
     schedule_info = get_camera_batch_schedule(
         training_schedule=training_schedule,
@@ -232,37 +392,65 @@ def _finalize_distributed_plan(
         batch_size=batch_size,
         schedule_ordering=schedule_ordering,
     )
-    payload = None
-    if context.is_rank0:
+    def finalize_rank0_payload():
         if rank0_preview is None:
             raise RuntimeError("Rank 0 is missing distributed plan preview state")
         if predicted_plan.global_camera_ids != schedule_info.batch_indices:
             raise RuntimeError(
                 f"Distributed prediction mismatch at iteration {iteration}"
             )
+        rank0_curvature_camera_ids = [
+            int(value) for value in (curvature_camera_ids or [])
+        ]
+        if predicted_plan.global_s2_camera_ids != rank0_curvature_camera_ids:
+            raise RuntimeError(
+                f"Distributed S2 prediction mismatch at iteration {iteration}"
+            )
+        union_camera_ids = _union_camera_ids(
+            schedule_info.batch_indices,
+            rank0_curvature_camera_ids,
+        )
 
         repair_start = time.perf_counter()
         current_generation = storage_adapter.get_bounds_generation()
         repair_cull_metrics = None
         if current_generation == rank0_preview["bounds_generation"]:
-            camera_blocks = rank0_preview["camera_blocks"]
+            union_camera_blocks = rank0_preview["union_camera_blocks"]
         else:
-            _, repaired_blocks = storage_adapter.get_visible_blocks_batch(
-                schedule_info.batch_indices
+            _, union_camera_blocks = storage_adapter.get_visible_blocks_batch(
+                union_camera_ids
             )
-            camera_blocks = _normalize_camera_blocks(repaired_blocks)
+            union_camera_blocks = _normalize_camera_blocks(
+                union_camera_blocks
+            )
             repair_cull_metrics = getattr(storage_adapter, "_batch_cull_metrics", None)
         repair_ms = (time.perf_counter() - repair_start) * 1000.0
 
-        prediction_changed = camera_blocks != rank0_preview["camera_blocks"]
+        prediction_changed = (
+            union_camera_blocks != rank0_preview["union_camera_blocks"]
+        )
         exact_plan_ms = 0.0
         if prediction_changed:
+            camera_blocks = _split_camera_blocks(
+                union_camera_blocks,
+                schedule_info.batch_indices,
+            )
+            curvature_camera_blocks = (
+                _split_camera_blocks(
+                    union_camera_blocks,
+                    rank0_curvature_camera_ids,
+                )
+                if rank0_curvature_camera_ids
+                else None
+            )
             plan_start = time.perf_counter()
             exact_plan = planner.plan(
                 iteration=iteration,
                 epoch=schedule_info.epoch,
                 camera_ids=schedule_info.batch_indices,
                 camera_blocks=camera_blocks,
+                curvature_camera_ids=(rank0_curvature_camera_ids or None),
+                curvature_camera_blocks=curvature_camera_blocks,
             )
             exact_plan_ms = (time.perf_counter() - plan_start) * 1000.0
         else:
@@ -307,7 +495,13 @@ def _finalize_distributed_plan(
         payload["prediction_replanned"] = int(prediction_changed)
         payload["prediction_repair_ms"] = repair_ms
         payload["prediction_exact_plan_ms"] = exact_plan_ms
+        return payload
 
+    payload = _run_synchronized_training_phase(
+        context,
+        phase="final distributed planning",
+        operation=finalize_rank0_payload if context.is_rank0 else None,
+    )
     plan = DistributedBatchPlan.from_dict(context.broadcast_object(payload))
     return plan, schedule_info
 
@@ -390,14 +584,60 @@ def _validate_pure_ssd_runtime(args, gaussians, storage_adapter, resolved_backen
         if getattr(gaussians, "_paper_unified_params_never_allocated", False)
         else "_unified_params released"
     )
+    optimizer_label = (
+        "GPUResident3DGS2-TR"
+        if _optimizer_algorithm(args) == "3dgs2_tr"
+        else "GPUResidentAdam"
+    )
     message = (
         "[PURE SSD CHECK] Runtime path verified: "
         f"gaussians={total_desc} blocks={num_blocks} "
-        f"block_reader=TieredCacheBlockReader optimizer=GPUResidentAdam "
+        f"block_reader=TieredCacheBlockReader optimizer={optimizer_label} "
         f"state=resident_blocks init={init_state} ram_cache_limit={cache_limit_gb:.2f}GB\n"
     )
     log_file.write(message)
     utils.print_rank_0(message.strip())
+
+
+def _run_synchronized_training_phase(context, *, phase, operation=None):
+    """Run a local storage phase and publish failures before later collectives."""
+
+    result = None
+    local_error = None
+    try:
+        if operation is not None:
+            result = operation()
+    except BaseException as error:
+        local_error = error
+
+    if not context.enabled:
+        if local_error is not None:
+            raise local_error
+        return result
+
+    statuses = context.all_gather_object(
+        {
+            "rank": int(context.rank),
+            "error": (
+                None
+                if local_error is None
+                else f"{type(local_error).__name__}: {local_error}"
+            ),
+        }
+    )
+    failures = [
+        f"rank={status.get('rank', rank)} {status['error']}"
+        for rank, status in enumerate(statuses)
+        if status.get("error")
+    ]
+    if failures:
+        synchronized_error = RuntimeError(
+            f"Distributed training {phase} failed: " + "; ".join(failures)
+        )
+        if local_error is not None:
+            raise synchronized_error from local_error
+        raise synchronized_error
+    return result
 
 
 def training(dataset_args, opt_args, pipe_args, args, log_file):
@@ -434,13 +674,25 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     torch.cuda.set_device(args.gpu)
     timers = Timer(args)
     utils.set_timers(timers)
-    if not distributed_enabled or distributed_context.is_rank0:
-        prepare_output_and_logger(dataset_args)
+    _run_synchronized_training_phase(
+        distributed_context,
+        phase="output initialization",
+        operation=(
+            lambda: prepare_output_and_logger(dataset_args)
+            if not distributed_enabled or distributed_context.is_rank0
+            else None
+        ),
+    )
     distributed_context.barrier()
     utils.log_cpu_memory_usage("at the beginning of training")
     start_from_this_iteration = 1
+    completed_optimizer_steps = 0
     pure_ssd_resume_manifest = None
-    pure_ssd_prebuilt_manifest = _load_pure_ssd_prebuilt_manifest(args)
+    pure_ssd_prebuilt_manifest = _run_synchronized_training_phase(
+        distributed_context,
+        phase="prebuilt manifest validation",
+        operation=lambda: _load_pure_ssd_prebuilt_manifest(args),
+    )
     if pure_ssd_prebuilt_manifest is not None and args.start_checkpoint != "":
         raise ValueError(
             "--pure_ssd_prebuilt_manifest is for fresh runs from an existing SSD base; "
@@ -459,27 +711,54 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         log_file.write(prebuilt_msg + "\n")
     if args.start_checkpoint != "":
         if distributed_enabled:
-            if not is_distributed_checkpoint(args.start_checkpoint):
-                raise ValueError(
-                    "gaussian_sharded mode only resumes distributed Pure SSD checkpoints."
+            def load_distributed_resume_manifest():
+                if not is_distributed_checkpoint(args.start_checkpoint):
+                    raise ValueError(
+                        "gaussian_sharded mode only resumes distributed Pure SSD "
+                        "checkpoints."
+                    )
+                return load_distributed_checkpoint_manifest(
+                    args.start_checkpoint,
+                    rank=distributed_context.rank,
+                    world_size=distributed_context.world_size,
+                    global_bsz=args.bsz,
+                    args=args,
                 )
-            pure_ssd_resume_manifest = load_distributed_checkpoint_manifest(
-                args.start_checkpoint,
-                rank=distributed_context.rank,
-                world_size=distributed_context.world_size,
-                global_bsz=args.bsz,
-            )
-            args.paper_resident_capacity_blocks = int(
-                pure_ssd_resume_manifest["_tide_global_capacity_blocks"]
+
+            pure_ssd_resume_manifest = _run_synchronized_training_phase(
+                distributed_context,
+                phase="distributed checkpoint resume validation",
+                operation=load_distributed_resume_manifest,
             )
         else:
             if not is_pure_ssd_checkpoint(args.start_checkpoint):
                 raise ValueError(
                     "train_tidegs.py only resumes pure SSD checkpoints."
                 )
-            pure_ssd_resume_manifest = load_pure_ssd_checkpoint_manifest(args.start_checkpoint)
+            pure_ssd_resume_manifest = load_pure_ssd_checkpoint_manifest(
+                args.start_checkpoint
+            )
+            validate_pure_ssd_checkpoint_optimizer(
+                args,
+                pure_ssd_resume_manifest,
+            )
         args._pure_ssd_resume_manifest = pure_ssd_resume_manifest
         start_from_this_iteration = int(pure_ssd_resume_manifest["next_iteration"])
+        derived_completed_steps = max(
+            0,
+            (start_from_this_iteration - 1) // int(args.bsz),
+        )
+        completed_optimizer_steps = int(
+            pure_ssd_resume_manifest.get(
+                "_tide_global_optimizer_step",
+                derived_completed_steps,
+            )
+        )
+        if completed_optimizer_steps != derived_completed_steps:
+            raise ValueError(
+                "Checkpoint optimizer step does not match next_iteration/global batch: "
+                f"step={completed_optimizer_steps} expected={derived_completed_steps}"
+            )
         args.gaussian_block_size = int(pure_ssd_resume_manifest["block_size"])
         resume_msg = (
             "[PURE SSD RESUME] loaded checkpoint: "
@@ -504,7 +783,11 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     ssd_training_schedule = None
 
     with torch.no_grad():
-        scene = Scene(args, gaussians)
+        scene = _run_synchronized_training_phase(
+            distributed_context,
+            phase="scene initialization",
+            operation=lambda: Scene(args, gaussians),
+        )
         utils.print_rank_0("[SSD] Initializing Tide storage engine...")
         storage_dir = (
             os.path.join(args.ssd_cache_dir, f"rank_{distributed_context.rank}")
@@ -533,18 +816,38 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         ssd_schedule_ordering = getattr(args, "ssd_schedule_ordering", "trajectory")
         ssd_schedule_shuffle = ssd_schedule_ordering == "shuffle"
         if distributed_enabled:
-            storage_adapter = None
-            ssd_training_schedule = None
-            if distributed_context.is_rank0:
-                storage_adapter = create_storage_adapter()
-                ssd_training_schedule = storage_adapter.get_training_schedule(
+            def create_rank0_storage_and_schedule():
+                rank0_adapter = create_storage_adapter()
+                rank0_schedule = rank0_adapter.get_training_schedule(
                     shuffle=ssd_schedule_shuffle
                 )
+                return rank0_adapter, rank0_schedule
+
+            rank0_result = _run_synchronized_training_phase(
+                distributed_context,
+                phase="rank 0 storage and schedule initialization",
+                operation=(
+                    create_rank0_storage_and_schedule
+                    if distributed_context.is_rank0
+                    else None
+                ),
+            )
+            if distributed_context.is_rank0:
+                storage_adapter, ssd_training_schedule = rank0_result
             ssd_training_schedule = distributed_context.broadcast_object(
                 ssd_training_schedule
             )
+            worker_adapter = _run_synchronized_training_phase(
+                distributed_context,
+                phase="worker storage initialization",
+                operation=(
+                    create_storage_adapter
+                    if not distributed_context.is_rank0
+                    else None
+                ),
+            )
             if not distributed_context.is_rank0:
-                storage_adapter = create_storage_adapter()
+                storage_adapter = worker_adapter
             distributed_context.barrier()
         else:
             storage_adapter = create_storage_adapter()
@@ -625,6 +928,13 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     balanced_seed_fraction=float(args.paper_balanced_seed_fraction),
                     camera_assignment=str(args.tide_camera_assignment),
                 )
+                resume_planner_state = _planner_state_from_manifest(
+                    None
+                    if pure_ssd_resume_manifest is None
+                    else pure_ssd_resume_manifest.get("_tide_planner_state")
+                )
+                if resume_planner_state is not None:
+                    distributed_planner.restore_state(resume_planner_state)
             log_file.write(
                 f"[DISTRIBUTED] rank={distributed_context.rank}/{distributed_context.world_size} "
                 f"local_gpu={distributed_context.local_rank} "
@@ -632,9 +942,20 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             )
 
         if pure_ssd_resume_manifest is not None:
-            msg = "[PURE SSD RESUME] GPUResidentAdam cold-started; Adam moments are not restored"
+            optimizer_label = (
+                "3DGS2-TR"
+                if _optimizer_algorithm(args) == "3dgs2_tr"
+                else "Adam"
+            )
+            msg = (
+                f"[PURE SSD RESUME] GPUResident{optimizer_label} cold-started; "
+                "optimizer EMA state is not restored"
+            )
             utils.print_rank_0(msg)
             log_file.write(msg + "\n")
+
+        gaussians._tide_global_optimizer_step = int(completed_optimizer_steps)
+        args._tide_global_optimizer_step = int(completed_optimizer_steps)
 
         scene.log_scene_info_to_file(log_file, "Scene Info Before Training")
     emergency_compaction_free_gb = resolve_emergency_free_gb(
@@ -756,6 +1077,11 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     gaussians._paper_optimizer_backend = 'gpu_resident'
     _enable_optimizer_churn_logging("pure_ssd_gpu_resident")
     camera_batch_prefetcher = CameraBatchPrefetcher(train_dataset)
+    curvature_camera_batch_prefetcher = (
+        CameraBatchPrefetcher(train_dataset)
+        if _optimizer_algorithm(args) == "3dgs2_tr"
+        else None
+    )
     timeline_writer = (
         get_distributed_metrics_writer(gaussians, distributed_context)
         if args.tide_detailed_metrics
@@ -768,7 +1094,29 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         if callable(set_timeline_enabled):
             set_timeline_enabled(True)
     current_distributed_plan = None
+    initial_optimizer_step = optimizer_step_from_iteration(
+        start_from_this_iteration,
+        int(args.bsz),
+    )
+    if initial_optimizer_step != completed_optimizer_steps + 1:
+        raise ValueError(
+            "Resume optimizer clock is inconsistent with start iteration: "
+            f"next_step={completed_optimizer_steps + 1} "
+            f"iteration_step={initial_optimizer_step}"
+        )
     if distributed_enabled:
+        initial_schedule = get_camera_batch_schedule(
+            training_schedule=ssd_training_schedule,
+            iteration=start_from_this_iteration,
+            batch_size=args.bsz,
+            schedule_ordering=getattr(args, "ssd_schedule_ordering", "trajectory"),
+        )
+        initial_s2_camera_ids = _curvature_camera_ids_for_step(
+            args=args,
+            training_schedule=ssd_training_schedule,
+            s1_camera_ids=initial_schedule.batch_indices,
+            optimizer_step=initial_optimizer_step,
+        )
         current_distributed_plan, _ = _build_distributed_plan(
             context=distributed_context,
             planner=distributed_planner,
@@ -777,11 +1125,15 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             iteration=start_from_this_iteration,
             batch_size=args.bsz,
             schedule_ordering=getattr(args, "ssd_schedule_ordering", "trajectory"),
+            curvature_camera_ids=initial_s2_camera_ids,
         )
         initial_camera_ids = current_distributed_plan.rank_camera_ids[
             distributed_context.rank
         ]
         initial_resident = current_distributed_plan.rank_resident_blocks[
+            distributed_context.rank
+        ]
+        initial_curvature_camera_ids = current_distributed_plan.rank_s2_camera_ids[
             distributed_context.rank
         ]
         gaussians._block_reader.hint_future(
@@ -796,7 +1148,17 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             schedule_ordering=getattr(args, "ssd_schedule_ordering", "trajectory"),
         )
         initial_camera_ids = initial_camera_schedule.batch_indices
+        initial_curvature_camera_ids = _curvature_camera_ids_for_step(
+            args=args,
+            training_schedule=ssd_training_schedule,
+            s1_camera_ids=initial_camera_ids,
+            optimizer_step=initial_optimizer_step,
+        )
     camera_batch_prefetcher.submit(initial_camera_ids)
+    if initial_curvature_camera_ids:
+        if curvature_camera_batch_prefetcher is None:
+            raise RuntimeError("3DGS2-TR S2 prefetcher is not initialized")
+        curvature_camera_batch_prefetcher.submit(initial_curvature_camera_ids)
     # ============================================================================
     # STAGE 2: MAIN TRAINING LOOP
     # ============================================================================
@@ -823,6 +1185,13 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
         progress_bar.update(args.bsz)
         utils.set_cur_iter(iteration)
+        optimizer_step = optimizer_step_from_iteration(iteration, int(args.bsz))
+        if optimizer_step != completed_optimizer_steps + 1:
+            raise RuntimeError(
+                "Global optimizer clock diverged from the training iteration: "
+                f"iteration={iteration} step={optimizer_step} "
+                f"completed={completed_optimizer_steps}"
+            )
         gaussians.update_learning_rate(iteration)  # Learning rate scheduling
         num_trained_batches += 1
         last_iteration = iteration
@@ -877,6 +1246,12 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             schedule_ordering=getattr(args, "ssd_schedule_ordering", "trajectory"),
         )
         global_batch_indices = schedule_info.batch_indices
+        global_curvature_batch_indices = _curvature_camera_ids_for_step(
+            args=args,
+            training_schedule=ssd_training_schedule,
+            s1_camera_ids=global_batch_indices,
+            optimizer_step=optimizer_step,
+        )
         if distributed_enabled:
             if (
                 current_distributed_plan is None
@@ -886,11 +1261,29 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 raise RuntimeError(
                     f"Distributed plan mismatch at iteration {iteration}"
                 )
+            if (
+                current_distributed_plan.global_s2_camera_ids
+                != global_curvature_batch_indices
+            ):
+                raise RuntimeError(
+                    f"Distributed S2 plan mismatch at iteration {iteration}"
+                )
             batch_indices = current_distributed_plan.rank_camera_ids[
                 distributed_context.rank
             ]
+            curvature_batch_indices = (
+                current_distributed_plan.rank_s2_camera_ids[
+                    distributed_context.rank
+                ]
+            )
         else:
             batch_indices = global_batch_indices
+            curvature_batch_indices = global_curvature_batch_indices
+        checkpoint_planner_state = (
+            distributed_planner.snapshot_state()
+            if distributed_enabled and distributed_context.is_rank0
+            else None
+        )
         epoch = schedule_info.epoch
         within_epoch_idx = schedule_info.within_epoch_idx
         n_batches = schedule_info.num_batches
@@ -907,9 +1300,33 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 optimizer_churn_state['current_epoch'] = epoch
 
         batched_cameras = camera_batch_prefetcher.get(batch_indices)
+        curvature_cameras = []
+        if curvature_batch_indices:
+            if curvature_camera_batch_prefetcher is None:
+                raise RuntimeError("3DGS2-TR S2 prefetcher is not initialized")
+            curvature_cameras = curvature_camera_batch_prefetcher.get(
+                curvature_batch_indices
+            )
         nvtx.range_pop()
 
         next_iteration = iteration + args.bsz
+        next_optimizer_step = optimizer_step + 1
+        next_curvature_camera_ids = []
+        if next_iteration <= opt_args.iterations:
+            next_schedule = get_camera_batch_schedule(
+                training_schedule=ssd_training_schedule,
+                iteration=next_iteration,
+                batch_size=args.bsz,
+                schedule_ordering=getattr(
+                    args, "ssd_schedule_ordering", "trajectory"
+                ),
+            )
+            next_curvature_camera_ids = _curvature_camera_ids_for_step(
+                args=args,
+                training_schedule=ssd_training_schedule,
+                s1_camera_ids=next_schedule.batch_indices,
+                optimizer_step=next_optimizer_step,
+            )
         next_distributed_prediction = None
         next_distributed_rank0_preview = None
         if distributed_enabled and next_iteration <= opt_args.iterations:
@@ -929,6 +1346,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 schedule_ordering=getattr(
                     args, "ssd_schedule_ordering", "trajectory"
                 ),
+                curvature_camera_ids=next_curvature_camera_ids,
             )
             preview_end_ns = time.perf_counter_ns()
             if timeline_writer is not None:
@@ -955,13 +1373,13 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 
         if not distributed_enabled and next_iteration <= opt_args.iterations:
             nvtx.range_push("Outer: next_camera_prefetch_submit")
-            next_camera_schedule = get_camera_batch_schedule(
-                training_schedule=ssd_training_schedule,
-                iteration=next_iteration,
-                batch_size=args.bsz,
-                schedule_ordering=getattr(args, "ssd_schedule_ordering", "trajectory"),
-            )
-            camera_batch_prefetcher.submit(next_camera_schedule.batch_indices)
+            camera_batch_prefetcher.submit(next_schedule.batch_indices)
+            if next_curvature_camera_ids:
+                if curvature_camera_batch_prefetcher is None:
+                    raise RuntimeError("3DGS2-TR S2 prefetcher is not initialized")
+                curvature_camera_batch_prefetcher.submit(
+                    next_curvature_camera_ids
+                )
             nvtx.range_pop()
 
         if iteration % 100 == 0:
@@ -975,51 +1393,18 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 
         timers.stop("dataloader: load the next image from disk and decode")
 
-        for uid, (c, global_idx) in enumerate(zip(batched_cameras, batch_indices)):
-            c.uid = uid
-            c.global_idx = global_idx
-
         # ------------------------------------------------------------------------
         # 2.3: Transfer camera matrices to GPU
         # ------------------------------------------------------------------------
         nvtx.range_push("Outer: camera_h2d")
         timers.start("send cam matrices to gpu")
-        # Transfer world-view and projection transforms
-        for camera in batched_cameras:
-            camera.world_view_transform = camera.world_view_transform.cuda()
-            camera.full_proj_transform = camera.full_proj_transform.cuda()
-
-        # Create camera intrinsics (K matrix) and compute camera-to-world transforms
-        batched_world_view_transform = []
-        for camera in batched_cameras:
-            camera.K = camera.create_k_on_gpu()
-            batched_world_view_transform.append(
-                camera.world_view_transform.transpose(0, 1)
-            )
-
-        # Batch process: compute inverse transforms for all cameras
-        batched_world_view_transform = torch.stack(batched_world_view_transform)
-        batched_world_view_transform_inverse = torch.inverse( # torch.tensor, (4, 4, 4)
-            batched_world_view_transform
-        )
-        batched_world_view_transform_inverse = torch.unbind( # tuple
-            batched_world_view_transform_inverse, dim=0
-        )
-
-        # Store camera-to-world transforms (for view direction computation)
-        for camera, wvt in zip(batched_cameras, batched_world_view_transform_inverse):
-            camera.camtoworlds = wvt.unsqueeze(0)
-        # TODO: maybe we can save them on GPU during initialization. After all, they do not take up lots of memory.
-        timers.stop("send cam matrices to gpu")
-
-        # ------------------------------------------------------------------------
-        # 2.4: Load ground-truth images to GPU
-        # ------------------------------------------------------------------------
         with torch.no_grad():
-            timers.start("load_cameras")
-            for camera in batched_cameras:
-                camera.original_image = camera.original_image_backup.cuda()
-            timers.stop("load_cameras")
+            _prepare_camera_batch_on_gpu(batched_cameras, batch_indices)
+            _prepare_camera_batch_on_gpu(
+                curvature_cameras,
+                curvature_batch_indices,
+            )
+        timers.stop("send cam matrices to gpu")
         nvtx.range_pop()
         assert args.bsz > 1, "Pipelined offload requires batch size > 1"
         losses, ordered_cams, sparsity = train_tide_batch(
@@ -1035,7 +1420,13 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             training_schedule=ssd_training_schedule,
             distributed_plan=current_distributed_plan,
             distributed_context=distributed_context,
+            curvature_cameras=curvature_cameras,
+            optimizer_step=optimizer_step,
         )
+
+        completed_optimizer_steps = optimizer_step
+        gaussians._tide_global_optimizer_step = int(completed_optimizer_steps)
+        args._tide_global_optimizer_step = int(completed_optimizer_steps)
 
         mem_mon.tick(iteration)
 
@@ -1049,6 +1440,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 f"[WARNING] Iteration {iteration}: All {len(batched_cameras)} cameras see no Gaussians; "
                 "skipping optimizer step.\n"
             )
+            for camera in batched_cameras + curvature_cameras:
+                camera.original_image = None
             continue
 
         batched_cameras = [batched_cameras[i] for i in ordered_cams]
@@ -1141,6 +1534,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     schedule_ordering=getattr(args, "ssd_schedule_ordering", "trajectory"),
                     predicted_plan=next_distributed_prediction,
                     rank0_preview=next_distributed_rank0_preview,
+                    curvature_camera_ids=next_curvature_camera_ids,
                 )
                 finalize_end_ns = time.perf_counter_ns()
                 if timeline_writer is not None:
@@ -1172,6 +1566,13 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 camera_batch_prefetcher.submit(
                     next_distributed_plan.rank_camera_ids[rank]
                 )
+                next_rank_s2 = next_distributed_plan.rank_s2_camera_ids[rank]
+                if next_rank_s2:
+                    if curvature_camera_batch_prefetcher is None:
+                        raise RuntimeError(
+                            "3DGS2-TR S2 prefetcher is not initialized"
+                        )
+                    curvature_camera_batch_prefetcher.submit(next_rank_s2)
             current_distributed_plan = next_distributed_plan
 
         matched_checkpoint_iterations = [
@@ -1188,7 +1589,11 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         )
         is_final_batch = next_iteration > opt_args.iterations
         if matched_checkpoint_iterations or is_final_batch:
-            storage_adapter.flush_resident_dirty()
+            _run_synchronized_training_phase(
+                distributed_context,
+                phase="resident dirty flush",
+                operation=storage_adapter.flush_resident_dirty,
+            )
         compaction_result = run_compaction_maintenance(
             context=distributed_context,
             storage_adapter=storage_adapter,
@@ -1257,7 +1662,11 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 log_file.write(
                     f"[ITER {iteration}] Saving Pure SSD Checkpoint {checkpoint_iteration}\n"
                 )
-                storage_adapter.drain_cache_writebacks()
+                _run_synchronized_training_phase(
+                    distributed_context,
+                    phase="checkpoint writeback drain",
+                    operation=storage_adapter.drain_cache_writebacks,
+                )
                 pure_ssd_checkpoint_mode = str(
                     getattr(args, "pure_ssd_checkpoint_mode", "incremental")
                 ).lower()
@@ -1271,6 +1680,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                         next_iteration=iteration + args.bsz,
                         args=args,
                         block_owner=args._tide_block_owner,
+                        planner_state=checkpoint_planner_state,
+                        global_optimizer_step=completed_optimizer_steps,
                         log_file=log_file,
                     )
                 elif pure_ssd_checkpoint_mode == "snapshot":
@@ -1294,12 +1705,18 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                         args=args,
                         log_file=log_file,
                     )
+                prune_operation = None
                 if not distributed_enabled or distributed_context.is_rank0:
-                    prune_checkpoint_history(
+                    prune_operation = lambda: prune_checkpoint_history(
                         scene.model_path,
                         keep_last=getattr(args, "pure_ssd_checkpoint_keep_last", 2),
                         log_file=log_file,
                     )
+                _run_synchronized_training_phase(
+                    distributed_context,
+                    phase="checkpoint history prune",
+                    operation=prune_operation,
+                )
                 distributed_context.barrier()
                 end2end_timers.start()
 
@@ -1312,6 +1729,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         # Release camera image memory
         nvtx.range_push("Outer: camera_cleanup")
         for viewpoint_cam in batched_cameras:
+            viewpoint_cam.original_image = None
+        for viewpoint_cam in curvature_cameras:
             viewpoint_cam.original_image = None
         nvtx.range_pop()
 
@@ -1356,6 +1775,15 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         f"ready_hits={camera_prefetch_stats['ready_hits']} "
         f"wait_seconds={camera_prefetch_stats['wait_seconds']:.6f}\n"
     )
+    if curvature_camera_batch_prefetcher is not None:
+        curvature_prefetch_stats = curvature_camera_batch_prefetcher.get_stats()
+        curvature_camera_batch_prefetcher.close()
+        log_file.write(
+            "[S2 CAMERA PREFETCH] "
+            f"batches={curvature_prefetch_stats['batches']} "
+            f"ready_hits={curvature_prefetch_stats['ready_hits']} "
+            f"wait_seconds={curvature_prefetch_stats['wait_seconds']:.6f}\n"
+        )
 
     # ============================================================================
     # STAGE 3: POST-TRAINING CLEANUP AND REPORTING
@@ -1387,10 +1815,21 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             legacy_collector = getattr(
                 gaussians, "_tide_legacy_cuda_metrics_collector", None
             )
-            if legacy_collector is not None:
-                legacy_collector.finalize()
+            _run_synchronized_training_phase(
+                distributed_context,
+                phase="legacy metrics finalize",
+                operation=(
+                    None
+                    if legacy_collector is None
+                    else legacy_collector.finalize
+                ),
+            )
         if not final_storage_maintenance_complete:
-            storage_adapter.flush_resident_dirty()
+            _run_synchronized_training_phase(
+                distributed_context,
+                phase="shutdown resident dirty flush",
+                operation=storage_adapter.flush_resident_dirty,
+            )
             compaction_result = run_compaction_maintenance(
                 context=distributed_context,
                 storage_adapter=storage_adapter,
@@ -1407,21 +1846,42 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 flush_dirty_cache=True,
             )
             if compaction_result is not None:
-                get_distributed_metrics_writer(
+                _run_synchronized_training_phase(
+                    distributed_context,
+                    phase="compaction metrics write",
+                    operation=lambda: get_distributed_metrics_writer(
+                        gaussians,
+                        distributed_context,
+                    ).write_compaction(compaction_result),
+                )
+        _run_synchronized_training_phase(
+            distributed_context,
+            phase="storage shutdown",
+            operation=lambda: storage_adapter.shutdown(
+                compact_storage=False
+            ),
+        )
+        if args.tide_detailed_metrics:
+            def finalize_distributed_metrics():
+                metrics_writer = get_distributed_metrics_writer(
                     gaussians,
                     distributed_context,
-                ).write_compaction(compaction_result)
-        storage_adapter.shutdown(compact_storage=False)
-        if args.tide_detailed_metrics:
-            metrics_writer = get_distributed_metrics_writer(
-                gaussians,
+                )
+                metrics_writer.write_io_events(
+                    storage_adapter.cache.drain_io_events()
+                )
+                metrics_writer.finalize_async_metrics()
+
+            _run_synchronized_training_phase(
                 distributed_context,
+                phase="distributed metrics finalize",
+                operation=finalize_distributed_metrics,
             )
-            metrics_writer.write_io_events(
-                storage_adapter.cache.drain_io_events()
-            )
-            metrics_writer.finalize_async_metrics()
-        shutdown_double_buffer_gpu()
+        _run_synchronized_training_phase(
+            distributed_context,
+            phase="double buffer shutdown",
+            operation=shutdown_double_buffer_gpu,
+        )
         distributed_context.barrier()
 
     scene.clean_up()

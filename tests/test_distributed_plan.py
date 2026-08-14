@@ -79,6 +79,14 @@ class DistributedPlanTest(unittest.TestCase):
         )
         restored = DistributedBatchPlan.from_dict(plan.to_dict())
         self.assertEqual(restored, plan)
+        self.assertEqual(plan.global_s1_camera_ids, plan.global_camera_ids)
+        self.assertEqual(plan.rank_s1_camera_ids, plan.rank_camera_ids)
+        self.assertEqual(plan.global_s2_camera_ids, [])
+        self.assertEqual(plan.rank_s2_camera_ids, [[], [], [], []])
+        self.assertEqual(
+            plan.rank_gradient_active_blocks, plan.rank_active_blocks
+        )
+        self.assertEqual(plan.rank_curvature_active_blocks, [[], [], [], []])
         self.assertEqual([len(values) for values in plan.rank_camera_ids], [4, 4, 4, 4])
         self.assertEqual(
             sorted(value for values in plan.rank_camera_ids for value in values), camera_ids
@@ -122,6 +130,126 @@ class DistributedPlanTest(unittest.TestCase):
                 camera_ids=[0, 1, 2, 2],
                 camera_blocks={camera_id: [camera_id] for camera_id in range(4)},
             )
+
+    def test_curvature_batch_uses_union_residency_and_separate_active_sets(self):
+        owner = np.asarray([block_id % 2 for block_id in range(8)], dtype=np.int32)
+        planner = DistributedBatchPlanner(
+            block_owner=owner,
+            total_points=32,
+            block_size=4,
+            world_size=2,
+            resident_capacity_blocks=8,
+            resident_lambda=1.0,
+            resident_recency_decay=0.95,
+            balanced_seed_fraction=1.0,
+            camera_assignment="gaussian_balanced",
+        )
+        plan = planner.plan(
+            iteration=1,
+            epoch=0,
+            camera_ids=[0, 1, 2, 3],
+            camera_blocks={0: [0], 1: [1], 2: [2], 3: [3]},
+            curvature_camera_ids=[2, 3, 4, 5],
+            curvature_camera_blocks={2: [2, 4], 3: [3, 5], 4: [6], 5: [7]},
+        )
+
+        self.assertEqual(plan.global_s1_camera_ids, [0, 1, 2, 3])
+        self.assertEqual(plan.global_s2_camera_ids, [2, 3, 4, 5])
+        self.assertEqual(
+            [len(values) for values in plan.rank_s1_camera_ids], [2, 2]
+        )
+        self.assertEqual(
+            [len(values) for values in plan.rank_s2_camera_ids], [2, 2]
+        )
+        self.assertEqual(plan.global_gradient_active_blocks, [0, 1, 2, 3])
+        self.assertEqual(
+            plan.global_curvature_active_blocks, [2, 3, 4, 5, 6, 7]
+        )
+        self.assertEqual(plan.global_union_active_blocks, list(range(8)))
+        self.assertEqual(plan.global_resident_blocks, list(range(8)))
+        self.assertEqual(plan.rank_owner_active_rows, [16, 16])
+        self.assertEqual(plan.rank_participation_rows, [16, 16])
+        self.assertEqual(
+            DistributedBatchPlan.from_dict(plan.to_dict()), plan
+        )
+
+    def test_empty_owner_uses_one_collective_participation_row(self):
+        planner = DistributedBatchPlanner(
+            block_owner=np.asarray([0, 0], dtype=np.int32),
+            total_points=8,
+            block_size=4,
+            world_size=2,
+            resident_capacity_blocks=1,
+            resident_lambda=1.0,
+            resident_recency_decay=0.95,
+            balanced_seed_fraction=1.0,
+            camera_assignment="equal",
+        )
+
+        plan = planner.plan(
+            iteration=1,
+            epoch=0,
+            camera_ids=[0, 1],
+            camera_blocks={0: [0], 1: [0]},
+        )
+
+        self.assertEqual(plan.rank_owner_active_rows, [4, 0])
+        self.assertEqual(plan.rank_participation_rows, [4, 1])
+
+    def test_curvature_batch_must_match_s1_global_size(self):
+        planner = DistributedBatchPlanner(
+            block_owner=np.asarray([0, 1, 0, 1], dtype=np.int32),
+            total_points=16,
+            block_size=4,
+            world_size=2,
+            resident_capacity_blocks=4,
+            resident_lambda=0.3,
+            resident_recency_decay=0.95,
+            balanced_seed_fraction=1.0,
+            camera_assignment="equal",
+        )
+        with self.assertRaisesRegex(ValueError, "S2 global camera count"):
+            planner.plan(
+                iteration=1,
+                epoch=0,
+                camera_ids=[0, 1, 2, 3],
+                camera_blocks={camera_id: [camera_id] for camera_id in range(4)},
+                curvature_camera_ids=[0, 1],
+                curvature_camera_blocks={0: [0], 1: [1]},
+            )
+
+    def test_plan_rejects_inconsistent_rank_s2_assignment(self):
+        with self.assertRaisesRegex(ValueError, "every global S2 camera"):
+            DistributedBatchPlan(
+                iteration=1,
+                epoch=0,
+                global_camera_ids=[0, 1],
+                rank_camera_ids=[[0], [1]],
+                rank_resident_blocks=[[0], [1]],
+                rank_active_blocks=[[0], [1]],
+                global_s2_camera_ids=[2, 3],
+                rank_s2_camera_ids=[[2], [2]],
+            )
+
+    def test_legacy_payload_defaults_to_s1_only(self):
+        payload = {
+            "iteration": 7,
+            "epoch": 1,
+            "global_camera_ids": [10, 11],
+            "rank_camera_ids": [[10], [11]],
+            "rank_resident_blocks": [[0], [1]],
+            "rank_active_blocks": [[0], [1]],
+        }
+
+        plan = DistributedBatchPlan.from_dict(payload)
+
+        self.assertEqual(plan.global_s1_camera_ids, [10, 11])
+        self.assertEqual(plan.rank_s1_camera_ids, [[10], [11]])
+        self.assertEqual(plan.global_s2_camera_ids, [])
+        self.assertEqual(plan.rank_s2_camera_ids, [[], []])
+        self.assertEqual(plan.global_gradient_active_blocks, [0, 1])
+        self.assertEqual(plan.global_curvature_active_blocks, [])
+        self.assertEqual(plan.global_union_active_blocks, [0, 1])
 
     def test_preview_does_not_advance_planner_until_state_is_committed(self):
         planner = DistributedBatchPlanner(

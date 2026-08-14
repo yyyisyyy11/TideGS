@@ -1,5 +1,6 @@
 import json
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -89,6 +90,41 @@ class DistributedCheckpointCompatTest(unittest.TestCase):
             )
             self.assertEqual(manifest["_tide_global_capacity_blocks"], 8192)
             self.assertEqual(manifest["_tide_owner_policy"], "stable_round_robin")
+
+    def test_v2_loader_rejects_3dgs2_tr_resume_but_accepts_adam(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = self._write_checkpoint(
+                directory,
+                {
+                    "checkpoint_version": 2,
+                    "world_size": 1,
+                    "global_bsz": 8,
+                    "next_iteration": 17,
+                    "rank_manifests": ["rank_0"],
+                    "block_owner": "block_owner.npy",
+                    "block_bounds": "block_bounds.npy",
+                    "global_capacity_blocks": 5,
+                },
+            )
+            sophia_args = types.SimpleNamespace(
+                paper_optimizer_algorithm="3dgs2_tr"
+            )
+            with self.assertRaisesRegex(ValueError, "only resume with Adam"):
+                load_distributed_checkpoint_manifest(
+                    checkpoint,
+                    rank=0,
+                    world_size=1,
+                    global_bsz=8,
+                    args=sophia_args,
+                )
+
+            load_distributed_checkpoint_manifest(
+                checkpoint,
+                rank=0,
+                world_size=1,
+                global_bsz=8,
+                args=types.SimpleNamespace(paper_optimizer_algorithm="adam"),
+            )
 
 
 if __name__ == "__main__":

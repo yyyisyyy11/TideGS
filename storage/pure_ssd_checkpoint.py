@@ -185,6 +185,35 @@ def _manifest_base(storage_adapter, gaussians) -> Dict[str, Any]:
     return manifest
 
 
+def _optimizer_manifest_args(args) -> Dict[str, Any]:
+    names = (
+        "paper_optimizer_backend",
+        "paper_optimizer_state_mode",
+        "paper_optimizer_algorithm",
+        "paper_sophia_beta1",
+        "paper_sophia_beta2",
+        "paper_sophia_curvature_interval",
+        "paper_sophia_hutchinson_samples",
+        "paper_sophia_curvature_estimator",
+        "paper_sophia_curvature_seed",
+        "paper_sophia_gamma",
+        "paper_sophia_epsilon",
+        "paper_tr_epsilon_init",
+        "paper_tr_epsilon_final",
+        "paper_tr_quat_norm",
+        "paper_resident_capacity_blocks",
+        "paper_resident_selection_policy",
+        "paper_resident_lambda",
+        "paper_resident_recency_decay",
+        "paper_balanced_seed_fraction",
+        "lambda_dssim",
+        "ssd_schedule_ordering",
+        "bsz",
+        "iterations",
+    )
+    return {name: getattr(args, name, None) for name in names}
+
+
 def write_pure_ssd_snapshot_checkpoint(
     *,
     storage_adapter,
@@ -303,11 +332,9 @@ def write_pure_ssd_snapshot_checkpoint(
         "scene_min": np.asarray(scene_min, dtype=np.float32).tolist(),
         "scene_max": np.asarray(scene_max, dtype=np.float32).tolist(),
         "args": {
+            **_optimizer_manifest_args(args),
             "ssd_execution_mode": getattr(args, "ssd_execution_mode", None),
-            "paper_optimizer_backend": getattr(args, "paper_optimizer_backend", None),
-            "paper_optimizer_state_mode": getattr(args, "paper_optimizer_state_mode", None),
             "paper_block_reader_backend": getattr(args, "paper_block_reader_backend", None),
-            "paper_resident_capacity_blocks": getattr(args, "paper_resident_capacity_blocks", None),
         },
     }
 
@@ -316,6 +343,8 @@ def write_pure_ssd_snapshot_checkpoint(
             "next_iteration": int(next_iteration),
             "active_sh_degree": int(getattr(gaussians, "active_sh_degree", 0)),
             "optimizer_state_mode": "cold_start",
+            "optimizer_algorithm": getattr(args, "paper_optimizer_algorithm", "adam"),
+            "optimizer_state_saved": False,
             "adam_moments_saved": False,
         },
         training_state_file,
@@ -443,11 +472,9 @@ def write_pure_ssd_incremental_checkpoint(
         "scene_min": np.asarray(scene_min, dtype=np.float32).tolist(),
         "scene_max": np.asarray(scene_max, dtype=np.float32).tolist(),
         "args": {
+            **_optimizer_manifest_args(args),
             "ssd_execution_mode": getattr(args, "ssd_execution_mode", None),
-            "paper_optimizer_backend": getattr(args, "paper_optimizer_backend", None),
-            "paper_optimizer_state_mode": getattr(args, "paper_optimizer_state_mode", None),
             "paper_block_reader_backend": getattr(args, "paper_block_reader_backend", None),
-            "paper_resident_capacity_blocks": getattr(args, "paper_resident_capacity_blocks", None),
             "pure_ssd_checkpoint_mode": getattr(args, "pure_ssd_checkpoint_mode", None),
             "pure_ssd_checkpoint_patch_mode": patch_file_mode,
             "pure_ssd_checkpoint_keep_last": getattr(args, "pure_ssd_checkpoint_keep_last", None),
@@ -492,6 +519,8 @@ def write_pure_ssd_incremental_checkpoint(
             "next_iteration": int(next_iteration),
             "active_sh_degree": int(getattr(gaussians, "active_sh_degree", 0)),
             "optimizer_state_mode": "cold_start",
+            "optimizer_algorithm": getattr(args, "paper_optimizer_algorithm", "adam"),
+            "optimizer_state_saved": False,
             "adam_moments_saved": False,
             "storage_index": str(storage_index_file.resolve()),
         },

@@ -108,6 +108,48 @@ class GPUWorkingSetRetentionTest(unittest.TestCase):
             )
         return manager._persistent_component_tensors()
 
+    def test_empty_resident_set_supports_collective_sentinel(self):
+        manager = self._manager()
+        reader = _Reader(total_gaussians=16, block_size=4)
+
+        tensors, empty_stats = self._load(
+            manager,
+            reader,
+            [],
+            enable_retention=False,
+        )
+
+        self.assertEqual(
+            {name: tuple(tensor.shape) for name, tensor in tensors.items()},
+            {
+                "xyz": (0, 3),
+                "scaling": (0, 3),
+                "rotation": (0, 4),
+                "opacity": (0, 1),
+                "features_dc": (0, 3),
+                "features_rest": (0, 45),
+            },
+        )
+        self.assertEqual(empty_stats["total_count"], 0)
+        self.assertEqual(empty_stats["hit_rate"], 0.0)
+        self.assertEqual(manager.loaded_blocks, [])
+        self.assertEqual(manager.block_to_gpu_slice, {})
+
+        tensors, _ = self._load(manager, reader, [0], enable_retention=True)
+        self._bind_as_parameters(manager, tensors)
+        tensors, empty_stats = self._load(
+            manager,
+            reader,
+            [],
+            enable_retention=True,
+        )
+
+        self.assertEqual(empty_stats["total_count"], 0)
+        self.assertEqual(empty_stats["num_gaussians"], 0)
+        self.assertEqual(manager.loaded_blocks, [])
+        self.assertEqual(manager.block_to_gpu_slice, {})
+        self.assertTrue(bool((manager.local_to_global_idx == -1).all()))
+
     def test_retained_block_stays_in_place_and_only_delta_is_read(self):
         manager = self._manager()
         reader = _Reader(total_gaussians=16, block_size=4)
