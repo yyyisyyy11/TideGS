@@ -73,6 +73,36 @@ def _read_rows(path):
 
 
 class DistributedMetricsTest(unittest.TestCase):
+    def test_grad_zero_metrics_write_rank_and_global_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = DistributedMetricsWriter(
+                args=SimpleNamespace(
+                    log_folder=directory,
+                    tide_detailed_metrics=False,
+                    tide_grad_zero_metrics=True,
+                    tide_grad_zero_metrics_interval=2,
+                ),
+                context=_Context(),
+            )
+            self.assertTrue(writer.should_write_grad_zero(4))
+            self.assertFalse(writer.should_write_grad_zero(5))
+            writer.write_grad_zero(
+                {
+                    "iteration": 4,
+                    "projection_cull_unique_gaussians": 3,
+                    "projection_cull_parameter_elements": 177,
+                    "projection_cull_zero_gradient_elements": 111,
+                    "projection_cull_all_zero_gradient_gaussians": 1,
+                    "projection_cull_zero_gradient_elements_52_gaussians": 1,
+                }
+            )
+            rank_rows = _read_rows(Path(directory) / "metrics_grad_zero_rank0.tsv")
+            global_rows = _read_rows(Path(directory) / "metrics_grad_zero_global.tsv")
+            self.assertEqual(rank_rows[0]["projection_cull_zero_gradient_elements"], "111")
+            self.assertEqual(global_rows[0]["world_size"], "2")
+            self.assertEqual(global_rows[0]["projection_cull_unique_gaussians"], "6")
+            self.assertEqual(global_rows[0]["projection_cull_zero_gradient_elements_52_gaussians"], "2")
+
     def test_legacy_collector_defers_cuda_read_and_writes_single_rank_schema(self):
         with tempfile.TemporaryDirectory() as directory:
             writer = DistributedMetricsWriter(

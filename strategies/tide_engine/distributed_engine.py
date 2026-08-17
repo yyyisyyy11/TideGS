@@ -41,6 +41,16 @@ _LEAF_NAMES = (
     "features_rest",
 )
 
+_LEAF_WIDTHS = {
+    "xyz": 3,
+    "opacity": 1,
+    "scaling": 3,
+    "rotation": 4,
+    "features_dc": 3,
+    "features_rest": 45,
+}
+_PARAMETERS_PER_GAUSSIAN = sum(_LEAF_WIDTHS.values())
+
 
 @dataclass
 class DistributedResidentState:
@@ -466,6 +476,104 @@ def _touched_component_rows(
     return torch.nonzero(touched, as_tuple=False).reshape(-1)
 
 
+def _mark_projection_cull_survivors(
+    survivor_mask: torch.Tensor,
+    meta: Dict[str, object],
+    active_count: int,
+) -> None:
+    """Union packed gsplat ``radii > 0`` rows into owner-local IDs."""
+
+    if int(active_count) == 0:
+        return
+    gaussian_ids = meta.get("gaussian_ids")
+    radii = meta.get("radii")
+    if not torch.is_tensor(gaussian_ids) or not torch.is_tensor(radii):
+        raise RuntimeError(
+            "Gradient-zero profiling requires packed gsplat gaussian_ids and radii"
+        )
+    gaussian_ids = gaussian_ids.reshape(-1)
+    radii = radii.reshape(-1)
+    if gaussian_ids.numel() != radii.numel():
+        raise RuntimeError(
+            "gsplat metadata gaussian_ids/radii length mismatch during profiling"
+        )
+    visible_ids = gaussian_ids[radii > 0]
+    if visible_ids.numel() == 0:
+        return
+    if (
+        int(visible_ids.min()) < 0
+        or int(visible_ids.max()) >= int(active_count)
+    ):
+        raise RuntimeError(
+            "Distributed gsplat returned a projection Gaussian ID outside the "
+            f"owner-local range [0, {int(active_count)})"
+        )
+    survivor_mask[visible_ids] = True
+
+
+def _projection_cull_gradient_zero_stats(
+    components: Dict[str, torch.Tensor],
+    survivor_mask: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    """Return exact-zero statistics for the 59 gradient scalars of each survivor."""
+
+    active_count = int(survivor_mask.numel())
+    if active_count == 0:
+        return {
+            "values": torch.zeros(
+                4 + 2 * len(_LEAF_NAMES) + _PARAMETERS_PER_GAUSSIAN + 1,
+                dtype=torch.long,
+                device=survivor_mask.device,
+            )
+        }
+    for name, width in _LEAF_WIDTHS.items():
+        value = components.get(name)
+        if not torch.is_tensor(value) or int(value.shape[0]) != active_count:
+            raise RuntimeError(
+                f"Gradient-zero profiling received invalid {name!r} rows: "
+                f"expected={active_count}, actual={getattr(value, 'shape', None)}"
+            )
+        if int(value.flatten(start_dim=1).shape[1]) != width:
+            raise RuntimeError(
+                f"Gradient-zero profiling expected {_LEAF_WIDTHS[name]} values per "
+                f"Gaussian for {name!r}"
+            )
+
+    survivor_rows = torch.nonzero(survivor_mask, as_tuple=False).reshape(-1)
+    survivor_count = int(survivor_rows.numel())
+    device = survivor_mask.device
+    row_zero_counts = torch.zeros(
+        (survivor_count,), dtype=torch.long, device=device
+    )
+    values = []
+    for name in _LEAF_NAMES:
+        component = components[name].detach().index_select(0, survivor_rows)
+        zero_count = (component == 0).flatten(start_dim=1).sum(dim=1)
+        row_zero_counts.add_(zero_count)
+        values.extend(
+            [
+                torch.tensor(component.numel(), dtype=torch.long, device=device),
+                zero_count.sum(dtype=torch.long),
+            ]
+        )
+    histogram = torch.bincount(
+        row_zero_counts, minlength=_PARAMETERS_PER_GAUSSIAN + 1
+    )
+    values = [
+        torch.tensor(survivor_count, dtype=torch.long, device=device),
+        torch.tensor(
+            survivor_count * _PARAMETERS_PER_GAUSSIAN,
+            dtype=torch.long,
+            device=device,
+        ),
+        row_zero_counts.sum(dtype=torch.long),
+        histogram[_PARAMETERS_PER_GAUSSIAN],
+        *values,
+        *histogram.unbind(),
+    ]
+    return {"values": torch.stack(values)}
+
+
 def _sync_bounds(
     *,
     context: DistributedContext,
@@ -640,6 +748,12 @@ def train_distributed_tide_batch(
     curvature_forward_ranges = []
     curvature_vjp_ranges = []
     probe_device = leaves["xyz"].device
+    grad_zero_sample_due = metrics_writer.should_write_grad_zero(iteration)
+    projection_cull_survivor_mask = (
+        torch.zeros((owner_active_rows,), dtype=torch.bool, device=probe_device)
+        if grad_zero_sample_due
+        else None
+    )
     slot_capacity_blocks = int(
         retention_stats.get("gpu_slot_capacity_blocks", 0)
     )
@@ -904,6 +1018,12 @@ def train_distributed_tide_batch(
             projection_events = meta.get(PROJECTION_TIMING_FIX)
             if projection_events is not None:
                 projection_event_pairs.append(projection_events)
+            if grad_zero_sample_due:
+                _mark_projection_cull_survivors(
+                    projection_cull_survivor_mask,
+                    meta,
+                    owner_active_rows,
+                )
             detached_losses.extend(loss.detach() for loss in micro_losses)
             write_memory_point(
                 phase="after_forward",
@@ -970,6 +1090,7 @@ def train_distributed_tide_batch(
         raise RuntimeError("Distributed TideGS produced no local losses")
 
     sparse_error = None
+    grad_zero_values = None
     try:
         owner_grad_components = {
             name: (
@@ -979,6 +1100,13 @@ def train_distributed_tide_batch(
             )
             for name in _LEAF_NAMES
         }
+        if grad_zero_sample_due:
+            grad_zero_values = (
+                _projection_cull_gradient_zero_stats(
+                    owner_grad_components,
+                    projection_cull_survivor_mask,
+                )["values"].detach().cpu().tolist()
+            )
         gradient_active = _touched_component_rows(
             owner_grad_components,
             owner_active_rows,
@@ -1008,6 +1136,29 @@ def train_distributed_tide_batch(
         phase="sparse gradient/curvature preparation",
         error=sparse_error,
     )
+    if grad_zero_sample_due:
+        grad_zero_fields = (
+            "projection_cull_unique_gaussians",
+            "projection_cull_parameter_elements",
+            "projection_cull_zero_gradient_elements",
+            "projection_cull_all_zero_gradient_gaussians",
+        ) + tuple(
+            field
+            for name in _LEAF_NAMES
+            for field in (
+                f"projection_cull_{name}_parameter_elements",
+                f"projection_cull_{name}_zero_gradient_elements",
+            )
+        ) + tuple(
+            f"projection_cull_zero_gradient_elements_{count}_gaussians"
+            for count in range(_PARAMETERS_PER_GAUSSIAN + 1)
+        )
+        metrics_writer.write_grad_zero(
+            {
+                "iteration": iteration,
+                **dict(zip(grad_zero_fields, grad_zero_values)),
+            }
+        )
 
     optimizer_submit_ns = time.perf_counter_ns() if timeline_enabled else None
     optimizer_start = torch.cuda.Event(enable_timing=True)

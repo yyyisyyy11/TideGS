@@ -234,6 +234,8 @@ class AuxiliaryParams(ParamGroup):
         self.tide_camera_microbatch = 4  # Cameras rendered per distributed gsplat call
         self.tide_owner_balance_samples = 256  # Legacy compatibility; stable round-robin ignores it
         self.tide_detailed_metrics = False  # Write per-rank/global batch and I/O metrics
+        self.tide_grad_zero_metrics = False  # Profile exact zero gradient elements after projection cull
+        self.tide_grad_zero_metrics_interval = 1  # Profile every N optimizer iterations
         self.tide_block_cull_backend = "cpu"  # {cpu, gpu}; frustum block cull backend
         self.tide_block_cull_camera_chunk = 8  # GPU cull cameras per chunk
         # Public TideGS aliases. These map onto the internal paper_* names for

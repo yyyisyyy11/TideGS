@@ -92,6 +92,31 @@ BATCH_FIELDS = [
     "next_plan_target_iteration",
 ]
 
+GRAD_ZERO_COMPONENTS = (
+    "xyz",
+    "opacity",
+    "scaling",
+    "rotation",
+    "features_dc",
+    "features_rest",
+)
+GRAD_ZERO_HISTOGRAM_FIELDS = [
+    f"projection_cull_zero_gradient_elements_{count}_gaussians"
+    for count in range(60)
+]
+GRAD_ZERO_VALUE_FIELDS = [
+    "projection_cull_unique_gaussians",
+    "projection_cull_parameter_elements",
+    "projection_cull_zero_gradient_elements",
+    "projection_cull_all_zero_gradient_gaussians",
+] + [
+    f"projection_cull_{component}_{suffix}"
+    for component in GRAD_ZERO_COMPONENTS
+    for suffix in ("parameter_elements", "zero_gradient_elements")
+] + GRAD_ZERO_HISTOGRAM_FIELDS
+GRAD_ZERO_FIELDS = ["iteration", "rank"] + GRAD_ZERO_VALUE_FIELDS
+GRAD_ZERO_GLOBAL_FIELDS = ["iteration", "world_size"] + GRAD_ZERO_VALUE_FIELDS
+
 IO_FIELDS = [
     "operation",
     "tier",
@@ -293,12 +318,24 @@ class DistributedMetricsWriter:
     def __init__(self, *, args, context):
         self.context = context
         self.enabled = bool(getattr(args, "tide_detailed_metrics", False))
+        self.grad_zero_enabled = bool(
+            getattr(args, "tide_grad_zero_metrics", False)
+        )
+        self.grad_zero_interval = max(
+            1, int(getattr(args, "tide_grad_zero_metrics_interval", 1))
+        )
         self.rank_path = Path(args.log_folder) / f"metrics_batch_rank{context.rank}.tsv"
         self.io_path = Path(args.log_folder) / f"metrics_io_rank{context.rank}.tsv"
         self.timeline_path = (
             Path(args.log_folder) / f"timeline_events_rank{context.rank}.jsonl"
         )
         self.global_path = Path(args.log_folder) / "metrics_batch_global.tsv"
+        self.grad_zero_rank_path = (
+            Path(args.log_folder) / f"metrics_grad_zero_rank{context.rank}.tsv"
+        )
+        self.grad_zero_global_path = (
+            Path(args.log_folder) / "metrics_grad_zero_global.tsv"
+        )
         self.async_rank_path = (
             Path(args.log_folder)
             / f"metrics_async_iteration_rank{context.rank}.tsv"
@@ -318,6 +355,38 @@ class DistributedMetricsWriter:
         self._timeline_lock = threading.Lock()
         self._timeline_host = socket.gethostname()
         self._timeline_pid = os.getpid()
+
+    def should_write_grad_zero(self, iteration: int) -> bool:
+        return self.grad_zero_enabled and int(iteration) % self.grad_zero_interval == 0
+
+    def write_grad_zero(self, row: Dict[str, object]) -> None:
+        """Write exact zero-gradient counts for projection-cull survivors.
+
+        Gaussian ownership is disjoint across ranks, so summing the per-rank
+        unique-row counts and 0..59 histogram yields the global distribution.
+        """
+
+        if not self.grad_zero_enabled:
+            return
+        rank_row = dict(row)
+        rank_row["rank"] = self.context.rank
+        _append_tsv(self.grad_zero_rank_path, GRAD_ZERO_FIELDS, rank_row)
+        rank_rows: List[Dict[str, object]] = self.context.all_gather_object(rank_row)
+        if not self.context.is_rank0:
+            return
+        global_row: Dict[str, object] = {
+            "iteration": int(rank_row["iteration"]),
+            "world_size": int(self.context.world_size),
+        }
+        for field in GRAD_ZERO_VALUE_FIELDS:
+            global_row[field] = sum(
+                int(value.get(field, 0)) for value in rank_rows
+            )
+        _append_tsv(
+            self.grad_zero_global_path,
+            GRAD_ZERO_GLOBAL_FIELDS,
+            global_row,
+        )
 
     def write_timeline_event(
         self,

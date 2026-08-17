@@ -48,6 +48,35 @@ def _load_local_ids_for_blocks():
     return namespace["_local_ids_for_blocks"]
 
 
+def _load_gradient_zero_helpers():
+    tree = ast.parse(ENGINE_PATH.read_text(encoding="utf-8"))
+    names = {
+        "_LEAF_NAMES",
+        "_LEAF_WIDTHS",
+        "_PARAMETERS_PER_GAUSSIAN",
+        "_mark_projection_cull_survivors",
+        "_projection_cull_gradient_zero_stats",
+    }
+    nodes = []
+    for node in tree.body:
+        if isinstance(node, (ast.Assign, ast.FunctionDef)):
+            targets = (
+                [target.id for target in node.targets if isinstance(target, ast.Name)]
+                if isinstance(node, ast.Assign)
+                else [node.name]
+            )
+            if any(name in names for name in targets):
+                nodes.append(node)
+    module = ast.Module(body=nodes, type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"Dict": Dict, "torch": torch}
+    exec(compile(module, str(ENGINE_PATH), "exec"), namespace)
+    return (
+        namespace["_mark_projection_cull_survivors"],
+        namespace["_projection_cull_gradient_zero_stats"],
+    )
+
+
 @unittest.skipIf(torch is None, "torch is unavailable")
 class DistributedOwnerActiveRowsTest(unittest.TestCase):
     def test_block_rows_follow_persistent_slot_order(self):
@@ -122,6 +151,68 @@ class DistributedOwnerActiveRowsTest(unittest.TestCase):
                 3,
                 torch.device("cpu"),
             )
+
+    def test_projection_cull_gradient_zero_stats_are_exact_and_row_grouped(self):
+        mark_survivors, gradient_zero_stats = _load_gradient_zero_helpers()
+        mask = torch.zeros((4,), dtype=torch.bool)
+        mark_survivors(
+            mask,
+            {
+                "gaussian_ids": torch.tensor([0, 2, 2, 3]),
+                "radii": torch.tensor([1, 0, 2, 3]),
+            },
+            active_count=4,
+        )
+        self.assertEqual(mask.tolist(), [True, False, True, True])
+
+        components = {
+            "xyz": torch.tensor([
+                [0.0, 0.0, 0.0],
+                [5.0, 5.0, 5.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 1.0],
+            ]),
+            "opacity": torch.tensor([[0.0], [5.0], [0.0], [1.0]]),
+            "scaling": torch.tensor([
+                [0.0, 0.0, 0.0],
+                [5.0, 5.0, 5.0],
+                [0.0, 2.0, 0.0],
+                [1.0, 1.0, 1.0],
+            ]),
+            "rotation": torch.tensor([
+                [0.0, 0.0, 0.0, 0.0],
+                [5.0, 5.0, 5.0, 5.0],
+                [0.0, 0.0, 0.0, 3.0],
+                [1.0, 1.0, 1.0, 1.0],
+            ]),
+            "features_dc": torch.tensor([
+                [0.0, 0.0, 0.0],
+                [5.0, 5.0, 5.0],
+                [0.0, 0.0, 0.0],
+                [1.0, 1.0, 1.0],
+            ]),
+            "features_rest": torch.stack([
+                torch.zeros((15, 3)),
+                torch.full((15, 3), 5.0),
+                torch.cat([torch.ones(4), torch.zeros(41)]).reshape(15, 3),
+                torch.ones((15, 3)),
+            ]),
+        }
+
+        values = gradient_zero_stats(components, mask)["values"].tolist()
+        self.assertEqual(values[:16], [3, 177, 111, 1, 9, 5, 3, 2, 9, 5, 12, 7, 9, 6, 135, 86])
+        histogram = values[16:]
+        self.assertEqual(len(histogram), 60)
+        self.assertEqual(histogram[0], 1)
+        self.assertEqual(histogram[52], 1)
+        self.assertEqual(histogram[59], 1)
+        self.assertEqual(sum(histogram), 3)
+
+    def test_projection_cull_gradient_zero_stats_handles_empty_owner(self):
+        _, gradient_zero_stats = _load_gradient_zero_helpers()
+        values = gradient_zero_stats({}, torch.zeros((0,), dtype=torch.bool))["values"]
+        self.assertEqual(tuple(values.shape), (76,))
+        self.assertEqual(int(values.sum()), 0)
 
 
 if __name__ == "__main__":
