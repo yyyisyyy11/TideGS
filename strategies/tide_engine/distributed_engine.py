@@ -16,7 +16,11 @@ from strategies.base_engine import torch_compiled_loss
 from utils.distributed import DistributedContext
 
 from .distributed_plan import DistributedBatchPlan
-from .distributed_metrics import get_distributed_metrics_writer
+from .distributed_metrics import (
+    GRAD_NEAR_ZERO_THRESHOLDS,
+    GRAD_ZERO_VALUE_FIELDS,
+    get_distributed_metrics_writer,
+)
 from .engine import get_gpu_resident_optimizer
 from .gsplat_backend import (
     PROJECTION_TIMING_FIX,
@@ -514,18 +518,34 @@ def _mark_projection_cull_survivors(
 def _projection_cull_gradient_zero_stats(
     components: Dict[str, torch.Tensor],
     survivor_mask: torch.Tensor,
+    *,
+    near_zero_threshold: float = 1e-8,
+    sample_rows: int = 0,
+    chunk_rows: int = 262144,
 ) -> Dict[str, torch.Tensor]:
-    """Return exact-zero statistics for the 59 gradient scalars of each survivor."""
+    """Profile the 59 gradient scalars per projection survivor in bounded chunks."""
 
     active_count = int(survivor_mask.numel())
     if active_count == 0:
         return {
             "values": torch.zeros(
-                4 + 2 * len(_LEAF_NAMES) + _PARAMETERS_PER_GAUSSIAN + 1,
+                len(GRAD_ZERO_VALUE_FIELDS),
                 dtype=torch.long,
                 device=survivor_mask.device,
-            )
+            ),
+            "sample_owner_rows": torch.empty(
+                (0,), dtype=torch.long, device=survivor_mask.device
+            ),
+            "sample_gradients": torch.empty(
+                (0, _PARAMETERS_PER_GAUSSIAN),
+                dtype=torch.float32,
+                device=survivor_mask.device,
+            ),
         }
+    near_zero_threshold = float(near_zero_threshold)
+    if near_zero_threshold < 0.0:
+        raise ValueError("near_zero_threshold must be non-negative")
+    chunk_rows = max(1, int(chunk_rows))
     for name, width in _LEAF_WIDTHS.items():
         value = components.get(name)
         if not torch.is_tensor(value) or int(value.shape[0]) != active_count:
@@ -543,21 +563,87 @@ def _projection_cull_gradient_zero_stats(
     survivor_count = int(survivor_rows.numel())
     device = survivor_mask.device
     row_zero_counts = torch.zeros(
-        (survivor_count,), dtype=torch.long, device=device
+        (survivor_count,), dtype=torch.int16, device=device
     )
-    values = []
-    for name in _LEAF_NAMES:
-        component = components[name].detach().index_select(0, survivor_rows)
-        zero_count = (component == 0).flatten(start_dim=1).sum(dim=1)
-        row_zero_counts.add_(zero_count)
-        values.extend(
-            [
-                torch.tensor(component.numel(), dtype=torch.long, device=device),
-                zero_count.sum(dtype=torch.long),
-            ]
+    row_near_zero_counts = torch.zeros(
+        (survivor_count,), dtype=torch.int16, device=device
+    )
+    sample_rows = int(sample_rows)
+    sample_count = (
+        survivor_count
+        if sample_rows == -1
+        else min(max(0, sample_rows), survivor_count)
+    )
+    if sample_count:
+        sample_positions = torch.div(
+            torch.arange(sample_count, dtype=torch.long, device=device)
+            * survivor_count,
+            sample_count,
+            rounding_mode="floor",
         )
-    histogram = torch.bincount(
-        row_zero_counts, minlength=_PARAMETERS_PER_GAUSSIAN + 1
+        sample_owner_rows = survivor_rows.index_select(0, sample_positions)
+    else:
+        sample_owner_rows = torch.empty((0,), dtype=torch.long, device=device)
+
+    component_values = []
+    component_near_values = []
+    sample_components = []
+    total_nonfinite = torch.zeros((), dtype=torch.long, device=device)
+    total_near_values = [
+        torch.zeros((), dtype=torch.long, device=device)
+        for _ in GRAD_NEAR_ZERO_THRESHOLDS
+    ]
+    for name in _LEAF_NAMES:
+        value = components[name].detach()
+        component_zero = torch.zeros((), dtype=torch.long, device=device)
+        component_nonfinite = torch.zeros((), dtype=torch.long, device=device)
+        component_near = [
+            torch.zeros((), dtype=torch.long, device=device)
+            for _ in GRAD_NEAR_ZERO_THRESHOLDS
+        ]
+        for start in range(0, survivor_count, chunk_rows):
+            end = min(start + chunk_rows, survivor_count)
+            owner_rows = survivor_rows[start:end]
+            flat = value.index_select(0, owner_rows).flatten(start_dim=1)
+            absolute = flat.abs()
+            exact_by_row = (flat == 0).sum(dim=1)
+            near_by_row = (absolute <= near_zero_threshold).sum(dim=1)
+            row_zero_counts[start:end].add_(exact_by_row.to(torch.int16))
+            row_near_zero_counts[start:end].add_(near_by_row.to(torch.int16))
+            component_zero.add_(exact_by_row.sum(dtype=torch.long))
+            component_nonfinite.add_((~torch.isfinite(flat)).sum(dtype=torch.long))
+            for threshold_index, (_, threshold) in enumerate(
+                GRAD_NEAR_ZERO_THRESHOLDS
+            ):
+                component_near[threshold_index].add_(
+                    (absolute <= threshold).sum(dtype=torch.long)
+                )
+        total_nonfinite.add_(component_nonfinite)
+        for threshold_index, count in enumerate(component_near):
+            total_near_values[threshold_index].add_(count)
+        component_values.extend(
+            (
+                torch.tensor(
+                    survivor_count * _LEAF_WIDTHS[name],
+                    dtype=torch.long,
+                    device=device,
+                ),
+                component_zero,
+                component_nonfinite,
+            )
+        )
+        component_near_values.extend(component_near)
+        if sample_count:
+            sample_components.append(
+                value.index_select(0, sample_owner_rows).flatten(start_dim=1)
+            )
+
+    zero_histogram = torch.bincount(
+        row_zero_counts.to(torch.long), minlength=_PARAMETERS_PER_GAUSSIAN + 1
+    )
+    near_zero_histogram = torch.bincount(
+        row_near_zero_counts.to(torch.long),
+        minlength=_PARAMETERS_PER_GAUSSIAN + 1,
     )
     values = [
         torch.tensor(survivor_count, dtype=torch.long, device=device),
@@ -567,11 +653,34 @@ def _projection_cull_gradient_zero_stats(
             device=device,
         ),
         row_zero_counts.sum(dtype=torch.long),
-        histogram[_PARAMETERS_PER_GAUSSIAN],
-        *values,
-        *histogram.unbind(),
+        total_nonfinite,
+        zero_histogram[_PARAMETERS_PER_GAUSSIAN],
+        torch.tensor(sample_count, dtype=torch.long, device=device),
+        *component_values,
+        *total_near_values,
+        *component_near_values,
+        *zero_histogram.unbind(),
+        *near_zero_histogram.unbind(),
     ]
-    return {"values": torch.stack(values)}
+    if len(values) != len(GRAD_ZERO_VALUE_FIELDS):
+        raise RuntimeError(
+            "Gradient sparsity field/value mismatch: "
+            f"fields={len(GRAD_ZERO_VALUE_FIELDS)} values={len(values)}"
+        )
+    sample_gradients = (
+        torch.cat(sample_components, dim=1).contiguous()
+        if sample_components
+        else torch.empty(
+            (0, _PARAMETERS_PER_GAUSSIAN),
+            dtype=torch.float32,
+            device=device,
+        )
+    )
+    return {
+        "values": torch.stack(values),
+        "sample_owner_rows": sample_owner_rows,
+        "sample_gradients": sample_gradients,
+    }
 
 
 def _sync_bounds(
@@ -748,7 +857,7 @@ def train_distributed_tide_batch(
     curvature_forward_ranges = []
     curvature_vjp_ranges = []
     probe_device = leaves["xyz"].device
-    grad_zero_sample_due = metrics_writer.should_write_grad_zero(iteration)
+    grad_zero_sample_due = metrics_writer.should_write_grad_zero(optimizer_step)
     projection_cull_survivor_mask = (
         torch.zeros((owner_active_rows,), dtype=torch.bool, device=probe_device)
         if grad_zero_sample_due
@@ -1091,6 +1200,7 @@ def train_distributed_tide_batch(
 
     sparse_error = None
     grad_zero_values = None
+    grad_sample_payload = None
     try:
         owner_grad_components = {
             name: (
@@ -1101,12 +1211,35 @@ def train_distributed_tide_batch(
             for name in _LEAF_NAMES
         }
         if grad_zero_sample_due:
-            grad_zero_values = (
-                _projection_cull_gradient_zero_stats(
-                    owner_grad_components,
-                    projection_cull_survivor_mask,
-                )["values"].detach().cpu().tolist()
+            grad_profile = _projection_cull_gradient_zero_stats(
+                owner_grad_components,
+                projection_cull_survivor_mask,
+                near_zero_threshold=metrics_writer.grad_near_zero_threshold,
+                sample_rows=metrics_writer.grad_sample_rows,
+                chunk_rows=metrics_writer.grad_stats_chunk_rows,
             )
+            grad_zero_values = grad_profile["values"].detach().cpu().tolist()
+            sample_owner_rows = grad_profile["sample_owner_rows"]
+            sample_local_ids = active_local_ids.index_select(
+                0, sample_owner_rows
+            )
+            grad_sample_payload = {
+                "format_version": 1,
+                "iteration": iteration,
+                "optimizer_step": optimizer_step,
+                "near_zero_threshold": metrics_writer.grad_near_zero_threshold,
+                "parameter_names": _LEAF_NAMES,
+                "parameter_widths": tuple(
+                    _LEAF_WIDTHS[name] for name in _LEAF_NAMES
+                ),
+                "owner_active_rows": owner_active_rows,
+                "projection_cull_unique_gaussians": int(
+                    projection_cull_survivor_mask.sum().item()
+                ),
+                "owner_active_row_indices": sample_owner_rows.detach().cpu(),
+                "resident_local_ids": sample_local_ids.detach().cpu(),
+                "gradients": grad_profile["sample_gradients"].detach().cpu(),
+            }
         gradient_active = _touched_component_rows(
             owner_grad_components,
             owner_active_rows,
@@ -1137,28 +1270,15 @@ def train_distributed_tide_batch(
         error=sparse_error,
     )
     if grad_zero_sample_due:
-        grad_zero_fields = (
-            "projection_cull_unique_gaussians",
-            "projection_cull_parameter_elements",
-            "projection_cull_zero_gradient_elements",
-            "projection_cull_all_zero_gradient_gaussians",
-        ) + tuple(
-            field
-            for name in _LEAF_NAMES
-            for field in (
-                f"projection_cull_{name}_parameter_elements",
-                f"projection_cull_{name}_zero_gradient_elements",
-            )
-        ) + tuple(
-            f"projection_cull_zero_gradient_elements_{count}_gaussians"
-            for count in range(_PARAMETERS_PER_GAUSSIAN + 1)
-        )
         metrics_writer.write_grad_zero(
             {
                 "iteration": iteration,
-                **dict(zip(grad_zero_fields, grad_zero_values)),
+                "optimizer_step": optimizer_step,
+                "near_zero_threshold": metrics_writer.grad_near_zero_threshold,
+                **dict(zip(GRAD_ZERO_VALUE_FIELDS, grad_zero_values)),
             }
         )
+        metrics_writer.write_grad_sample(grad_sample_payload)
 
     optimizer_submit_ns = time.perf_counter_ns() if timeline_enabled else None
     optimizer_start = torch.cuda.Event(enable_timing=True)

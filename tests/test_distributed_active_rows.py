@@ -4,6 +4,11 @@ from types import SimpleNamespace
 from typing import Dict, Sequence
 import unittest
 
+from strategies.tide_engine.distributed_metrics import (
+    GRAD_NEAR_ZERO_THRESHOLDS,
+    GRAD_ZERO_VALUE_FIELDS,
+)
+
 try:
     import torch
 except ModuleNotFoundError:
@@ -28,7 +33,12 @@ def _load_touched_component_rows():
     )
     module = ast.Module(body=[function], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"Dict": Dict, "torch": torch}
+    namespace = {
+        "Dict": Dict,
+        "torch": torch,
+        "GRAD_NEAR_ZERO_THRESHOLDS": GRAD_NEAR_ZERO_THRESHOLDS,
+        "GRAD_ZERO_VALUE_FIELDS": GRAD_ZERO_VALUE_FIELDS,
+    }
     exec(compile(module, str(ENGINE_PATH), "exec"), namespace)
     return namespace["_touched_component_rows"]
 
@@ -69,7 +79,12 @@ def _load_gradient_zero_helpers():
                 nodes.append(node)
     module = ast.Module(body=nodes, type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"Dict": Dict, "torch": torch}
+    namespace = {
+        "Dict": Dict,
+        "torch": torch,
+        "GRAD_NEAR_ZERO_THRESHOLDS": GRAD_NEAR_ZERO_THRESHOLDS,
+        "GRAD_ZERO_VALUE_FIELDS": GRAD_ZERO_VALUE_FIELDS,
+    }
     exec(compile(module, str(ENGINE_PATH), "exec"), namespace)
     return (
         namespace["_mark_projection_cull_survivors"],
@@ -169,7 +184,7 @@ class DistributedOwnerActiveRowsTest(unittest.TestCase):
             "xyz": torch.tensor([
                 [0.0, 0.0, 0.0],
                 [5.0, 5.0, 5.0],
-                [1.0, 0.0, 0.0],
+                [1e-9, 0.0, 0.0],
                 [1.0, 1.0, 1.0],
             ]),
             "opacity": torch.tensor([[0.0], [5.0], [0.0], [1.0]]),
@@ -199,20 +214,59 @@ class DistributedOwnerActiveRowsTest(unittest.TestCase):
             ]),
         }
 
-        values = gradient_zero_stats(components, mask)["values"].tolist()
-        self.assertEqual(values[:16], [3, 177, 111, 1, 9, 5, 3, 2, 9, 5, 12, 7, 9, 6, 135, 86])
-        histogram = values[16:]
-        self.assertEqual(len(histogram), 60)
-        self.assertEqual(histogram[0], 1)
-        self.assertEqual(histogram[52], 1)
-        self.assertEqual(histogram[59], 1)
-        self.assertEqual(sum(histogram), 3)
+        profile = gradient_zero_stats(
+            components,
+            mask,
+            near_zero_threshold=1e-8,
+            sample_rows=2,
+            chunk_rows=2,
+        )
+        stats = dict(zip(GRAD_ZERO_VALUE_FIELDS, profile["values"].tolist()))
+        self.assertEqual(stats["projection_cull_unique_gaussians"], 3)
+        self.assertEqual(stats["projection_cull_parameter_elements"], 177)
+        self.assertEqual(stats["projection_cull_zero_gradient_elements"], 111)
+        self.assertEqual(stats["projection_cull_nonfinite_gradient_elements"], 0)
+        self.assertEqual(stats["projection_cull_all_zero_gradient_gaussians"], 1)
+        self.assertEqual(stats["raw_sampled_gaussians"], 2)
+        self.assertEqual(stats["projection_cull_xyz_zero_gradient_elements"], 5)
+        self.assertEqual(stats["projection_cull_features_rest_zero_gradient_elements"], 86)
+        self.assertEqual(stats["projection_cull_abs_le_1em10_gradient_elements"], 111)
+        self.assertEqual(stats["projection_cull_abs_le_1em8_gradient_elements"], 112)
+        self.assertEqual(stats["projection_cull_xyz_abs_le_1em8_gradient_elements"], 6)
+        self.assertEqual(stats["projection_cull_zero_gradient_elements_0_gaussians"], 1)
+        self.assertEqual(stats["projection_cull_zero_gradient_elements_52_gaussians"], 1)
+        self.assertEqual(stats["projection_cull_zero_gradient_elements_59_gaussians"], 1)
+        self.assertEqual(stats["projection_cull_near_zero_elements_0_gaussians"], 1)
+        self.assertEqual(stats["projection_cull_near_zero_elements_53_gaussians"], 1)
+        self.assertEqual(stats["projection_cull_near_zero_elements_59_gaussians"], 1)
+        self.assertEqual(tuple(profile["sample_gradients"].shape), (2, 59))
+        self.assertEqual(profile["sample_owner_rows"].tolist(), [0, 2])
 
     def test_projection_cull_gradient_zero_stats_handles_empty_owner(self):
         _, gradient_zero_stats = _load_gradient_zero_helpers()
         values = gradient_zero_stats({}, torch.zeros((0,), dtype=torch.bool))["values"]
-        self.assertEqual(tuple(values.shape), (76,))
+        self.assertEqual(tuple(values.shape), (len(GRAD_ZERO_VALUE_FIELDS),))
         self.assertEqual(int(values.sum()), 0)
+
+    def test_projection_cull_gradient_sample_can_include_every_survivor(self):
+        _, gradient_zero_stats = _load_gradient_zero_helpers()
+        mask = torch.tensor([True, False, True])
+        components = {
+            name: torch.arange(3 * width, dtype=torch.float32).reshape(3, width)
+            for name, width in {
+                "xyz": 3,
+                "opacity": 1,
+                "scaling": 3,
+                "rotation": 4,
+                "features_dc": 3,
+                "features_rest": 45,
+            }.items()
+        }
+
+        profile = gradient_zero_stats(components, mask, sample_rows=-1)
+
+        self.assertEqual(profile["sample_owner_rows"].tolist(), [0, 2])
+        self.assertEqual(tuple(profile["sample_gradients"].shape), (2, 59))
 
 
 if __name__ == "__main__":

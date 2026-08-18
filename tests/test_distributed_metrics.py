@@ -73,6 +73,18 @@ def _read_rows(path):
 
 
 class DistributedMetricsTest(unittest.TestCase):
+    def test_grad_sample_rows_accepts_all_rows_sentinel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = DistributedMetricsWriter(
+                args=SimpleNamespace(
+                    log_folder=directory,
+                    tide_grad_zero_metrics=True,
+                    tide_grad_sample_rows=-1,
+                ),
+                context=_SingleRankContext(),
+            )
+            self.assertEqual(writer.grad_sample_rows, -1)
+
     def test_grad_zero_metrics_write_rank_and_global_counts(self):
         with tempfile.TemporaryDirectory() as directory:
             writer = DistributedMetricsWriter(
@@ -89,6 +101,8 @@ class DistributedMetricsTest(unittest.TestCase):
             writer.write_grad_zero(
                 {
                     "iteration": 4,
+                    "optimizer_step": 4,
+                    "near_zero_threshold": 1e-8,
                     "projection_cull_unique_gaussians": 3,
                     "projection_cull_parameter_elements": 177,
                     "projection_cull_zero_gradient_elements": 111,

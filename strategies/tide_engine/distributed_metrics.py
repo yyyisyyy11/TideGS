@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import socket
 import threading
@@ -100,22 +101,53 @@ GRAD_ZERO_COMPONENTS = (
     "features_dc",
     "features_rest",
 )
+GRAD_NEAR_ZERO_THRESHOLDS = (
+    ("1em16", 1e-16),
+    ("1em14", 1e-14),
+    ("1em12", 1e-12),
+    ("1em10", 1e-10),
+    ("1em8", 1e-8),
+    ("1em6", 1e-6),
+    ("1em4", 1e-4),
+)
 GRAD_ZERO_HISTOGRAM_FIELDS = [
     f"projection_cull_zero_gradient_elements_{count}_gaussians"
+    for count in range(60)
+]
+GRAD_NEAR_ZERO_HISTOGRAM_FIELDS = [
+    f"projection_cull_near_zero_elements_{count}_gaussians"
     for count in range(60)
 ]
 GRAD_ZERO_VALUE_FIELDS = [
     "projection_cull_unique_gaussians",
     "projection_cull_parameter_elements",
     "projection_cull_zero_gradient_elements",
+    "projection_cull_nonfinite_gradient_elements",
     "projection_cull_all_zero_gradient_gaussians",
+    "raw_sampled_gaussians",
 ] + [
     f"projection_cull_{component}_{suffix}"
     for component in GRAD_ZERO_COMPONENTS
-    for suffix in ("parameter_elements", "zero_gradient_elements")
-] + GRAD_ZERO_HISTOGRAM_FIELDS
-GRAD_ZERO_FIELDS = ["iteration", "rank"] + GRAD_ZERO_VALUE_FIELDS
-GRAD_ZERO_GLOBAL_FIELDS = ["iteration", "world_size"] + GRAD_ZERO_VALUE_FIELDS
+    for suffix in (
+        "parameter_elements",
+        "zero_gradient_elements",
+        "nonfinite_gradient_elements",
+    )
+] + [
+    f"projection_cull_abs_le_{token}_gradient_elements"
+    for token, _ in GRAD_NEAR_ZERO_THRESHOLDS
+] + [
+    f"projection_cull_{component}_abs_le_{token}_gradient_elements"
+    for component in GRAD_ZERO_COMPONENTS
+    for token, _ in GRAD_NEAR_ZERO_THRESHOLDS
+] + GRAD_ZERO_HISTOGRAM_FIELDS + GRAD_NEAR_ZERO_HISTOGRAM_FIELDS
+GRAD_ZERO_ONCE_FIELDS = ["optimizer_step", "near_zero_threshold"]
+GRAD_ZERO_FIELDS = (
+    ["iteration", "rank"] + GRAD_ZERO_ONCE_FIELDS + GRAD_ZERO_VALUE_FIELDS
+)
+GRAD_ZERO_GLOBAL_FIELDS = (
+    ["iteration", "world_size"] + GRAD_ZERO_ONCE_FIELDS + GRAD_ZERO_VALUE_FIELDS
+)
 
 IO_FIELDS = [
     "operation",
@@ -324,6 +356,24 @@ class DistributedMetricsWriter:
         self.grad_zero_interval = max(
             1, int(getattr(args, "tide_grad_zero_metrics_interval", 1))
         )
+        self.grad_near_zero_threshold = float(
+            getattr(args, "tide_grad_near_zero_threshold", 1e-8)
+        )
+        if (
+            not math.isfinite(self.grad_near_zero_threshold)
+            or self.grad_near_zero_threshold < 0.0
+        ):
+            raise ValueError(
+                "tide_grad_near_zero_threshold must be finite and non-negative"
+            )
+        self.grad_sample_rows = int(
+            getattr(args, "tide_grad_sample_rows", 8192)
+        )
+        if self.grad_sample_rows < -1:
+            raise ValueError("tide_grad_sample_rows must be -1, 0, or positive")
+        self.grad_stats_chunk_rows = max(
+            1, int(getattr(args, "tide_grad_stats_chunk_rows", 262144))
+        )
         self.rank_path = Path(args.log_folder) / f"metrics_batch_rank{context.rank}.tsv"
         self.io_path = Path(args.log_folder) / f"metrics_io_rank{context.rank}.tsv"
         self.timeline_path = (
@@ -336,6 +386,7 @@ class DistributedMetricsWriter:
         self.grad_zero_global_path = (
             Path(args.log_folder) / "metrics_grad_zero_global.tsv"
         )
+        self.grad_sample_dir = Path(args.log_folder) / "grad_samples"
         self.async_rank_path = (
             Path(args.log_folder)
             / f"metrics_async_iteration_rank{context.rank}.tsv"
@@ -356,11 +407,16 @@ class DistributedMetricsWriter:
         self._timeline_host = socket.gethostname()
         self._timeline_pid = os.getpid()
 
-    def should_write_grad_zero(self, iteration: int) -> bool:
-        return self.grad_zero_enabled and int(iteration) % self.grad_zero_interval == 0
+    def should_write_grad_zero(self, optimizer_step: int) -> bool:
+        """Sample by batch/optimizer step, not raw iteration (which advances by bsz)."""
+
+        return (
+            self.grad_zero_enabled
+            and int(optimizer_step) % self.grad_zero_interval == 0
+        )
 
     def write_grad_zero(self, row: Dict[str, object]) -> None:
-        """Write exact zero-gradient counts for projection-cull survivors.
+        """Write exact/near-zero gradient counts for projection-cull survivors.
 
         Gaussian ownership is disjoint across ranks, so summing the per-rank
         unique-row counts and 0..59 histogram yields the global distribution.
@@ -378,6 +434,13 @@ class DistributedMetricsWriter:
             "iteration": int(rank_row["iteration"]),
             "world_size": int(self.context.world_size),
         }
+        for field in GRAD_ZERO_ONCE_FIELDS:
+            values = [value.get(field) for value in rank_rows]
+            if any(value != values[0] for value in values[1:]):
+                raise RuntimeError(
+                    f"Distributed ranks disagree on grad metric {field}: {values}"
+                )
+            global_row[field] = values[0]
         for field in GRAD_ZERO_VALUE_FIELDS:
             global_row[field] = sum(
                 int(value.get(field, 0)) for value in rank_rows
@@ -387,6 +450,25 @@ class DistributedMetricsWriter:
             GRAD_ZERO_GLOBAL_FIELDS,
             global_row,
         )
+
+    def write_grad_sample(self, payload: Dict[str, object]) -> Path | None:
+        """Persist a bounded, rank-local raw gradient sample for one batch."""
+
+        if not self.grad_zero_enabled or self.grad_sample_rows == 0:
+            return None
+        import torch
+
+        self.grad_sample_dir.mkdir(parents=True, exist_ok=True)
+        optimizer_step = int(payload["optimizer_step"])
+        iteration = int(payload["iteration"])
+        path = self.grad_sample_dir / (
+            f"grad_sample_step{optimizer_step:06d}_iter{iteration:09d}_"
+            f"rank{self.context.rank}.pt"
+        )
+        temporary = path.with_suffix(".pt.tmp")
+        torch.save({**payload, "rank": int(self.context.rank)}, temporary)
+        os.replace(temporary, path)
+        return path
 
     def write_timeline_event(
         self,
