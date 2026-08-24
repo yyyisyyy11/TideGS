@@ -193,6 +193,7 @@ class AuxiliaryParams(ParamGroup):
         self.num_clusters = 64
         self.visualize_ssd_schedule = False  # Generate TSP schedule visualization
         self.ssd_schedule_ordering = "trajectory"  # {trajectory, shuffle, microbatch_shuffle}
+        self.tide_trajectory_start_offset = 0  # Canonical TSP position used as the in-memory schedule start
         self.tide_storage_max_patch_files = 32  # Legacy idle-compaction high watermark
         self.tide_storage_max_patch_gb = 64.0  # Compact after this much stale delta data accumulates
         self.tide_storage_min_free_gb = 64.0  # Refuse writes that consume this reserve
@@ -239,6 +240,7 @@ class AuxiliaryParams(ParamGroup):
         self.tide_grad_near_zero_threshold = 1e-8  # Primary threshold for per-Gaussian near-zero histograms
         self.tide_grad_sample_rows = 8192  # Raw-gradient rows per rank/batch; 0 disables, -1 records every survivor
         self.tide_grad_stats_chunk_rows = 262144  # Bound temporary memory while scanning gradient rows
+        self.tide_force_active_sh_degree = -1  # Diagnostic override in [-1, sh_degree]; -1 keeps the normal schedule
         self.tide_block_cull_backend = "cpu"  # {cpu, gpu}; frustum block cull backend
         self.tide_block_cull_camera_chunk = 8  # GPU cull cameras per chunk
         # Public TideGS aliases. These map onto the internal paper_* names for
@@ -580,6 +582,29 @@ def init_args(args):
         args.debug_camera_sample_start = int(args.debug_camera_sample_start)
         assert args.debug_camera_sample_start >= 0, (
             f"Invalid debug_camera_sample_start={args.debug_camera_sample_start!r}; expected >= 0"
+        )
+    if hasattr(args, "ssd_schedule_ordering"):
+        args.ssd_schedule_ordering = str(args.ssd_schedule_ordering).lower()
+        assert args.ssd_schedule_ordering in {
+            "trajectory",
+            "shuffle",
+            "microbatch_shuffle",
+        }, (
+            "Invalid ssd_schedule_ordering="
+            f"{args.ssd_schedule_ordering!r}; expected trajectory, shuffle, or microbatch_shuffle"
+        )
+    if hasattr(args, "tide_trajectory_start_offset"):
+        args.tide_trajectory_start_offset = int(args.tide_trajectory_start_offset)
+        assert args.tide_trajectory_start_offset >= 0, (
+            "Invalid tide_trajectory_start_offset="
+            f"{args.tide_trajectory_start_offset!r}; expected >= 0"
+        )
+        assert (
+            args.tide_trajectory_start_offset == 0
+            or getattr(args, "ssd_schedule_ordering", "trajectory") == "trajectory"
+        ), (
+            "tide_trajectory_start_offset is only valid with "
+            "ssd_schedule_ordering=trajectory"
         )
 
     if hasattr(args, "paper_optimizer_state_mode"):

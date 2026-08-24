@@ -1,10 +1,13 @@
 import os
 import sys
 import json
+import csv
 import gc
+import hashlib
 import time
 import psutil
 import numpy as np
+from collections import Counter
 from pathlib import Path
 
 # import faulthandler
@@ -47,7 +50,11 @@ from storage.compaction_scheduler import (
     resolve_emergency_free_gb,
     run_compaction_maintenance,
 )
-from storage.schedule_utils import get_camera_batch_schedule
+from storage.schedule_utils import (
+    get_camera_batch_schedule,
+    rotate_training_schedule,
+    validate_trajectory_start_offset,
+)
 from storage.pure_ssd_checkpoint import (
     is_pure_ssd_checkpoint,
     load_pure_ssd_checkpoint_manifest,
@@ -90,6 +97,100 @@ CULL_METRIC_FIELDS = (
     "block_cull_gpu_cameras",
     "block_cull_output_blocks",
 )
+
+CAMERA_BATCH_FIELDS = (
+    "iteration",
+    "optimizer_step",
+    "trajectory_start_offset",
+    "batch_start_position",
+    "camera_count",
+    "camera_ids_json",
+)
+
+
+def _schedule_sha256(schedule):
+    payload = ",".join(str(int(camera_id)) for camera_id in schedule)
+    return hashlib.sha256(payload.encode("ascii")).hexdigest()
+
+
+def _camera_window_geometry(storage_adapter, camera_ids):
+    camera_ids = [int(camera_id) for camera_id in camera_ids]
+    positions = np.asarray(storage_adapter.camera_positions, dtype=np.float64)[
+        camera_ids
+    ]
+    directions = np.asarray(storage_adapter.camera_directions, dtype=np.float64)[
+        camera_ids
+    ]
+    clusters = getattr(storage_adapter, "camera_clusters", None)
+    cluster_histogram = {}
+    if clusters is not None and len(clusters) == len(storage_adapter.cameras):
+        selected_clusters = [int(clusters[camera_id]) for camera_id in camera_ids]
+        cluster_histogram = {
+            str(cluster_id): int(count)
+            for cluster_id, count in sorted(Counter(selected_clusters).items())
+        }
+    return {
+        "position_centroid": positions.mean(axis=0).tolist(),
+        "position_min": positions.min(axis=0).tolist(),
+        "position_max": positions.max(axis=0).tolist(),
+        "mean_view_direction": directions.mean(axis=0).tolist(),
+        "cluster_count": len(cluster_histogram),
+        "cluster_histogram": cluster_histogram,
+    }
+
+
+def _write_schedule_metadata(
+    *,
+    log_folder,
+    storage_adapter,
+    canonical_schedule,
+    rotated_schedule,
+    requested_offset,
+    effective_offset,
+    window_camera_count,
+):
+    window_camera_ids = [
+        int(camera_id) for camera_id in rotated_schedule[:window_camera_count]
+    ]
+    metadata = {
+        "num_cameras": len(canonical_schedule),
+        "requested_trajectory_start_offset": int(requested_offset),
+        "effective_trajectory_start_offset": int(effective_offset),
+        "canonical_schedule_sha256": _schedule_sha256(canonical_schedule),
+        "rotated_schedule_sha256": _schedule_sha256(rotated_schedule),
+        "canonical_first_camera_id": int(canonical_schedule[0]),
+        "canonical_last_camera_id": int(canonical_schedule[-1]),
+        "rotated_first_camera_id": int(rotated_schedule[0]),
+        "rotated_last_camera_id": int(rotated_schedule[-1]),
+        "analysis_window_camera_count": len(window_camera_ids),
+        "analysis_window_camera_ids": window_camera_ids,
+        "analysis_window_geometry": _camera_window_geometry(
+            storage_adapter,
+            window_camera_ids,
+        ),
+    }
+    path = Path(log_folder) / "schedule_metadata.json"
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    with temp_path.open("w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    temp_path.replace(path)
+    return metadata
+
+
+def _append_camera_batch_metrics(log_folder, row):
+    path = Path(log_folder) / "metrics_camera_batches.tsv"
+    write_header = not path.exists()
+    with path.open("a", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=CAMERA_BATCH_FIELDS,
+            delimiter="\t",
+            extrasaction="ignore",
+        )
+        if write_header:
+            writer.writeheader()
+        writer.writerow({field: row[field] for field in CAMERA_BATCH_FIELDS})
 
 
 def _optimizer_algorithm(args):
@@ -665,6 +766,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         prepare_distributed_gsplat(
             distributed_context,
             enable_timing=bool(args.tide_detailed_metrics),
+            enable_grad_zero_metrics=bool(args.tide_grad_zero_metrics),
         )
     # ------------------------------------------------------------------------
     # 1.1: Setup auxiliary tools and GPU configuration
@@ -854,6 +956,54 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             ssd_training_schedule = storage_adapter.get_training_schedule(
                 shuffle=ssd_schedule_shuffle
             )
+
+        canonical_ssd_training_schedule = [
+            int(camera_id) for camera_id in ssd_training_schedule
+        ]
+        requested_trajectory_offset = validate_trajectory_start_offset(
+            ssd_schedule_ordering,
+            getattr(args, "tide_trajectory_start_offset", 0),
+        )
+        ssd_training_schedule, effective_trajectory_offset = (
+            rotate_training_schedule(
+                canonical_ssd_training_schedule,
+                requested_trajectory_offset,
+            )
+        )
+        args._tide_trajectory_start_offset_effective = int(
+            effective_trajectory_offset
+        )
+        planned_batch_count = len(
+            range(
+                start_from_this_iteration,
+                opt_args.iterations + 1,
+                int(args.bsz),
+            )
+        )
+        if distributed_context.is_rank0:
+            schedule_metadata = _write_schedule_metadata(
+                log_folder=args.log_folder,
+                storage_adapter=storage_adapter,
+                canonical_schedule=canonical_ssd_training_schedule,
+                rotated_schedule=ssd_training_schedule,
+                requested_offset=requested_trajectory_offset,
+                effective_offset=effective_trajectory_offset,
+                window_camera_count=min(
+                    len(ssd_training_schedule),
+                    planned_batch_count * int(args.bsz),
+                ),
+            )
+            schedule_message = (
+                "[SSD Schedule] canonical_sha256="
+                f"{schedule_metadata['canonical_schedule_sha256']} "
+                f"rotated_sha256={schedule_metadata['rotated_schedule_sha256']} "
+                f"requested_offset={requested_trajectory_offset} "
+                f"effective_offset={effective_trajectory_offset} "
+                f"first_camera={ssd_training_schedule[0]} "
+                f"last_camera={ssd_training_schedule[-1]}"
+            )
+            utils.print_rank_0(schedule_message)
+            log_file.write(schedule_message + "\n")
 
         log_file.write(f"[SSD] Execution mode: {args.ssd_execution_mode}\n")
 
@@ -1163,6 +1313,22 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     # STAGE 2: MAIN TRAINING LOOP
     # ============================================================================
 
+    forced_active_sh_degree = int(
+        getattr(args, "tide_force_active_sh_degree", -1)
+    )
+    if not -1 <= forced_active_sh_degree <= int(gaussians.max_sh_degree):
+        raise ValueError(
+            "tide_force_active_sh_degree must be -1 or an integer in "
+            f"[0, {int(gaussians.max_sh_degree)}], got "
+            f"{forced_active_sh_degree}"
+        )
+    if forced_active_sh_degree >= 0:
+        gaussians.active_sh_degree = forced_active_sh_degree
+        log_file.write(
+            "[SH DIAGNOSTIC] forcing active_sh_degree="
+            f"{forced_active_sh_degree} for every batch\n"
+        )
+
     for iteration in range(
         start_from_this_iteration, opt_args.iterations + 1, args.bsz
     ):
@@ -1222,7 +1388,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 nvtx.range_push(f"iteration[{iteration},{iteration+args.bsz})")
 
         # Gradually increase spherical harmonics degree (every 1000 iterations)
-        if utils.check_update_at_this_iter(iteration, args.bsz, 1000, 0):
+        if forced_active_sh_degree >= 0:
+            gaussians.active_sh_degree = forced_active_sh_degree
+        elif utils.check_update_at_this_iter(iteration, args.bsz, 1000, 0):
             gaussians.oneupSHdegree()
 
         # ------------------------------------------------------------------------
@@ -1246,6 +1414,24 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             schedule_ordering=getattr(args, "ssd_schedule_ordering", "trajectory"),
         )
         global_batch_indices = schedule_info.batch_indices
+        if distributed_context.is_rank0:
+            canonical_batch_start_position = (
+                effective_trajectory_offset + int(schedule_info.batch_start_cam)
+            ) % len(ssd_training_schedule)
+            _append_camera_batch_metrics(
+                args.log_folder,
+                {
+                    "iteration": int(iteration),
+                    "optimizer_step": int(optimizer_step),
+                    "trajectory_start_offset": int(effective_trajectory_offset),
+                    "batch_start_position": int(canonical_batch_start_position),
+                    "camera_count": len(global_batch_indices),
+                    "camera_ids_json": json.dumps(
+                        [int(camera_id) for camera_id in global_batch_indices],
+                        separators=(",", ":"),
+                    ),
+                },
+            )
         global_curvature_batch_indices = _curvature_camera_ids_for_step(
             args=args,
             training_schedule=ssd_training_schedule,

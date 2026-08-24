@@ -173,8 +173,9 @@ class DistributedOwnerActiveRowsTest(unittest.TestCase):
         mark_survivors(
             mask,
             {
-                "gaussian_ids": torch.tensor([0, 2, 2, 3]),
-                "radii": torch.tensor([1, 0, 2, 3]),
+                "_tide_owner_projection_survivor_mask": torch.tensor(
+                    [True, False, True, True]
+                ),
             },
             active_count=4,
         )

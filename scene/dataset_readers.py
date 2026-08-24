@@ -107,7 +107,14 @@ def _city_frame_cache_key(frame_ref, mode):
     return (PurePosixPath(mode) / relative_path).as_posix()
 
 
-def _resolve_city_frame_image(path, transformsfile, frame, mode):
+def _resolve_city_frame_image(
+    path,
+    transformsfile,
+    frame,
+    mode,
+    *,
+    check_exists=True,
+):
     frame_ref = _get_city_frame_ref(frame)
     frame_ref_str = str(frame_ref)
     cache_key = _city_frame_cache_key(frame_ref, mode)
@@ -137,7 +144,7 @@ def _resolve_city_frame_image(path, transformsfile, frame, mode):
             seen.add(normalized)
 
     for candidate in normalized_candidates:
-        if os.path.exists(candidate):
+        if not check_exists or os.path.exists(candidate):
             return candidate, os.path.basename(frame_ref_str), cache_key
 
     return normalized_candidates[0], os.path.basename(frame_ref_str), cache_key
@@ -456,6 +463,18 @@ def readCamerasFromTransformsCity(
     except:
         fovx = None
 
+    metadata_width = int(transforms.get("w", 0) or 0)
+    metadata_height = int(transforms.get("h", 0) or 0)
+    has_metadata_image_size = metadata_width > 0 and metadata_height > 0
+    decoded_cache_ready = (
+        str(getattr(args, "dataset_cache_and_stream_mode", ""))
+        == "load_from_disk_on_demand"
+        and bool(getattr(args, "decode_dataset_path", ""))
+        and os.path.isdir(
+            os.path.join(str(args.decode_dataset_path), "dataset_raw")
+        )
+    )
+
     frames = transforms["frames"]
     max_debug_cameras = (
         args.debug_max_train_cameras if mode == "train" else args.debug_max_test_cameras
@@ -478,9 +497,13 @@ def readCamerasFromTransformsCity(
 
     for idx, frame in enumerate(frames):
         cam_path, cam_name, image_cache_key = _resolve_city_frame_image(
-            path, transformsfile, frame, mode
+            path,
+            transformsfile,
+            frame,
+            mode,
+            check_exists=not decoded_cache_ready,
         )
-        if not os.path.exists(cam_path):
+        if not decoded_cache_ready and not os.path.exists(cam_path):
             print(f"File {cam_path} not found, skipping...")
             continue
         # NeRF 'transform_matrix' is a camera-to-world transform
@@ -566,16 +589,22 @@ def readCamerasFromTransformsCity(
 
         image_path = cam_path
         image_name = cam_name
-        image = Image.open(image_path)
+        image = None
+        if has_metadata_image_size:
+            image_width = metadata_width
+            image_height = metadata_height
+        else:
+            image = Image.open(image_path)
+            image_width, image_height = image.size
 
         if fovx is not None:
-            fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
+            fovy = focal2fov(fov2focal(fovx, image_width), image_height)
             FovY = fovy
             FovX = fovx
         else:
             # given focal in pixel unit
-            FovY = focal2fov(frame["fl_y"], image.size[1])
-            FovX = focal2fov(frame["fl_x"], image.size[0])
+            FovY = focal2fov(frame["fl_y"], image_height)
+            FovX = focal2fov(frame["fl_x"], image_width)
 
         cam_infos.append(
             CameraInfo(
@@ -587,16 +616,16 @@ def readCamerasFromTransformsCity(
                 image=None,
                 image_path=image_path,
                 image_name=image_name,
-                width=image.size[0],
-                height=image.size[1],
+                width=image_width,
+                height=image_height,
                 cam_center=Ts[idx],
                 image_cache_key=image_cache_key,
             )
         )
 
         # release memory
-        image.close()
-        image = None
+        if image is not None:
+            image.close()
 
         if is_debug and idx > 128:
             break

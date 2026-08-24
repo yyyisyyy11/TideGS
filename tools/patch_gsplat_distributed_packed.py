@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Patch gsplat 1.5.3 distributed camera IDs and projection timing."""
+"""Patch gsplat 1.5.3 for TideGS distributed rendering and profiling."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from pathlib import Path
 ORIGINAL = "            C = C_world[world_rank]\n\n        else:\n"
 BUGGY_IMAGE_IDS = "image_ids = batch_ids * C + camera_ids"
 PROJECTION_TIMING_MARKER = "_tide_projection_events"
+OWNER_SURVIVOR_MARKER = "_tide_owner_projection_survivor_mask"
 PROJECTION_START_ANCHOR = "    if with_ut:\n"
 PROJECTION_END_ANCHOR = (
     "    if packed:\n"
@@ -43,6 +44,25 @@ PROJECTION_END_PATCHED = (
     "        )\n"
     "\n"
     f"{PROJECTION_END_ANCHOR}"
+)
+OWNER_SURVIVOR_ANCHOR = (
+    "    meta.update(\n"
+    "        {\n"
+    "            # global batch and camera ids\n"
+)
+OWNER_SURVIVOR_PATCHED = (
+    '    if distributed and packed and getattr(torch, "_tide_gsplat_grad_zero_metrics", False):\n'
+    "        _tide_owner_projection_survivor_mask = torch.zeros(\n"
+    "            (N,), dtype=torch.bool, device=device\n"
+    "        )\n"
+    "        _tide_owner_projection_survivor_mask[\n"
+    "            gaussian_ids[(radii > 0).all(dim=-1)]\n"
+    "        ] = True\n"
+    f'        meta["{OWNER_SURVIVOR_MARKER}"] = (\n'
+    "            _tide_owner_projection_survivor_mask\n"
+    "        )\n"
+    "\n"
+    f"{OWNER_SURVIVOR_ANCHOR}"
 )
 
 
@@ -87,6 +107,22 @@ def patch_projection_timing_source(source: str) -> tuple[str, bool]:
     return patched, True
 
 
+def patch_owner_survivor_source(source: str) -> tuple[str, bool]:
+    if OWNER_SURVIVOR_MARKER in source:
+        return source, False
+    occurrences = source.count(OWNER_SURVIVOR_ANCHOR)
+    if occurrences != 1:
+        raise RuntimeError(
+            "Expected exactly one gsplat 1.5.3 owner-survivor insertion point; "
+            f"found {occurrences}. Refusing to modify an unknown source layout."
+        )
+    return source.replace(
+        OWNER_SURVIVOR_ANCHOR,
+        OWNER_SURVIVOR_PATCHED,
+        1,
+    ), True
+
+
 def find_rendering_path() -> Path:
     spec = importlib.util.find_spec("gsplat")
     if spec is None or not spec.submodule_search_locations:
@@ -111,7 +147,8 @@ def main() -> None:
     source = rendering_path.read_text(encoding="utf-8")
     patched_source, camera_changed = patch_rendering_source(source)
     patched_source, timing_changed = patch_projection_timing_source(patched_source)
-    if not camera_changed and not timing_changed:
+    patched_source, survivor_changed = patch_owner_survivor_source(patched_source)
+    if not camera_changed and not timing_changed and not survivor_changed:
         print(f"TideGS gsplat fixes already present: {rendering_path}")
         return
 
@@ -127,6 +164,8 @@ def main() -> None:
         print(f"Patched gsplat packed-distributed camera IDs: {rendering_path}")
     if timing_changed:
         print(f"Patched gsplat projection timing events: {rendering_path}")
+    if survivor_changed:
+        print(f"Patched gsplat owner projection survivor mask: {rendering_path}")
     print(f"Original source backup: {backup_path}")
 
 

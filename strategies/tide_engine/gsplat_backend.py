@@ -12,6 +12,7 @@ import torch
 MIN_DISTRIBUTED_GSPLAT = (1, 5, 3)
 PACKED_DISTRIBUTED_FIX = "image_ids = camera_ids"
 PROJECTION_TIMING_FIX = "_tide_projection_events"
+OWNER_PROJECTION_SURVIVOR_FIX = "_tide_owner_projection_survivor_mask"
 
 
 def _version_tuple(value: str) -> Tuple[int, ...]:
@@ -54,6 +55,21 @@ def _require_projection_timing_fix(gsplat) -> None:
         )
 
 
+def _require_owner_projection_survivor_fix(gsplat) -> None:
+    try:
+        source = inspect.getsource(gsplat.rasterization)
+    except (OSError, TypeError) as exc:
+        raise RuntimeError(
+            "Gradient-zero profiling requires inspectable gsplat rasterization source"
+        ) from exc
+    if OWNER_PROJECTION_SURVIVOR_FIX not in source:
+        raise RuntimeError(
+            "Gradient-zero profiling requires the gsplat owner-survivor patch. "
+            "Run `python tools/patch_gsplat_distributed_packed.py` in the TideGS "
+            "environment before launching training."
+        )
+
+
 @lru_cache(maxsize=1)
 def require_distributed_gsplat():
     import gsplat
@@ -83,12 +99,20 @@ def require_gsplat_cuda_backend():
     return _C
 
 
-def prepare_distributed_gsplat(context, *, enable_timing: bool = False) -> None:
+def prepare_distributed_gsplat(
+    context,
+    *,
+    enable_timing: bool = False,
+    enable_grad_zero_metrics: bool = False,
+) -> None:
     """Serialize first-time CUDA extension setup across local ranks."""
     gsplat = require_distributed_gsplat()
     torch._tide_gsplat_detailed_metrics = bool(enable_timing)
+    torch._tide_gsplat_grad_zero_metrics = bool(enable_grad_zero_metrics)
     if enable_timing:
         _require_projection_timing_fix(gsplat)
+    if enable_grad_zero_metrics:
+        _require_owner_projection_survivor_fix(gsplat)
     for loader_rank in range(context.world_size):
         error = None
         if context.rank == loader_rank:

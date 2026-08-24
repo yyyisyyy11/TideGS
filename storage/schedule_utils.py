@@ -27,6 +27,40 @@ def _circular_slice(schedule: Sequence[int], start: int, length: int) -> List[in
     return [int(schedule[(start + offset) % num_items]) for offset in range(length)]
 
 
+def rotate_training_schedule(
+    training_schedule: Sequence[int],
+    start_offset: int,
+) -> Tuple[List[int], int]:
+    """Rotate a canonical camera schedule without mutating its cached form."""
+    if len(training_schedule) == 0:
+        raise ValueError("training_schedule must not be empty")
+    start_offset = int(start_offset)
+    if start_offset < 0:
+        raise ValueError(f"start_offset must be non-negative, got {start_offset}")
+    effective_offset = start_offset % len(training_schedule)
+    rotated = _circular_slice(
+        training_schedule,
+        effective_offset,
+        len(training_schedule),
+    )
+    return rotated, effective_offset
+
+
+def validate_trajectory_start_offset(
+    schedule_ordering: str,
+    start_offset: int,
+) -> int:
+    schedule_ordering = str(schedule_ordering).lower()
+    start_offset = int(start_offset)
+    if start_offset < 0:
+        raise ValueError(f"start_offset must be non-negative, got {start_offset}")
+    if start_offset and schedule_ordering != "trajectory":
+        raise ValueError(
+            "trajectory start offset is only valid with schedule_ordering=trajectory"
+        )
+    return start_offset
+
+
 def get_camera_batch_schedule(
     training_schedule: Sequence[int],
     iteration: int,

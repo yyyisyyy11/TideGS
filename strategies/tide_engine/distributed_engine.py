@@ -485,34 +485,23 @@ def _mark_projection_cull_survivors(
     meta: Dict[str, object],
     active_count: int,
 ) -> None:
-    """Union packed gsplat ``radii > 0`` rows into owner-local IDs."""
+    """Union pre-all-to-all projection survivors into owner-local rows."""
 
     if int(active_count) == 0:
         return
-    gaussian_ids = meta.get("gaussian_ids")
-    radii = meta.get("radii")
-    if not torch.is_tensor(gaussian_ids) or not torch.is_tensor(radii):
+    owner_mask = meta.get("_tide_owner_projection_survivor_mask")
+    if not torch.is_tensor(owner_mask):
         raise RuntimeError(
-            "Gradient-zero profiling requires packed gsplat gaussian_ids and radii"
+            "Gradient-zero profiling requires gsplat owner projection survivor mask"
         )
-    gaussian_ids = gaussian_ids.reshape(-1)
-    radii = radii.reshape(-1)
-    if gaussian_ids.numel() != radii.numel():
+    owner_mask = owner_mask.reshape(-1)
+    if owner_mask.dtype != torch.bool or owner_mask.numel() != int(active_count):
         raise RuntimeError(
-            "gsplat metadata gaussian_ids/radii length mismatch during profiling"
+            "gsplat owner projection survivor mask has invalid shape or dtype: "
+            f"expected=({int(active_count)},) bool, "
+            f"actual={tuple(owner_mask.shape)} {owner_mask.dtype}"
         )
-    visible_ids = gaussian_ids[radii > 0]
-    if visible_ids.numel() == 0:
-        return
-    if (
-        int(visible_ids.min()) < 0
-        or int(visible_ids.max()) >= int(active_count)
-    ):
-        raise RuntimeError(
-            "Distributed gsplat returned a projection Gaussian ID outside the "
-            f"owner-local range [0, {int(active_count)})"
-        )
-    survivor_mask[visible_ids] = True
+    survivor_mask |= owner_mask
 
 
 def _projection_cull_gradient_zero_stats(
@@ -875,6 +864,54 @@ def train_distributed_tide_batch(
             for camera in cameras
         ]
 
+    def debug_projection_input(
+        *,
+        phase: str,
+        microbatch_index: int,
+        cameras,
+        scales: torch.Tensor,
+        opacities: torch.Tensor,
+    ) -> None:
+        local_cameras = int(len(cameras))
+        global_cameras = local_cameras * int(context.world_size)
+        pair_upper_bound = participation_rows * global_cameras
+        if pair_upper_bound > np.iinfo(np.int32).max:
+            raise RuntimeError(
+                "gsplat packed projection int32 capacity exceeded: "
+                f"rank={context.rank} phase={phase} "
+                f"gaussians={participation_rows} "
+                f"global_cameras={global_cameras} pairs={pair_upper_bound}"
+            )
+        if int(optimizer_step) > 1 or microbatch_index != 0:
+            return
+        free_bytes, total_bytes = torch.cuda.mem_get_info(probe_device)
+        with torch.no_grad():
+            finite_xyz = bool(torch.isfinite(leaves["xyz"]).all().item())
+            finite_scales = bool(torch.isfinite(scales).all().item())
+            finite_opacities = bool(torch.isfinite(opacities).all().item())
+            scale_min = float(scales.min().item())
+            scale_max = float(scales.max().item())
+            opacity_min = float(opacities.min().item())
+            opacity_max = float(opacities.max().item())
+        print(
+            "[GSPROJ INPUT] "
+            f"rank={context.rank} step={optimizer_step} phase={phase} "
+            f"microbatch={microbatch_index} local_cameras={local_cameras} "
+            f"global_cameras={global_cameras} active_blocks={len(active_blocks)} "
+            f"resident_blocks={len(target_resident)} gaussians={participation_rows} "
+            f"pair_upper_bound={pair_upper_bound} "
+            f"finite_xyz={int(finite_xyz)} finite_scales={int(finite_scales)} "
+            f"finite_opacities={int(finite_opacities)} "
+            f"scale_range=[{scale_min:.9g},{scale_max:.9g}] "
+            f"opacity_range=[{opacity_min:.9g},{opacity_max:.9g}] "
+            f"allocated_gib={torch.cuda.memory_allocated(probe_device) / (1 << 30):.3f} "
+            f"reserved_gib={torch.cuda.memory_reserved(probe_device) / (1 << 30):.3f} "
+            f"free_gib={free_bytes / (1 << 30):.3f} "
+            f"total_gib={total_bytes / (1 << 30):.3f} "
+            f"camera_uids={camera_uids(cameras)}",
+            flush=True,
+        )
+
     def write_memory_point(
         *,
         phase: str,
@@ -959,6 +996,13 @@ def train_distributed_tide_batch(
                     phase="before_curvature_forward",
                     microbatch_index=microbatch_index,
                     cameras=cameras,
+                )
+                debug_projection_input(
+                    phase="curvature",
+                    microbatch_index=microbatch_index,
+                    cameras=cameras,
+                    scales=scales,
+                    opacities=opacities,
                 )
                 submit_ns = time.perf_counter_ns() if timeline_enabled else None
                 event_start = torch.cuda.Event(enable_timing=True)
@@ -1098,6 +1142,13 @@ def train_distributed_tide_batch(
                 microbatch_index=microbatch_index,
                 cameras=cameras,
             )
+            debug_projection_input(
+                phase="gradient",
+                microbatch_index=microbatch_index,
+                cameras=cameras,
+                scales=scales,
+                opacities=opacities,
+            )
             forward_submit_ns = time.perf_counter_ns() if timeline_enabled else None
             forward_start = torch.cuda.Event(enable_timing=True)
             forward_end = torch.cuda.Event(enable_timing=True)
@@ -1227,6 +1278,7 @@ def train_distributed_tide_batch(
                 "format_version": 1,
                 "iteration": iteration,
                 "optimizer_step": optimizer_step,
+                "active_sh_degree": int(gaussians.active_sh_degree),
                 "near_zero_threshold": metrics_writer.grad_near_zero_threshold,
                 "parameter_names": _LEAF_NAMES,
                 "parameter_widths": tuple(
@@ -1274,6 +1326,7 @@ def train_distributed_tide_batch(
             {
                 "iteration": iteration,
                 "optimizer_step": optimizer_step,
+                "active_sh_degree": int(gaussians.active_sh_degree),
                 "near_zero_threshold": metrics_writer.grad_near_zero_threshold,
                 **dict(zip(GRAD_ZERO_VALUE_FIELDS, grad_zero_values)),
             }

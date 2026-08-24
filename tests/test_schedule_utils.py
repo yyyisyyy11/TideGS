@@ -11,6 +11,9 @@ import schedule_utils  # noqa: E402
 DEFAULT_EPOCH_SEED_BASE = schedule_utils.DEFAULT_EPOCH_SEED_BASE
 _circular_slice = schedule_utils._circular_slice
 get_camera_batch_schedule = schedule_utils.get_camera_batch_schedule
+rotate_training_schedule = schedule_utils.rotate_training_schedule
+validate_trajectory_start_offset = schedule_utils.validate_trajectory_start_offset
+get_current_and_next_camera_batches = schedule_utils.get_current_and_next_camera_batches
 
 
 class CircularSliceTest(unittest.TestCase):
@@ -26,6 +29,53 @@ class CircularSliceTest(unittest.TestCase):
 
     def test_empty_schedule(self):
         self.assertEqual(_circular_slice([], 0, 5), [])
+
+
+class RotateTrainingScheduleTest(unittest.TestCase):
+    def test_zero_offset_preserves_canonical_schedule(self):
+        canonical = [10, 20, 30, 40]
+        rotated, effective = rotate_training_schedule(canonical, 0)
+        self.assertEqual(rotated, canonical)
+        self.assertEqual(effective, 0)
+        self.assertIsNot(rotated, canonical)
+
+    def test_nonzero_offset_rotates_without_mutating_input(self):
+        canonical = [10, 20, 30, 40]
+        rotated, effective = rotate_training_schedule(canonical, 2)
+        self.assertEqual(rotated, [30, 40, 10, 20])
+        self.assertEqual(effective, 2)
+        self.assertEqual(canonical, [10, 20, 30, 40])
+
+    def test_offset_wraps_at_schedule_length(self):
+        rotated, effective = rotate_training_schedule([0, 1, 2, 3], 6)
+        self.assertEqual(rotated, [2, 3, 0, 1])
+        self.assertEqual(effective, 2)
+
+    def test_negative_offset_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            rotate_training_schedule([0, 1], -1)
+
+    def test_empty_schedule_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            rotate_training_schedule([], 0)
+
+    def test_rotated_schedule_drives_current_and_next_prefetch_batches(self):
+        rotated, _ = rotate_training_schedule(list(range(12)), 4)
+        current, next_batch = get_current_and_next_camera_batches(
+            training_schedule=rotated,
+            iteration=1,
+            batch_size=3,
+            schedule_ordering="trajectory",
+        )
+        self.assertEqual(current.batch_indices, [4, 5, 6])
+        self.assertEqual(next_batch.batch_indices, [7, 8, 9])
+
+    def test_nonzero_offset_rejects_nontrajectory_ordering(self):
+        with self.assertRaisesRegex(ValueError, "only valid"):
+            validate_trajectory_start_offset("shuffle", 64)
+
+    def test_zero_offset_allows_other_orderings(self):
+        self.assertEqual(validate_trajectory_start_offset("shuffle", 0), 0)
 
 
 class MicrobatchShuffleTest(unittest.TestCase):

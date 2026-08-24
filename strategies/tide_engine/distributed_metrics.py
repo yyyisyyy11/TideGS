@@ -141,7 +141,11 @@ GRAD_ZERO_VALUE_FIELDS = [
     for component in GRAD_ZERO_COMPONENTS
     for token, _ in GRAD_NEAR_ZERO_THRESHOLDS
 ] + GRAD_ZERO_HISTOGRAM_FIELDS + GRAD_NEAR_ZERO_HISTOGRAM_FIELDS
-GRAD_ZERO_ONCE_FIELDS = ["optimizer_step", "near_zero_threshold"]
+GRAD_ZERO_ONCE_FIELDS = [
+    "optimizer_step",
+    "active_sh_degree",
+    "near_zero_threshold",
+]
 GRAD_ZERO_FIELDS = (
     ["iteration", "rank"] + GRAD_ZERO_ONCE_FIELDS + GRAD_ZERO_VALUE_FIELDS
 )
