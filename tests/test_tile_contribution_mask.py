@@ -82,43 +82,22 @@ def _reference_one(
 
 
 class TileContributionReferenceTest(unittest.TestCase):
-    def test_threshold_equality_is_kept(self):
-        result = _reference_one(
-            (8.5, 8.5),
-            (1.0, 0.0, 1.0),
-            ALPHA_THRESHOLD,
-            4,
-            16,
-            16,
+    def test_threshold_opacity_radius_and_image_boundaries(self):
+        cases = (
+            ((8.5, 8.5), (1.0, 0.0, 1.0), ALPHA_THRESHOLD, 4, 16, 16,
+             (True, 1, 1)),
+            ((16.0, 16.0), (0.1, 0.0, 0.1), ALPHA_THRESHOLD * 0.5,
+             (17, 9), 32, 32, (False, 4, 0)),
+            ((8.5, 8.5), (1.0, 0.0, 1.0), 1.0, 0, 16, 16,
+             (False, 0, 0)),
+            ((-100.0, -100.0), (1.0, 0.0, 1.0), 1.0, 2, 16, 16,
+             (False, 0, 0)),
+            ((16.5, 16.5), (4.0, 0.0, 4.0), ALPHA_THRESHOLD,
+             (1, 1), 17, 17, (True, 4, 1)),
         )
-        self.assertEqual(result, (True, 1, 1))
-
-    def test_low_opacity_preserves_candidate_count(self):
-        keep, candidates, contributing = _reference_one(
-            (16.0, 16.0),
-            (0.1, 0.0, 0.1),
-            ALPHA_THRESHOLD * 0.5,
-            (17, 9),
-            32,
-            32,
-        )
-        self.assertFalse(keep)
-        self.assertEqual(candidates, 4)
-        self.assertEqual(contributing, 0)
-
-    def test_zero_radius_and_outside_image_have_no_candidates(self):
-        self.assertEqual(
-            _reference_one(
-                (8.5, 8.5), (1.0, 0.0, 1.0), 1.0, 0, 16, 16
-            ),
-            (False, 0, 0),
-        )
-        self.assertEqual(
-            _reference_one(
-                (-100.0, -100.0), (1.0, 0.0, 1.0), 1.0, 2, 16, 16
-            ),
-            (False, 0, 0),
-        )
+        for *inputs, expected in cases:
+            with self.subTest(inputs=inputs):
+                self.assertEqual(_reference_one(*inputs), expected)
 
     def test_non_diagonal_rotated_conic_finds_edge_minimum(self):
         angle = math.radians(37.0)
@@ -136,19 +115,6 @@ class TileContributionReferenceTest(unittest.TestCase):
             for y in range(-4000, 5001)
         )
         self.assertAlmostEqual(minimum, edge_minimum, places=6)
-
-    def test_image_and_tile_boundaries_are_inclusive_at_pixel_centers(self):
-        keep, candidates, contributing = _reference_one(
-            (16.5, 16.5),
-            (4.0, 0.0, 4.0),
-            ALPHA_THRESHOLD,
-            (1, 1),
-            17,
-            17,
-        )
-        self.assertTrue(keep)
-        self.assertEqual(candidates, 4)
-        self.assertEqual(contributing, 1)
 
     def test_continuous_rectangle_test_never_drops_a_contributing_pixel(self):
         generator = random.Random(19)
@@ -173,20 +139,10 @@ class TileContributionReferenceTest(unittest.TestCase):
             keep, _, _ = _reference_one(
                 mean, conic, opacity, radius, width, height
             )
-            tile_width = math.ceil(width / 16)
-            tile_height = math.ceil(height / 16)
-            min_tile_x = _clamp(
-                math.floor((mean[0] - radius[0]) / 16), 0, tile_width
-            )
-            min_tile_y = _clamp(
-                math.floor((mean[1] - radius[1]) / 16), 0, tile_height
-            )
-            max_tile_x = _clamp(
-                math.ceil((mean[0] + radius[0]) / 16), 0, tile_width
-            )
-            max_tile_y = _clamp(
-                math.ceil((mean[1] + radius[1]) / 16), 0, tile_height
-            )
+            x0 = max(0, math.floor((mean[0] - radius[0]) / 16) * 16)
+            y0 = max(0, math.floor((mean[1] - radius[1]) / 16) * 16)
+            x1 = min(width, math.ceil((mean[0] + radius[0]) / 16) * 16)
+            y1 = min(height, math.ceil((mean[1] + radius[1]) / 16) * 16)
             discrete_contribution = any(
                 opacity
                 * math.exp(
@@ -198,10 +154,8 @@ class TileContributionReferenceTest(unittest.TestCase):
                     )
                 )
                 >= ALPHA_THRESHOLD
-                for pixel_y in range(height)
-                for pixel_x in range(width)
-                if min_tile_x <= pixel_x // 16 < max_tile_x
-                and min_tile_y <= pixel_y // 16 < max_tile_y
+                for pixel_y in range(y0, y1)
+                for pixel_x in range(x0, x1)
             )
             self.assertFalse(discrete_contribution and not keep)
 
@@ -302,30 +256,15 @@ class TileContributionCudaTest(unittest.TestCase):
         background = torch.tensor([[0.2, 0.3, 0.4]], device="cuda")
 
         def render(mode):
-            means = torch.tensor(
-                [[[18.0, 8.5]]],
-                dtype=torch.float32,
-                device="cuda",
-                requires_grad=True,
-            )
-            conics = torch.tensor(
-                [[[4.0, 0.0, 4.0]]],
-                dtype=torch.float32,
-                device="cuda",
-                requires_grad=True,
-            )
-            colors = torch.tensor(
-                [[[0.8, 0.1, 0.6]]],
-                dtype=torch.float32,
-                device="cuda",
-                requires_grad=True,
-            )
-            opacities = torch.tensor(
-                [[0.01]],
-                dtype=torch.float32,
-                device="cuda",
-                requires_grad=True,
-            )
+            def variable(value):
+                return torch.tensor(
+                    value, dtype=torch.float32, device="cuda", requires_grad=True
+                )
+
+            means = variable([[[18.0, 8.5]]])
+            conics = variable([[[4.0, 0.0, 4.0]]])
+            colors = variable([[[0.8, 0.1, 0.6]]])
+            opacities = variable([[0.01]])
             radii = torch.tensor([[[4, 4]]], dtype=torch.int32, device="cuda")
             if mode != "off":
                 keep, _, _ = self.mask(

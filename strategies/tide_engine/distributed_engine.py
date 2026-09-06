@@ -21,9 +21,11 @@ from .distributed_metrics import (
     get_distributed_metrics_writer,
 )
 from .gradient_sparsity import (
-    active_parameter_width,
-    profile_gradient_sparsity,
+    build_gradient_sparsity_records,
+    collect_gradient_sparsity,
+    touched_component_rows as _touched_component_rows,
 )
+from .gradient_schema import GRADIENT_COMPONENTS as _LEAF_NAMES
 from .engine import get_gpu_resident_optimizer
 from .gsplat_backend import (
     PROJECTION_TIMING_FIX,
@@ -39,23 +41,6 @@ from .sophia_tr_math import (
 )
 
 
-_LEAF_NAMES = (
-    "xyz",
-    "opacity",
-    "scaling",
-    "rotation",
-    "features_dc",
-    "features_rest",
-)
-
-_LEAF_WIDTHS = {
-    "xyz": 3,
-    "opacity": 1,
-    "scaling": 3,
-    "rotation": 4,
-    "features_dc": 3,
-    "features_rest": 45,
-}
 @dataclass
 class DistributedResidentState:
     resident: Set[int] = field(default_factory=set)
@@ -454,30 +439,6 @@ def _validate_distributed_batch_contract(
         int(contract["microbatch"]),
         int(contract["sample_count"]),
     )
-
-
-def _touched_component_rows(
-    components: Dict[str, torch.Tensor],
-    active_count: int,
-    device,
-) -> torch.Tensor:
-    """Return owner-local rows with a nonzero, non-finite, or signed component."""
-
-    active_count = int(active_count)
-    if active_count < 0:
-        raise ValueError("active_count must be non-negative")
-    if active_count == 0:
-        return torch.empty((0,), dtype=torch.long, device=device)
-    touched = torch.zeros((active_count,), dtype=torch.bool, device=device)
-    for name, value in components.items():
-        if not torch.is_tensor(value) or int(value.shape[0]) != active_count:
-            raise RuntimeError(
-                f"owner-local component {name!r} has invalid leading rows: "
-                f"expected={active_count}, actual={getattr(value, 'shape', None)}"
-            )
-        flat = value.detach().reshape(active_count, -1)
-        touched |= torch.any(flat != 0, dim=1)
-    return torch.nonzero(touched, as_tuple=False).reshape(-1)
 
 
 def _mark_projection_cull_survivors(
@@ -1123,7 +1084,7 @@ def train_distributed_tide_batch(
         raise RuntimeError("Distributed TideGS produced no local losses")
 
     sparse_error = None
-    grad_zero_values = None
+    grad_zero_record = None
     grad_sample_payload = None
     try:
         owner_grad_components = {
@@ -1135,112 +1096,37 @@ def train_distributed_tide_batch(
             for name in _LEAF_NAMES
         }
         if grad_zero_sample_due:
-            grad_profile = profile_gradient_sparsity(
+            grad_profile = collect_gradient_sparsity(
                 owner_grad_components,
                 projection_cull_survivor_mask,
-                prefix="projection_cull",
+                tile_survivor_mask,
                 active_sh_degree=int(gaussians.active_sh_degree),
+                tile_mode=tile_contribution_mode,
+                tile_counts=tile_mask_counts,
                 near_zero_threshold=metrics_writer.grad_near_zero_threshold,
                 sample_rows=metrics_writer.grad_sample_rows,
                 chunk_rows=metrics_writer.grad_stats_chunk_rows,
-                include_sample_count=True,
-                include_active=True,
             )
-            tile_grad_profile = profile_gradient_sparsity(
-                owner_grad_components,
+            grad_zero_record, grad_sample_payload = build_gradient_sparsity_records(
+                grad_profile,
+                GRAD_METRIC_VALUE_FIELDS,
+                active_local_ids,
                 tile_survivor_mask,
-                prefix="tile_mask_keep",
+                iteration=iteration,
+                optimizer_step=optimizer_step,
                 active_sh_degree=int(gaussians.active_sh_degree),
                 near_zero_threshold=metrics_writer.grad_near_zero_threshold,
-                sample_rows=0,
-                chunk_rows=metrics_writer.grad_stats_chunk_rows,
-                include_sample_count=False,
-                include_active=True,
+                tile_mode=tile_contribution_mode,
+                tile_alpha_threshold=tile_alpha_threshold,
             )
-            gradient_active_for_metrics = _touched_component_rows(
+        gradient_active = (
+            grad_profile["touched_rows"]
+            if grad_zero_sample_due
+            else _touched_component_rows(
                 owner_grad_components,
                 owner_active_rows,
                 active_local_ids.device,
             )
-            nonzero_mask = torch.zeros_like(projection_cull_survivor_mask)
-            nonzero_mask[gradient_active_for_metrics] = True
-            rejected_mask = projection_cull_survivor_mask & ~tile_survivor_mask
-            rejected_count = rejected_mask.sum(dtype=torch.long)
-            rejected_nonzero = (rejected_mask & nonzero_mask).sum(dtype=torch.long)
-            metric_tensors = {
-                **grad_profile["stats"],
-                **tile_grad_profile["stats"],
-                "projection_cull_nonzero_gradient_gaussians": (
-                    projection_cull_survivor_mask & nonzero_mask
-                ).sum(dtype=torch.long),
-                "tile_mask_keep_nonzero_gradient_gaussians": (
-                    tile_survivor_mask & nonzero_mask
-                ).sum(dtype=torch.long),
-                "tile_mask_rejected_gaussians": rejected_count,
-                "tile_mask_rejected_all_zero_gradient_gaussians": (
-                    rejected_count - rejected_nonzero
-                ),
-                "tile_mask_rejected_nonzero_gradient_gaussians": rejected_nonzero,
-                "would_drop_nonzero_gradient_gaussians": torch.where(
-                    torch.tensor(
-                        tile_contribution_mode == "profile",
-                        dtype=torch.bool,
-                        device=rejected_nonzero.device,
-                    ),
-                    rejected_nonzero,
-                    torch.zeros_like(rejected_nonzero),
-                ),
-                "tile_mask_projection_pairs": tile_mask_counts[0],
-                "tile_mask_kept_projection_pairs": tile_mask_counts[1],
-                "tile_mask_candidate_tile_pairs_before": tile_mask_counts[2],
-                "tile_mask_candidate_tile_pairs_after": tile_mask_counts[3],
-                "tile_mask_contributing_tile_pairs": tile_mask_counts[4],
-            }
-            grad_zero_values = dict(
-                zip(
-                    GRAD_METRIC_VALUE_FIELDS,
-                    torch.stack(
-                        [metric_tensors[field] for field in GRAD_METRIC_VALUE_FIELDS]
-                    )
-                    .detach()
-                    .cpu()
-                    .tolist(),
-                )
-            )
-            sample_owner_rows = grad_profile["sample_owner_rows"]
-            sample_local_ids = active_local_ids.index_select(
-                0, sample_owner_rows
-            )
-            grad_sample_payload = {
-                "format_version": 2,
-                "iteration": iteration,
-                "optimizer_step": optimizer_step,
-                "active_sh_degree": int(gaussians.active_sh_degree),
-                "near_zero_threshold": metrics_writer.grad_near_zero_threshold,
-                "active_parameter_width": active_parameter_width(
-                    int(gaussians.active_sh_degree)
-                ),
-                "tile_contribution_mode": tile_contribution_mode,
-                "tile_alpha_threshold": tile_alpha_threshold,
-                "parameter_names": _LEAF_NAMES,
-                "parameter_widths": tuple(
-                    _LEAF_WIDTHS[name] for name in _LEAF_NAMES
-                ),
-                "owner_active_rows": owner_active_rows,
-                "projection_cull_unique_gaussians": int(
-                    projection_cull_survivor_mask.sum().item()
-                ),
-                "owner_active_row_indices": sample_owner_rows.detach().cpu(),
-                "resident_local_ids": sample_local_ids.detach().cpu(),
-                "tile_keep": tile_survivor_mask.index_select(
-                    0, sample_owner_rows
-                ).detach().cpu(),
-                "gradients": grad_profile["sample_gradients"].detach().cpu(),
-            }
-        gradient_active = _touched_component_rows(
-            owner_grad_components,
-            owner_active_rows,
-            active_local_ids.device,
         )
         curvature_active = _touched_component_rows(
             curvature_accumulators,
@@ -1267,23 +1153,7 @@ def train_distributed_tide_batch(
         error=sparse_error,
     )
     if grad_zero_sample_due:
-        metrics_writer.write_grad_zero(
-            {
-                "iteration": iteration,
-                "optimizer_step": optimizer_step,
-                "active_sh_degree": int(gaussians.active_sh_degree),
-                "active_parameter_width": active_parameter_width(
-                    int(gaussians.active_sh_degree)
-                ),
-                "near_zero_threshold": metrics_writer.grad_near_zero_threshold,
-                "tile_contribution_mode": tile_contribution_mode,
-                "tile_alpha_threshold": tile_alpha_threshold,
-                "tile_drop_gradients_observed": int(
-                    tile_contribution_mode == "profile"
-                ),
-                **grad_zero_values,
-            }
-        )
+        metrics_writer.write_grad_zero(grad_zero_record)
         metrics_writer.write_grad_sample(grad_sample_payload)
 
     optimizer_submit_ns = time.perf_counter_ns() if timeline_enabled else None

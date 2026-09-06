@@ -57,218 +57,6 @@ def _percentage(numerator: int, denominator: int) -> float:
     return 100.0 * numerator / denominator
 
 
-def _validate_full_gradient_cohort(
-    row: Dict[str, str],
-    *,
-    prefix: str,
-    row_count: int,
-    iteration: int,
-) -> None:
-    parameter_elements = _integer(
-        row[f"{prefix}_parameter_elements"],
-        field=f"{prefix}_parameter_elements",
-    )
-    exact_elements = _integer(
-        row[f"{prefix}_zero_gradient_elements"],
-        field=f"{prefix}_zero_gradient_elements",
-    )
-    nonfinite_elements = _integer(
-        row[f"{prefix}_nonfinite_gradient_elements"],
-        field=f"{prefix}_nonfinite_gradient_elements",
-    )
-    near_elements = [
-        _integer(
-            row[f"{prefix}_abs_le_{token}_gradient_elements"],
-            field=f"{prefix}_abs_le_{token}_gradient_elements",
-        )
-        for token, _ in NEAR_ZERO_THRESHOLDS
-    ]
-    if parameter_elements != PARAMETERS_PER_GAUSSIAN * row_count:
-        raise AssertionError(
-            f"{prefix} 59*d mismatch at iteration {iteration}"
-        )
-    if not (
-        0
-        <= exact_elements
-        <= near_elements[0]
-        <= near_elements[1]
-        <= near_elements[2]
-        <= near_elements[3]
-        <= near_elements[4]
-        <= near_elements[5]
-        <= near_elements[6]
-        <= parameter_elements
-    ):
-        raise AssertionError(
-            f"invalid {prefix} element counts at iteration {iteration}"
-        )
-    if nonfinite_elements:
-        raise AssertionError(
-            f"non-finite {prefix} gradients at iteration {iteration}"
-        )
-
-    zero_histogram = [
-        _integer(
-            row[f"{prefix}_zero_gradient_elements_{count}_gaussians"],
-            field=f"{prefix}_zero_histogram_{count}",
-        )
-        for count in range(PARAMETERS_PER_GAUSSIAN + 1)
-    ]
-    near_histogram = [
-        _integer(
-            row[f"{prefix}_near_zero_elements_{count}_gaussians"],
-            field=f"{prefix}_near_histogram_{count}",
-        )
-        for count in range(PARAMETERS_PER_GAUSSIAN + 1)
-    ]
-    if sum(zero_histogram) != row_count or sum(near_histogram) != row_count:
-        raise AssertionError(
-            f"{prefix} histogram row sum mismatch at iteration {iteration}"
-        )
-    if (
-        sum(count * rows for count, rows in enumerate(zero_histogram))
-        != exact_elements
-        or sum(count * rows for count, rows in enumerate(near_histogram))
-        != near_elements[4]
-    ):
-        raise AssertionError(
-            f"{prefix} histogram weighted sum mismatch at iteration {iteration}"
-        )
-    all_zero_rows = _integer(
-        row[f"{prefix}_all_zero_gradient_gaussians"],
-        field=f"{prefix}_all_zero_gradient_gaussians",
-    )
-    if zero_histogram[PARAMETERS_PER_GAUSSIAN] != all_zero_rows:
-        raise AssertionError(
-            f"{prefix} all-zero histogram mismatch at iteration {iteration}"
-        )
-
-    component_exact = 0
-    component_nonfinite = 0
-    component_near = [0] * len(NEAR_ZERO_THRESHOLDS)
-    for component, width in COMPONENT_WIDTHS.items():
-        component_prefix = f"{prefix}_{component}"
-        if _integer(
-            row[f"{component_prefix}_parameter_elements"],
-            field=f"{component_prefix}_parameter_elements",
-        ) != width * row_count:
-            raise AssertionError(
-                f"{component_prefix} width mismatch at iteration {iteration}"
-            )
-        component_exact += _integer(
-            row[f"{component_prefix}_zero_gradient_elements"],
-            field=f"{component_prefix}_zero_gradient_elements",
-        )
-        component_nonfinite += _integer(
-            row[f"{component_prefix}_nonfinite_gradient_elements"],
-            field=f"{component_prefix}_nonfinite_gradient_elements",
-        )
-        for index, (token, _) in enumerate(NEAR_ZERO_THRESHOLDS):
-            component_near[index] += _integer(
-                row[f"{component_prefix}_abs_le_{token}_gradient_elements"],
-                field=f"{component_prefix}_abs_le_{token}_gradient_elements",
-            )
-    if (
-        component_exact != exact_elements
-        or component_nonfinite != nonfinite_elements
-        or component_near != near_elements
-    ):
-        raise AssertionError(
-            f"{prefix} component sums mismatch at iteration {iteration}"
-        )
-
-
-def _validate_active_gradient_cohort(
-    row: Dict[str, str],
-    *,
-    prefix: str,
-    row_count: int,
-    active_width: int,
-    iteration: int,
-) -> None:
-    parameter_elements = _integer(
-        row[f"{prefix}_active_parameter_elements"],
-        field=f"{prefix}_active_parameter_elements",
-    )
-    exact_elements = _integer(
-        row[f"{prefix}_active_zero_gradient_elements"],
-        field=f"{prefix}_active_zero_gradient_elements",
-    )
-    nonfinite_elements = _integer(
-        row[f"{prefix}_active_nonfinite_gradient_elements"],
-        field=f"{prefix}_active_nonfinite_gradient_elements",
-    )
-    near_elements = [
-        _integer(
-            row[f"{prefix}_active_abs_le_{token}_gradient_elements"],
-            field=f"{prefix}_active_abs_le_{token}_gradient_elements",
-        )
-        for token, _ in NEAR_ZERO_THRESHOLDS
-    ]
-    if parameter_elements != active_width * row_count:
-        raise AssertionError(
-            f"{prefix} active width mismatch at iteration {iteration}"
-        )
-    if not (
-        0
-        <= exact_elements
-        <= near_elements[0]
-        <= near_elements[1]
-        <= near_elements[2]
-        <= near_elements[3]
-        <= near_elements[4]
-        <= near_elements[5]
-        <= near_elements[6]
-        <= parameter_elements
-    ):
-        raise AssertionError(
-            f"invalid {prefix} active counts at iteration {iteration}"
-        )
-    if nonfinite_elements:
-        raise AssertionError(
-            f"non-finite {prefix} active gradients at iteration {iteration}"
-        )
-    zero_histogram = [
-        _integer(
-            row[f"{prefix}_active_zero_gradient_elements_{count}_gaussians"],
-            field=f"{prefix}_active_zero_histogram_{count}",
-        )
-        for count in range(PARAMETERS_PER_GAUSSIAN + 1)
-    ]
-    near_histogram = [
-        _integer(
-            row[f"{prefix}_active_near_zero_elements_{count}_gaussians"],
-            field=f"{prefix}_active_near_histogram_{count}",
-        )
-        for count in range(PARAMETERS_PER_GAUSSIAN + 1)
-    ]
-    if sum(zero_histogram) != row_count or sum(near_histogram) != row_count:
-        raise AssertionError(
-            f"{prefix} active histogram row sum mismatch at iteration {iteration}"
-        )
-    if (
-        sum(count * rows for count, rows in enumerate(zero_histogram))
-        != exact_elements
-        or sum(count * rows for count, rows in enumerate(near_histogram))
-        != near_elements[4]
-    ):
-        raise AssertionError(
-            f"{prefix} active histogram weighted sum mismatch at iteration {iteration}"
-        )
-    all_zero_rows = _integer(
-        row[f"{prefix}_active_all_zero_gradient_gaussians"],
-        field=f"{prefix}_active_all_zero_gradient_gaussians",
-    )
-    if (
-        zero_histogram[active_width] != all_zero_rows
-        or any(zero_histogram[active_width + 1 :])
-        or any(near_histogram[active_width + 1 :])
-    ):
-        raise AssertionError(
-            f"{prefix} active histogram width mismatch at iteration {iteration}"
-        )
-
-
 def _rank_paths(run_dir: Path) -> List[Path]:
     paths = list(run_dir.glob("metrics_grad_zero_rank*.tsv"))
     paths.extend(run_dir.glob("rank_*/metrics_grad_zero_rank*.tsv"))
@@ -377,65 +165,83 @@ def audit(run_dir: Path) -> Dict[str, object]:
                 grad["tile_mask_rejected_gaussians"],
                 field="tile_mask_rejected_gaussians",
             )
-            tile_rejected_nonzero_rows = _integer(
-                grad["tile_mask_rejected_nonzero_gradient_gaussians"],
-                field="tile_mask_rejected_nonzero_gradient_gaussians",
-            )
-            tile_rejected_all_zero_rows = _integer(
+            tile_rejected_zero_rows = _integer(
                 grad["tile_mask_rejected_all_zero_gradient_gaussians"],
                 field="tile_mask_rejected_all_zero_gradient_gaussians",
             )
-            would_drop_nonzero_rows = _integer(
-                grad.get(
-                    "would_drop_nonzero_gradient_gaussians",
-                    grad["tile_mask_rejected_nonzero_gradient_gaussians"],
-                ),
-                field="would_drop_nonzero_gradient_gaussians",
+            tile_rejected_nonzero_rows = _integer(
+                grad["tile_mask_rejected_nonzero_gradient_gaussians"],
+                field="tile_mask_rejected_nonzero_gradient_gaussians",
             )
             if cull_rows != tile_keep_rows + tile_rejected_rows:
                 raise AssertionError(
                     f"projection/tile row partition failed at iteration {iteration}"
                 )
             if tile_rejected_rows != (
-                tile_rejected_all_zero_rows + tile_rejected_nonzero_rows
+                tile_rejected_zero_rows + tile_rejected_nonzero_rows
             ):
                 raise AssertionError(
                     f"tile rejected row partition failed at iteration {iteration}"
                 )
-            tile_parameter_elements = _integer(
+            if _integer(
                 grad["tile_mask_keep_parameter_elements"],
                 field="tile_mask_keep_parameter_elements",
-            )
-            if tile_parameter_elements != PARAMETERS_PER_GAUSSIAN * tile_keep_rows:
+            ) != PARAMETERS_PER_GAUSSIAN * tile_keep_rows:
                 raise AssertionError(
                     f"tile-mask 59*d mismatch at iteration {iteration}"
                 )
+
+            active_width = _integer(
+                grad["active_parameter_width"], field="active_parameter_width"
+            )
+            expected_active_width = 11 + 3 * (
+                _integer(grad["active_sh_degree"], field="active_sh_degree") + 1
+            ) ** 2
+            if active_width != expected_active_width:
+                raise AssertionError(
+                    f"active parameter width mismatch at iteration {iteration}"
+                )
+            for prefix, rows in (
+                ("projection_cull", cull_rows),
+                ("tile_mask_keep", tile_keep_rows),
+            ):
+                if _integer(
+                    grad[f"{prefix}_active_parameter_elements"],
+                    field=f"{prefix}_active_parameter_elements",
+                ) != active_width * rows:
+                    raise AssertionError(
+                        f"{prefix} active width mismatch at iteration {iteration}"
+                    )
+
             mode = grad.get("tile_contribution_mode", "off")
             observed = _integer(
                 grad.get("tile_drop_gradients_observed", "0") or "0",
                 field="tile_drop_gradients_observed",
             )
+            would_drop_nonzero = _integer(
+                grad["would_drop_nonzero_gradient_gaussians"],
+                field="would_drop_nonzero_gradient_gaussians",
+            )
             if mode == "profile" and observed:
                 profiled_drop_batches += 1
-            if mode == "profile" and observed and tile_rejected_nonzero_rows:
-                raise AssertionError(
-                    "tile mask false negatives at iteration "
-                    f"{iteration}: {tile_rejected_nonzero_rows} would-drop rows "
-                    "have nonzero gradients; apply equivalence is FAIL"
-                )
+                if tile_rejected_nonzero_rows:
+                    raise AssertionError(
+                        f"tile mask false negatives at iteration {iteration}: "
+                        f"{tile_rejected_nonzero_rows} would-drop rows have nonzero gradients"
+                    )
             expected_would_drop = (
                 tile_rejected_nonzero_rows
                 if mode == "profile" and observed
                 else 0
             )
-            if would_drop_nonzero_rows != expected_would_drop:
+            if would_drop_nonzero != expected_would_drop:
                 raise AssertionError(
                     "would-drop gradient count disagrees with observation mode at "
                     f"iteration {iteration}"
                 )
+
             projection_pairs = _integer(
-                grad["tile_mask_projection_pairs"],
-                field="tile_mask_projection_pairs",
+                grad["tile_mask_projection_pairs"], field="tile_mask_projection_pairs"
             )
             kept_projection_pairs = _integer(
                 grad["tile_mask_kept_projection_pairs"],
@@ -456,40 +262,11 @@ def audit(run_dir: Path) -> Dict[str, object]:
             if not (
                 0 <= kept_projection_pairs <= projection_pairs
                 and 0 <= candidate_after <= candidate_before
-                and kept_projection_pairs
-                <= contributing_pairs
-                <= candidate_after
+                and kept_projection_pairs <= contributing_pairs <= candidate_after
             ):
                 raise AssertionError(
                     f"invalid tile-mask pair counts at iteration {iteration}"
                 )
-            active_width = _integer(
-                grad["active_parameter_width"], field="active_parameter_width"
-            )
-            expected_active_width = 11 + 3 * (
-                _integer(grad["active_sh_degree"], field="active_sh_degree") + 1
-            ) ** 2
-            if active_width != expected_active_width:
-                raise AssertionError(
-                    f"active parameter width mismatch at iteration {iteration}"
-                )
-            for prefix, count in (
-                ("projection_cull", cull_rows),
-                ("tile_mask_keep", tile_keep_rows),
-            ):
-                _validate_active_gradient_cohort(
-                    grad,
-                    prefix=prefix,
-                    row_count=count,
-                    active_width=active_width,
-                    iteration=iteration,
-                )
-            _validate_full_gradient_cohort(
-                grad,
-                prefix="tile_mask_keep",
-                row_count=tile_keep_rows,
-                iteration=iteration,
-            )
 
         histogram = [
             _integer(

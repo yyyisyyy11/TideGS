@@ -31,23 +31,11 @@ def _gradient_zero_stats(*args, **kwargs):
 
 
 def _load_touched_component_rows():
-    tree = ast.parse(ENGINE_PATH.read_text(encoding="utf-8"))
-    function = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "_touched_component_rows"
+    from strategies.tide_engine.gradient_sparsity import (
+        touched_component_rows,
     )
-    module = ast.Module(body=[function], type_ignores=[])
-    ast.fix_missing_locations(module)
-    namespace = {
-        "Dict": Dict,
-        "torch": torch,
-        "GRAD_NEAR_ZERO_THRESHOLDS": GRAD_NEAR_ZERO_THRESHOLDS,
-        "GRAD_ZERO_VALUE_FIELDS": GRAD_ZERO_VALUE_FIELDS,
-    }
-    exec(compile(module, str(ENGINE_PATH), "exec"), namespace)
-    return namespace["_touched_component_rows"]
+
+    return touched_component_rows
 
 
 def _load_local_ids_for_blocks():

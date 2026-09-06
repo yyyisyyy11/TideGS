@@ -19,11 +19,8 @@ from strategies.tide_engine.distributed_metrics import (
     get_legacy_cuda_metrics_collector,
 )
 from strategies.tide_engine.gradient_sparsity import (
-    GRADIENT_COMPONENTS,
-    GRADIENT_WIDTHS,
-    active_parameter_width,
-    profile_gradient_sparsity,
-    touched_component_rows,
+    build_gradient_sparsity_records,
+    collect_gradient_sparsity,
 )
 from utils.distributed import get_distributed_context
 
@@ -3303,119 +3300,31 @@ def clm_offload_train_one_batch(
         owner_grad_components = sparse_grad_components
         if tile_contribution_mode == "off":
             tile_survivor_mask.copy_(projection_cull_survivor_mask)
-        projection_profile = profile_gradient_sparsity(
+        grad_profile = collect_gradient_sparsity(
             owner_grad_components,
             projection_cull_survivor_mask,
-            prefix="projection_cull",
+            tile_survivor_mask,
             active_sh_degree=int(gaussians.active_sh_degree),
+            tile_mode=tile_contribution_mode,
+            tile_counts=tile_mask_counts,
             near_zero_threshold=legacy_metrics_writer.grad_near_zero_threshold,
             sample_rows=legacy_metrics_writer.grad_sample_rows,
             chunk_rows=legacy_metrics_writer.grad_stats_chunk_rows,
-            include_sample_count=True,
-            include_active=True,
         )
-        tile_profile = profile_gradient_sparsity(
-            owner_grad_components,
+        grad_zero_record, grad_sample_record = build_gradient_sparsity_records(
+            grad_profile,
+            GRAD_METRIC_VALUE_FIELDS,
+            sparse_grad_local_ids,
             tile_survivor_mask,
-            prefix="tile_mask_keep",
+            iteration=iteration,
+            optimizer_step=optimizer_step,
             active_sh_degree=int(gaussians.active_sh_degree),
             near_zero_threshold=legacy_metrics_writer.grad_near_zero_threshold,
-            sample_rows=0,
-            chunk_rows=legacy_metrics_writer.grad_stats_chunk_rows,
-            include_sample_count=False,
-            include_active=True,
+            tile_mode=tile_contribution_mode,
+            tile_alpha_threshold=tile_alpha_threshold,
         )
-        active_rows = touched_component_rows(
-            owner_grad_components,
-            grad_stats_row_count,
-            gaussians._xyz.device,
-        )
-        nonzero_mask = torch.zeros_like(projection_cull_survivor_mask)
-        nonzero_mask[active_rows] = True
-        rejected_mask = projection_cull_survivor_mask & ~tile_survivor_mask
-        rejected_count = rejected_mask.sum(dtype=torch.long)
-        rejected_nonzero = (rejected_mask & nonzero_mask).sum(dtype=torch.long)
-        metric_tensors = {
-            **projection_profile["stats"],
-            **tile_profile["stats"],
-            "projection_cull_nonzero_gradient_gaussians": (
-                projection_cull_survivor_mask & nonzero_mask
-            ).sum(dtype=torch.long),
-            "tile_mask_keep_nonzero_gradient_gaussians": (
-                tile_survivor_mask & nonzero_mask
-            ).sum(dtype=torch.long),
-            "tile_mask_rejected_gaussians": rejected_count,
-            "tile_mask_rejected_all_zero_gradient_gaussians": (
-                rejected_count - rejected_nonzero
-            ),
-            "tile_mask_rejected_nonzero_gradient_gaussians": rejected_nonzero,
-            "would_drop_nonzero_gradient_gaussians": torch.where(
-                torch.tensor(
-                    tile_contribution_mode == "profile",
-                    dtype=torch.bool,
-                    device=rejected_nonzero.device,
-                ),
-                rejected_nonzero,
-                torch.zeros_like(rejected_nonzero),
-            ),
-            "tile_mask_projection_pairs": tile_mask_counts[0],
-            "tile_mask_kept_projection_pairs": tile_mask_counts[1],
-            "tile_mask_candidate_tile_pairs_before": tile_mask_counts[2],
-            "tile_mask_candidate_tile_pairs_after": tile_mask_counts[3],
-            "tile_mask_contributing_tile_pairs": tile_mask_counts[4],
-        }
-        metric_values = dict(
-            zip(
-                GRAD_METRIC_VALUE_FIELDS,
-                torch.stack(
-                    [metric_tensors[field] for field in GRAD_METRIC_VALUE_FIELDS]
-                ).detach().cpu().tolist(),
-            )
-        )
-        active_width = active_parameter_width(int(gaussians.active_sh_degree))
-        legacy_metrics_writer.write_grad_zero(
-            {
-                "iteration": iteration,
-                "optimizer_step": optimizer_step,
-                "active_sh_degree": int(gaussians.active_sh_degree),
-                "active_parameter_width": active_width,
-                "near_zero_threshold": legacy_metrics_writer.grad_near_zero_threshold,
-                "tile_contribution_mode": tile_contribution_mode,
-                "tile_alpha_threshold": tile_alpha_threshold,
-                "tile_drop_gradients_observed": int(
-                    tile_contribution_mode == "profile"
-                ),
-                **metric_values,
-            }
-        )
-        sample_owner_rows = projection_profile["sample_owner_rows"]
-        sample_local_ids = sparse_grad_local_ids.index_select(0, sample_owner_rows)
-        legacy_metrics_writer.write_grad_sample(
-            {
-                "format_version": 2,
-                "iteration": iteration,
-                "optimizer_step": optimizer_step,
-                "active_sh_degree": int(gaussians.active_sh_degree),
-                "active_parameter_width": active_width,
-                "near_zero_threshold": legacy_metrics_writer.grad_near_zero_threshold,
-                "tile_contribution_mode": tile_contribution_mode,
-                "tile_alpha_threshold": tile_alpha_threshold,
-                "parameter_names": GRADIENT_COMPONENTS,
-                "parameter_widths": tuple(
-                    GRADIENT_WIDTHS[name] for name in GRADIENT_COMPONENTS
-                ),
-                "owner_active_rows": grad_stats_row_count,
-                "projection_cull_unique_gaussians": int(
-                    projection_cull_survivor_mask.sum().item()
-                ),
-                "owner_active_row_indices": sample_owner_rows.detach().cpu(),
-                "resident_local_ids": sample_local_ids.detach().cpu(),
-                "tile_keep": tile_survivor_mask.index_select(
-                    0, sample_owner_rows
-                ).detach().cpu(),
-                "gradients": projection_profile["sample_gradients"].detach().cpu(),
-            }
-        )
+        legacy_metrics_writer.write_grad_zero(grad_zero_record)
+        legacy_metrics_writer.write_grad_sample(grad_sample_record)
 
     # ------------------------------------------------------------------------
     # 5.1: Optimizer step (mode-dependent)

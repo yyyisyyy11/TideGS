@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Sequence
 
 import torch
 
@@ -21,7 +21,10 @@ def touched_component_rows(
     active_count: int,
     device: torch.device,
 ) -> torch.Tensor:
-    if int(active_count) == 0:
+    active_count = int(active_count)
+    if active_count < 0:
+        raise ValueError("active_count must be non-negative")
+    if active_count == 0:
         return torch.empty((0,), dtype=torch.long, device=device)
     touched = torch.zeros((active_count,), dtype=torch.bool, device=device)
     for name, value in components.items():
@@ -262,3 +265,152 @@ def profile_gradient_sparsity(
         "sample_gradients": sample_gradients,
         "active_parameter_width": active_width,
     }
+
+
+def collect_gradient_sparsity(
+    components: Dict[str, torch.Tensor],
+    projection_mask: torch.Tensor,
+    tile_mask: torch.Tensor,
+    *,
+    active_sh_degree: int,
+    tile_mode: str,
+    tile_counts: Sequence[torch.Tensor],
+    near_zero_threshold: float,
+    sample_rows: int,
+    chunk_rows: int,
+) -> Dict[str, object]:
+    """Collect projection, tile, and final nonzero-row statistics."""
+
+    projection = profile_gradient_sparsity(
+        components,
+        projection_mask,
+        prefix="projection_cull",
+        active_sh_degree=active_sh_degree,
+        near_zero_threshold=near_zero_threshold,
+        sample_rows=sample_rows,
+        chunk_rows=chunk_rows,
+        include_sample_count=True,
+        include_active=True,
+    )
+    tile = profile_gradient_sparsity(
+        components,
+        tile_mask,
+        prefix="tile_mask_keep",
+        active_sh_degree=active_sh_degree,
+        near_zero_threshold=near_zero_threshold,
+        sample_rows=0,
+        chunk_rows=chunk_rows,
+        include_sample_count=False,
+        include_active=True,
+    )
+    touched_rows = touched_component_rows(
+        components, projection_mask.numel(), projection_mask.device
+    )
+    nonzero_mask = torch.zeros_like(projection_mask)
+    nonzero_mask[touched_rows] = True
+    rejected_mask = projection_mask & ~tile_mask
+    rejected = rejected_mask.sum(dtype=torch.long)
+    rejected_nonzero = (rejected_mask & nonzero_mask).sum(dtype=torch.long)
+    if len(tile_counts) != 5:
+        raise ValueError("tile_counts must contain five counters")
+
+    stats = {
+        **projection["stats"],
+        **tile["stats"],
+        "projection_cull_nonzero_gradient_gaussians": (
+            projection_mask & nonzero_mask
+        ).sum(dtype=torch.long),
+        "tile_mask_keep_nonzero_gradient_gaussians": (
+            tile_mask & nonzero_mask
+        ).sum(dtype=torch.long),
+        "tile_mask_rejected_gaussians": rejected,
+        "tile_mask_rejected_all_zero_gradient_gaussians": (
+            rejected - rejected_nonzero
+        ),
+        "tile_mask_rejected_nonzero_gradient_gaussians": rejected_nonzero,
+        "would_drop_nonzero_gradient_gaussians": (
+            rejected_nonzero
+            if tile_mode == "profile"
+            else torch.zeros_like(rejected_nonzero)
+        ),
+        **dict(
+            zip(
+                (
+                    "tile_mask_projection_pairs",
+                    "tile_mask_kept_projection_pairs",
+                    "tile_mask_candidate_tile_pairs_before",
+                    "tile_mask_candidate_tile_pairs_after",
+                    "tile_mask_contributing_tile_pairs",
+                ),
+                tile_counts,
+            )
+        ),
+    }
+    return {
+        "stats": stats,
+        "sample_owner_rows": projection["sample_owner_rows"],
+        "sample_gradients": projection["sample_gradients"],
+        "active_parameter_width": projection["active_parameter_width"],
+        "touched_rows": touched_rows,
+    }
+
+
+def build_gradient_sparsity_records(
+    profile: Dict[str, object],
+    metric_fields: Sequence[str],
+    local_ids: torch.Tensor,
+    tile_mask: torch.Tensor,
+    *,
+    iteration: int,
+    optimizer_step: int,
+    active_sh_degree: int,
+    near_zero_threshold: float,
+    tile_mode: str,
+    tile_alpha_threshold: float,
+) -> tuple[Dict[str, object], Dict[str, object]]:
+    """Move one profile to CPU and build the stable TSV/sample payloads."""
+
+    stats = profile["stats"]
+    values = dict(
+        zip(
+            metric_fields,
+            torch.stack([stats[field] for field in metric_fields])
+            .detach()
+            .cpu()
+            .tolist(),
+        )
+    )
+    sample_rows = profile["sample_owner_rows"]
+    sample_local_ids = local_ids.index_select(0, sample_rows)
+    common = {
+        "iteration": iteration,
+        "optimizer_step": optimizer_step,
+        "active_sh_degree": active_sh_degree,
+        "active_parameter_width": profile["active_parameter_width"],
+        "near_zero_threshold": near_zero_threshold,
+        "tile_contribution_mode": tile_mode,
+        "tile_alpha_threshold": tile_alpha_threshold,
+    }
+    return (
+        {
+            **common,
+            "tile_drop_gradients_observed": int(tile_mode == "profile"),
+            **values,
+        },
+        {
+            "format_version": 2,
+            **common,
+            "parameter_names": GRADIENT_COMPONENTS,
+            "parameter_widths": tuple(
+                GRADIENT_WIDTHS[name] for name in GRADIENT_COMPONENTS
+            ),
+            "owner_active_rows": int(tile_mask.numel()),
+            "projection_cull_unique_gaussians": int(
+                stats["projection_cull_unique_gaussians"].item()
+            ),
+            "owner_active_row_indices": sample_rows.detach().cpu(),
+            "resident_local_ids": sample_local_ids.detach().cpu(),
+            "tile_keep": tile_mask.index_select(0, sample_rows).detach().cpu(),
+            "gradients": profile["sample_gradients"].detach().cpu(),
+        },
+    )
