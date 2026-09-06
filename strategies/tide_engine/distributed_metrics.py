@@ -12,6 +12,12 @@ import time
 from pathlib import Path
 from typing import Dict, Iterable, List
 
+from .gradient_schema import (
+    GRADIENT_COMPONENTS,
+    GRAD_NEAR_ZERO_THRESHOLDS,
+    gradient_stat_fields,
+)
+
 
 BATCH_FIELDS = [
     "iteration",
@@ -93,23 +99,7 @@ BATCH_FIELDS = [
     "next_plan_target_iteration",
 ]
 
-GRAD_ZERO_COMPONENTS = (
-    "xyz",
-    "opacity",
-    "scaling",
-    "rotation",
-    "features_dc",
-    "features_rest",
-)
-GRAD_NEAR_ZERO_THRESHOLDS = (
-    ("1em16", 1e-16),
-    ("1em14", 1e-14),
-    ("1em12", 1e-12),
-    ("1em10", 1e-10),
-    ("1em8", 1e-8),
-    ("1em6", 1e-6),
-    ("1em4", 1e-4),
-)
+GRAD_ZERO_COMPONENTS = GRADIENT_COMPONENTS
 GRAD_ZERO_HISTOGRAM_FIELDS = [
     f"projection_cull_zero_gradient_elements_{count}_gaussians"
     for count in range(60)
@@ -141,16 +131,49 @@ GRAD_ZERO_VALUE_FIELDS = [
     for component in GRAD_ZERO_COMPONENTS
     for token, _ in GRAD_NEAR_ZERO_THRESHOLDS
 ] + GRAD_ZERO_HISTOGRAM_FIELDS + GRAD_NEAR_ZERO_HISTOGRAM_FIELDS
+GRAD_ACTIVE_VALUE_FIELDS = gradient_stat_fields(
+    "projection_cull",
+    include_sample_count=True,
+    include_active=True,
+)[len(GRAD_ZERO_VALUE_FIELDS):]
+TILE_KEEP_GRAD_VALUE_FIELDS = gradient_stat_fields(
+    "tile_mask_keep",
+    include_sample_count=False,
+    include_active=True,
+)
+TILE_MASK_COUNT_FIELDS = [
+    "projection_cull_nonzero_gradient_gaussians",
+    "tile_mask_keep_nonzero_gradient_gaussians",
+    "tile_mask_rejected_gaussians",
+    "tile_mask_rejected_all_zero_gradient_gaussians",
+    "tile_mask_rejected_nonzero_gradient_gaussians",
+    "would_drop_nonzero_gradient_gaussians",
+    "tile_mask_projection_pairs",
+    "tile_mask_kept_projection_pairs",
+    "tile_mask_candidate_tile_pairs_before",
+    "tile_mask_candidate_tile_pairs_after",
+    "tile_mask_contributing_tile_pairs",
+]
+GRAD_METRIC_VALUE_FIELDS = (
+    GRAD_ZERO_VALUE_FIELDS
+    + GRAD_ACTIVE_VALUE_FIELDS
+    + TILE_KEEP_GRAD_VALUE_FIELDS
+    + TILE_MASK_COUNT_FIELDS
+)
 GRAD_ZERO_ONCE_FIELDS = [
     "optimizer_step",
     "active_sh_degree",
+    "active_parameter_width",
     "near_zero_threshold",
+    "tile_contribution_mode",
+    "tile_alpha_threshold",
+    "tile_drop_gradients_observed",
 ]
 GRAD_ZERO_FIELDS = (
-    ["iteration", "rank"] + GRAD_ZERO_ONCE_FIELDS + GRAD_ZERO_VALUE_FIELDS
+    ["iteration", "rank"] + GRAD_ZERO_ONCE_FIELDS + GRAD_METRIC_VALUE_FIELDS
 )
 GRAD_ZERO_GLOBAL_FIELDS = (
-    ["iteration", "world_size"] + GRAD_ZERO_ONCE_FIELDS + GRAD_ZERO_VALUE_FIELDS
+    ["iteration", "world_size"] + GRAD_ZERO_ONCE_FIELDS + GRAD_METRIC_VALUE_FIELDS
 )
 
 IO_FIELDS = [
@@ -445,7 +468,7 @@ class DistributedMetricsWriter:
                     f"Distributed ranks disagree on grad metric {field}: {values}"
                 )
             global_row[field] = values[0]
-        for field in GRAD_ZERO_VALUE_FIELDS:
+        for field in GRAD_METRIC_VALUE_FIELDS:
             global_row[field] = sum(
                 int(value.get(field, 0)) for value in rank_rows
             )

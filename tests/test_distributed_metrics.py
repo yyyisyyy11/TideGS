@@ -108,6 +108,7 @@ class DistributedMetricsTest(unittest.TestCase):
                     "projection_cull_zero_gradient_elements": 111,
                     "projection_cull_all_zero_gradient_gaussians": 1,
                     "projection_cull_zero_gradient_elements_52_gaussians": 1,
+                    "would_drop_nonzero_gradient_gaussians": 2,
                 }
             )
             rank_rows = _read_rows(Path(directory) / "metrics_grad_zero_rank0.tsv")
@@ -116,6 +117,9 @@ class DistributedMetricsTest(unittest.TestCase):
             self.assertEqual(global_rows[0]["world_size"], "2")
             self.assertEqual(global_rows[0]["projection_cull_unique_gaussians"], "6")
             self.assertEqual(global_rows[0]["projection_cull_zero_gradient_elements_52_gaussians"], "2")
+            self.assertEqual(
+                global_rows[0]["would_drop_nonzero_gradient_gaussians"], "4"
+            )
 
     def test_legacy_collector_defers_cuda_read_and_writes_single_rank_schema(self):
         with tempfile.TemporaryDirectory() as directory:

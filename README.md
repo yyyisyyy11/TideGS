@@ -272,6 +272,44 @@ an 8192-block global resident cap. Distributed checkpoints must be resumed with
 the same world size and optimizer, batch, capacity, trust-region, camera, and
 owner-map configuration.
 
+### Tile Mask Gradient Profiling
+
+The tile-contribution mask tests each projected Gaussian against the pixel-center
+rectangle of every candidate tile using gsplat's `1/255` alpha cutoff. It never
+allocates a Gaussian-by-tile matrix. The default training behavior is unchanged:
+`--tide_tile_contribution_mode off` does not invoke the mask kernel.
+
+Run `profile` before `apply` to verify that every projection which would be
+removed has an all-zero gradient row:
+
+```bash
+TIDE_TILE_CONTRIBUTION_MODE=profile \
+TIDE_TILE_ALPHA_THRESHOLD=0.00392156862745098 \
+bash scripts/run_iat_grad_sparsity.sh
+```
+
+After the audit passes, rerun with
+`TIDE_TILE_CONTRIBUTION_MODE=apply`. The metrics preserve the original 59-value
+gradient definition and also report the active-SH width
+`11 + 3 * (active_sh_degree + 1)^2`. Summarize and audit a run with:
+
+```bash
+python tools/summarize_grad_zero_metrics.py \
+  "$RUN_DIR/metrics_grad_zero_global.tsv"
+python tools/summarize_grad_samples.py "$RUN_DIR/grad_samples"
+python tools/audit_grad_sparsity_metrics.py "$RUN_DIR"
+```
+
+The audit reports `apply_equivalence_under_profiled_threshold=PASS` only for a
+successful `profile` run. An `apply` run without matching profile evidence is
+reported as `NOT_ESTABLISHED`.
+
+Distributed gsplat 1.5.3 must be patched once in the training environment:
+
+```bash
+python tools/patch_gsplat_distributed_packed.py
+```
+
 ## Checkpoint And Resume
 
 Run 1000 iterations with an incremental checkpoint at 500:

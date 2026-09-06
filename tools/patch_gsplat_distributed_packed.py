@@ -14,6 +14,7 @@ ORIGINAL = "            C = C_world[world_rank]\n\n        else:\n"
 BUGGY_IMAGE_IDS = "image_ids = batch_ids * C + camera_ids"
 PROJECTION_TIMING_MARKER = "_tide_projection_events"
 OWNER_SURVIVOR_MARKER = "_tide_owner_projection_survivor_mask"
+TILE_CONTRIBUTION_MARKER = "_tide_owner_tile_survivor_mask"
 PROJECTION_START_ANCHOR = "    if with_ut:\n"
 PROJECTION_END_ANCHOR = (
     "    if packed:\n"
@@ -50,13 +51,88 @@ OWNER_SURVIVOR_ANCHOR = (
     "        {\n"
     "            # global batch and camera ids\n"
 )
-OWNER_SURVIVOR_PATCHED = (
+TILE_CONTRIBUTION_PREFIX = (
+    "    if compensations is not None:\n"
+    "        opacities = opacities * compensations\n"
+    "\n"
+)
+TILE_CONTRIBUTION_BODY = (
+    "    if compensations is not None:\n"
+    "        opacities = opacities * compensations\n"
+    "\n"
+    "    _tide_original_projection_radii = radii\n"
+    '    _tide_tile_mode = getattr(torch, "_tide_tile_contribution_mode", "off")\n'
+    '    if distributed and packed and _tide_tile_mode != "off":\n'
+    "        (\n"
+    "            _tide_tile_keep_mask,\n"
+    "            _tide_tile_candidate_counts,\n"
+    "            _tide_tile_contributing_counts,\n"
+    '        ) = torch._tide_tile_contribution_mask(\n'
+    "            means2d,\n"
+    "            conics,\n"
+    "            opacities,\n"
+    "            radii,\n"
+    "            width,\n"
+    "            height,\n"
+    "            tile_size,\n"
+    '            getattr(torch, "_tide_tile_alpha_threshold", 1.0 / 255.0),\n'
+    "        )\n"
+    "        _tide_owner_tile_survivor_mask = torch.zeros(\n"
+    "            (N,), dtype=torch.bool, device=device\n"
+    "        )\n"
+    "        _tide_owner_tile_survivor_mask[\n"
+    "            gaussian_ids[_tide_tile_keep_mask]\n"
+    "        ] = True\n"
+    f'        meta["{TILE_CONTRIBUTION_MARKER}"] = (\n'
+    "            _tide_owner_tile_survivor_mask\n"
+    "        )\n"
+    '        meta["_tide_tile_mask_counts"] = torch.stack(\n'
+    "            (\n"
+    "                _tide_tile_keep_mask.new_tensor(\n"
+    "                    _tide_tile_keep_mask.numel(), dtype=torch.long\n"
+    "                ),\n"
+    "                _tide_tile_keep_mask.sum(dtype=torch.long),\n"
+    "                _tide_tile_candidate_counts.sum(dtype=torch.long),\n"
+    "                _tide_tile_candidate_counts[\n"
+    "                    _tide_tile_keep_mask\n"
+    "                ].sum(dtype=torch.long),\n"
+    "                _tide_tile_contributing_counts.sum(dtype=torch.long),\n"
+    "            )\n"
+    "        )\n"
+    '        if _tide_tile_mode == "apply":\n'
+    "            _tide_radius_mask = _tide_tile_keep_mask\n"
+    "            if radii.dim() == _tide_radius_mask.dim() + 1:\n"
+    "                _tide_radius_mask = _tide_radius_mask.unsqueeze(-1)\n"
+    "            radii = torch.where(\n"
+    "                _tide_radius_mask, radii, torch.zeros_like(radii)\n"
+    "            )\n"
+    "\n"
+)
+TILE_CONTRIBUTION_ANCHOR = TILE_CONTRIBUTION_PREFIX + OWNER_SURVIVOR_ANCHOR
+TILE_CONTRIBUTION_PATCHED = TILE_CONTRIBUTION_BODY + OWNER_SURVIVOR_ANCHOR
+OWNER_SURVIVOR_LEGACY_PATCHED = (
     '    if distributed and packed and getattr(torch, "_tide_gsplat_grad_zero_metrics", False):\n'
     "        _tide_owner_projection_survivor_mask = torch.zeros(\n"
     "            (N,), dtype=torch.bool, device=device\n"
     "        )\n"
     "        _tide_owner_projection_survivor_mask[\n"
     "            gaussian_ids[(radii > 0).all(dim=-1)]\n"
+    "        ] = True\n"
+    f'        meta["{OWNER_SURVIVOR_MARKER}"] = (\n'
+    "            _tide_owner_projection_survivor_mask\n"
+    "        )\n"
+    "\n"
+    f"{OWNER_SURVIVOR_ANCHOR}"
+)
+OWNER_SURVIVOR_PATCHED = (
+    '    if distributed and packed and getattr(torch, "_tide_gsplat_grad_zero_metrics", False):\n'
+    "        _tide_owner_projection_survivor_mask = torch.zeros(\n"
+    "            (N,), dtype=torch.bool, device=device\n"
+    "        )\n"
+    "        _tide_owner_projection_survivor_mask[\n"
+    "            gaussian_ids[\n"
+    "                (_tide_original_projection_radii > 0).all(dim=-1)\n"
+    "            ]\n"
     "        ] = True\n"
     f'        meta["{OWNER_SURVIVOR_MARKER}"] = (\n'
     "            _tide_owner_projection_survivor_mask\n"
@@ -85,7 +161,15 @@ def patch_rendering_source(source: str) -> tuple[str, bool]:
 
 def patch_projection_timing_source(source: str) -> tuple[str, bool]:
     if PROJECTION_TIMING_MARKER in source:
-        return source, False
+        if (
+            PROJECTION_START_PATCHED in source
+            and PROJECTION_END_PATCHED in source
+        ):
+            return source, False
+        raise RuntimeError(
+            "Found an unknown existing projection-timing patch layout. "
+            "Refusing to modify it."
+        )
     start_occurrences = source.count(PROJECTION_START_ANCHOR)
     end_occurrences = source.count(PROJECTION_END_ANCHOR)
     if start_occurrences != 1 or end_occurrences != 1:
@@ -108,8 +192,20 @@ def patch_projection_timing_source(source: str) -> tuple[str, bool]:
 
 
 def patch_owner_survivor_source(source: str) -> tuple[str, bool]:
-    if OWNER_SURVIVOR_MARKER in source:
+    if OWNER_SURVIVOR_PATCHED in source:
         return source, False
+    if OWNER_SURVIVOR_MARKER in source:
+        occurrences = source.count(OWNER_SURVIVOR_LEGACY_PATCHED)
+        if occurrences != 1:
+            raise RuntimeError(
+                "Found an unknown existing owner-survivor patch layout. "
+                "Refusing to modify it."
+            )
+        return source.replace(
+            OWNER_SURVIVOR_LEGACY_PATCHED,
+            OWNER_SURVIVOR_PATCHED,
+            1,
+        ), True
     occurrences = source.count(OWNER_SURVIVOR_ANCHOR)
     if occurrences != 1:
         raise RuntimeError(
@@ -121,6 +217,31 @@ def patch_owner_survivor_source(source: str) -> tuple[str, bool]:
         OWNER_SURVIVOR_PATCHED,
         1,
     ), True
+
+
+def patch_tile_contribution_source(source: str) -> tuple[str, bool]:
+    if TILE_CONTRIBUTION_MARKER in source:
+        if TILE_CONTRIBUTION_BODY in source:
+            return source, False
+        raise RuntimeError(
+            "Found an unknown existing tile-mask patch layout. "
+            "Refusing to modify it."
+        )
+    suffixes = (
+        OWNER_SURVIVOR_PATCHED,
+        OWNER_SURVIVOR_LEGACY_PATCHED,
+        OWNER_SURVIVOR_ANCHOR,
+    )
+    anchors = [TILE_CONTRIBUTION_PREFIX + suffix for suffix in suffixes]
+    matches = [anchor for anchor in anchors if source.count(anchor) == 1]
+    if len(matches) != 1:
+        raise RuntimeError(
+            "Expected exactly one gsplat 1.5.3 tile-mask insertion point; "
+            f"found {len(matches)}. Refusing to modify an unknown source layout."
+        )
+    anchor = matches[0]
+    suffix = anchor[len(TILE_CONTRIBUTION_PREFIX):]
+    return source.replace(anchor, TILE_CONTRIBUTION_BODY + suffix, 1), True
 
 
 def find_rendering_path() -> Path:
@@ -147,8 +268,9 @@ def main() -> None:
     source = rendering_path.read_text(encoding="utf-8")
     patched_source, camera_changed = patch_rendering_source(source)
     patched_source, timing_changed = patch_projection_timing_source(patched_source)
+    patched_source, tile_changed = patch_tile_contribution_source(patched_source)
     patched_source, survivor_changed = patch_owner_survivor_source(patched_source)
-    if not camera_changed and not timing_changed and not survivor_changed:
+    if not camera_changed and not timing_changed and not tile_changed and not survivor_changed:
         print(f"TideGS gsplat fixes already present: {rendering_path}")
         return
 
@@ -166,6 +288,8 @@ def main() -> None:
         print(f"Patched gsplat projection timing events: {rendering_path}")
     if survivor_changed:
         print(f"Patched gsplat owner projection survivor mask: {rendering_path}")
+    if tile_changed:
+        print(f"Patched gsplat tile contribution mask: {rendering_path}")
     print(f"Original source backup: {backup_path}")
 
 

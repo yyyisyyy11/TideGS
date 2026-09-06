@@ -240,6 +240,8 @@ class AuxiliaryParams(ParamGroup):
         self.tide_grad_near_zero_threshold = 1e-8  # Primary threshold for per-Gaussian near-zero histograms
         self.tide_grad_sample_rows = 8192  # Raw-gradient rows per rank/batch; 0 disables, -1 records every survivor
         self.tide_grad_stats_chunk_rows = 262144  # Bound temporary memory while scanning gradient rows
+        self.tide_tile_contribution_mode = "off"  # {off, profile, apply}; tile-level alpha visibility filter
+        self.tide_tile_alpha_threshold = 1.0 / 255.0  # Match gsplat's per-pixel alpha cutoff
         self.tide_force_active_sh_degree = -1  # Diagnostic override in [-1, sh_degree]; -1 keeps the normal schedule
         self.tide_block_cull_backend = "cpu"  # {cpu, gpu}; frustum block cull backend
         self.tide_block_cull_camera_chunk = 8  # GPU cull cameras per chunk
@@ -540,6 +542,21 @@ def init_args(args):
         args.tide_owner_balance_samples = int(args.tide_owner_balance_samples)
         assert args.tide_owner_balance_samples >= 0, (
             "tide_owner_balance_samples must be non-negative"
+        )
+    if hasattr(args, "tide_tile_contribution_mode"):
+        args.tide_tile_contribution_mode = str(
+            args.tide_tile_contribution_mode
+        ).lower()
+        assert args.tide_tile_contribution_mode in {"off", "profile", "apply"}, (
+            "tide_tile_contribution_mode must be off, profile, or apply"
+        )
+    if hasattr(args, "tide_tile_alpha_threshold"):
+        args.tide_tile_alpha_threshold = float(args.tide_tile_alpha_threshold)
+        assert math.isfinite(args.tide_tile_alpha_threshold), (
+            "tide_tile_alpha_threshold must be finite"
+        )
+        assert 0.0 < args.tide_tile_alpha_threshold <= 1.0 / 255.0, (
+            "tide_tile_alpha_threshold must be in (0, 1/255]"
         )
     if hasattr(args, "paper_resident_selection_policy"):
         args.paper_resident_selection_policy = str(args.paper_resident_selection_policy).lower()

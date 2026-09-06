@@ -14,6 +14,7 @@ from clm_kernels._C import (
     fusedssim_backward,
     selective_adam_update,
     compute_sh_bwd_inplace,
+    tile_contribution_mask as _tile_contribution_mask,
 )
 from typing import Optional
 
@@ -85,6 +86,37 @@ def spherical_harmonics_bwd_inplace(
     return v_dirs
 
 
+@torch.no_grad()
+def tile_contribution_mask(
+    means2d: torch.Tensor,
+    conics: torch.Tensor,
+    opacities: torch.Tensor,
+    radii: torch.Tensor,
+    image_width: int,
+    image_height: int,
+    tile_size: int = 16,
+    alpha_threshold: float = 1.0 / 255.0,
+):
+    """Return per-projection keep and tile-count tensors."""
+
+    projection_shape = means2d.shape[:-1]
+    keep, candidates, contributing = _tile_contribution_mask(
+        means2d.contiguous(),
+        conics.contiguous(),
+        opacities.contiguous(),
+        radii.contiguous(),
+        int(image_width),
+        int(image_height),
+        int(tile_size),
+        float(alpha_threshold),
+    )
+    return tuple(value.reshape(projection_shape) for value in (
+        keep,
+        candidates,
+        contributing,
+    ))
+
+
 __all__ = [
     "set_signal",
     "compute_cnt_h",
@@ -97,4 +129,5 @@ __all__ = [
     "fused_ssim",
     "selective_adam_update",
     "spherical_harmonics_bwd_inplace",
+    "tile_contribution_mask",
 ]

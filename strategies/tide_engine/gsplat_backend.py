@@ -13,6 +13,12 @@ MIN_DISTRIBUTED_GSPLAT = (1, 5, 3)
 PACKED_DISTRIBUTED_FIX = "image_ids = camera_ids"
 PROJECTION_TIMING_FIX = "_tide_projection_events"
 OWNER_PROJECTION_SURVIVOR_FIX = "_tide_owner_projection_survivor_mask"
+TILE_CONTRIBUTION_FIXES = (
+    "_tide_owner_tile_survivor_mask",
+    "_tide_tile_contribution_mask",
+    "_tide_original_projection_radii",
+    "_tide_radius_mask",
+)
 
 
 def _version_tuple(value: str) -> Tuple[int, ...]:
@@ -70,6 +76,21 @@ def _require_owner_projection_survivor_fix(gsplat) -> None:
         )
 
 
+def _require_tile_contribution_fix(gsplat) -> None:
+    try:
+        source = inspect.getsource(gsplat.rasterization)
+    except (OSError, TypeError) as exc:
+        raise RuntimeError(
+            "Tile-contribution masking requires inspectable gsplat rasterization source"
+        ) from exc
+    if any(marker not in source for marker in TILE_CONTRIBUTION_FIXES):
+        raise RuntimeError(
+            "Tile-contribution masking requires the gsplat tile-mask patch. "
+            "Run `python tools/patch_gsplat_distributed_packed.py` in the TideGS "
+            "environment before launching training."
+        )
+
+
 @lru_cache(maxsize=1)
 def require_distributed_gsplat():
     import gsplat
@@ -104,15 +125,26 @@ def prepare_distributed_gsplat(
     *,
     enable_timing: bool = False,
     enable_grad_zero_metrics: bool = False,
+    tile_contribution_mode: str = "off",
+    tile_alpha_threshold: float = 1.0 / 255.0,
 ) -> None:
     """Serialize first-time CUDA extension setup across local ranks."""
     gsplat = require_distributed_gsplat()
     torch._tide_gsplat_detailed_metrics = bool(enable_timing)
     torch._tide_gsplat_grad_zero_metrics = bool(enable_grad_zero_metrics)
+    tile_contribution_mode = str(tile_contribution_mode).lower()
+    torch._tide_tile_contribution_mode = tile_contribution_mode
+    torch._tide_tile_alpha_threshold = float(tile_alpha_threshold)
+    if tile_contribution_mode != "off":
+        from clm_kernels import tile_contribution_mask
+
+        torch._tide_tile_contribution_mask = tile_contribution_mask
     if enable_timing:
         _require_projection_timing_fix(gsplat)
     if enable_grad_zero_metrics:
         _require_owner_projection_survivor_fix(gsplat)
+    if tile_contribution_mode != "off":
+        _require_tile_contribution_fix(gsplat)
     for loader_rank in range(context.world_size):
         error = None
         if context.rank == loader_rank:

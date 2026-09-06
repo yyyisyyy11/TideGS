@@ -14,8 +14,16 @@ from strategies.tide_engine.gpu_resident_optimizer import (
     GPUResidentSophiaTR,
 )
 from strategies.tide_engine.distributed_metrics import (
+    GRAD_METRIC_VALUE_FIELDS,
     get_distributed_metrics_writer,
     get_legacy_cuda_metrics_collector,
+)
+from strategies.tide_engine.gradient_sparsity import (
+    GRADIENT_COMPONENTS,
+    GRADIENT_WIDTHS,
+    active_parameter_width,
+    profile_gradient_sparsity,
+    touched_component_rows,
 )
 from utils.distributed import get_distributed_context
 
@@ -523,6 +531,54 @@ def pipeline_forward_one_step_shs_inplace(
 
     batched_means2D.retain_grad()  # this is only for training.
 
+    batched_opacities = filtered_opacity_gpu.squeeze(1).unsqueeze(0)
+    tile_mode = str(
+        getattr(utils.get_args(), "tide_tile_contribution_mode", "off")
+    ).lower()
+    tile_threshold = float(
+        getattr(utils.get_args(), "tide_tile_alpha_threshold", 1.0 / 255.0)
+    )
+    projection_mask = (
+        (batched_radiis > 0).all(dim=-1)
+        if batched_radiis.dim() == batched_means2D.dim()
+        else batched_radiis > 0
+    )
+    if tile_mode == "off":
+        tile_keep_mask = projection_mask
+        tile_counts = torch.zeros(
+            (5,), dtype=torch.long, device=batched_means2D.device
+        )
+    else:
+        tile_keep_mask, candidate_counts, contributing_counts = (
+            clm_kernels.tile_contribution_mask(
+                batched_means2D,
+                batched_conics,
+                batched_opacities,
+                batched_radiis,
+                image_width,
+                image_height,
+                TILE_SIZE,
+                tile_threshold,
+            )
+        )
+        tile_counts = torch.stack(
+            (
+                projection_mask.sum(dtype=torch.long),
+                tile_keep_mask.sum(dtype=torch.long),
+                candidate_counts.sum(dtype=torch.long),
+                candidate_counts[tile_keep_mask].sum(dtype=torch.long),
+                contributing_counts.sum(dtype=torch.long),
+            )
+        )
+        if tile_mode == "apply":
+            radius_mask = tile_keep_mask
+            if batched_radiis.dim() == radius_mask.dim() + 1:
+                radius_mask = radius_mask.unsqueeze(-1)
+            batched_radiis = torch.where(
+                radius_mask, batched_radiis, torch.zeros_like(batched_radiis)
+            )
+    effective_sh_mask = tile_keep_mask if tile_mode == "apply" else None
+
     sh_degree = gaussians.active_sh_degree
     camtoworlds = camera.camtoworlds
     # camtoworlds = torch.inverse(viewmat.unsqueeze(0)) # (4, 4)
@@ -536,7 +592,10 @@ def pipeline_forward_one_step_shs_inplace(
         # GPU-resident path: let PyTorch autograd handle SH gradients.
         # This is cleaner and avoids manual gradient computation
         batched_colors_origin = spherical_harmonics(
-            degrees_to_use=sh_degree, dirs=dirs, coeffs=filtered_shs
+            degrees_to_use=sh_degree,
+            dirs=dirs,
+            coeffs=filtered_shs,
+            masks=effective_sh_mask,
         )
         batched_colors_detached = batched_colors_origin  # No detach needed!
         batched_colors = torch.clamp_min(batched_colors_origin + 0.5, 0.0)
@@ -545,13 +604,14 @@ def pipeline_forward_one_step_shs_inplace(
         dirs.retain_grad()  # Need to retain for manual backward
         with torch.no_grad():
             batched_colors_origin = spherical_harmonics(
-                degrees_to_use=sh_degree, dirs=dirs, coeffs=filtered_shs
+                degrees_to_use=sh_degree,
+                dirs=dirs,
+                coeffs=filtered_shs,
+                masks=effective_sh_mask,
             )
         batched_colors_detached = batched_colors_origin.detach().requires_grad_()
         batched_colors = torch.clamp_min(batched_colors_detached + 0.5, 0.0)
     
-    batched_opacities = filtered_opacity_gpu.squeeze(1).unsqueeze(0)  # (N, 1) -> (1, N)
-
     # NOTE: In the above code, we keep the first batch dimension, even if it is always 1.
 
     # render
@@ -598,6 +658,11 @@ def pipeline_forward_one_step_shs_inplace(
         batched_radiis,
         batched_colors_detached,
         dirs,
+        {
+            "projection_mask": projection_mask,
+            "keep_mask": tile_keep_mask,
+            "counts": tile_counts,
+        },
     )
 
 
@@ -770,7 +835,7 @@ def _run_single_rank_sophia_curvature_batch(
             dim=1,
         ).contiguous().requires_grad_(True)
 
-        rendered_image, means2d, radii, colors, dirs = (
+        rendered_image, means2d, radii, colors, dirs, _ = (
             pipeline_forward_one_step_shs_inplace(
                 gaussians.opacity_activation(raw_opacity),
                 gaussians.scaling_activation(raw_scaling),
@@ -1121,16 +1186,21 @@ def clm_offload_train_one_batch(
         storage_adapter is not None
         and getattr(args, "tide_detailed_metrics", False)
     )
+    legacy_grad_metrics_enabled = bool(
+        storage_adapter is not None
+        and getattr(args, "tide_grad_zero_metrics", False)
+    )
     legacy_metrics_writer = None
     legacy_metrics_collector = None
     legacy_cache_before = None
     legacy_batch_start = time.perf_counter()
     legacy_gpu_ranges = {}
-    if legacy_metrics_enabled:
+    if legacy_metrics_enabled or legacy_grad_metrics_enabled:
         legacy_context = get_distributed_context(args)
         legacy_metrics_writer = get_distributed_metrics_writer(
             gaussians, legacy_context
         )
+    if legacy_metrics_enabled:
         legacy_metrics_collector = get_legacy_cuda_metrics_collector(
             gaussians, legacy_context
         )
@@ -1196,6 +1266,16 @@ def clm_offload_train_one_batch(
         gradient_cameras=batched_cameras,
         curvature_cameras=curvature_cameras,
         optimizer_step=optimizer_step,
+    )
+    grad_zero_sample_due = bool(
+        legacy_metrics_writer is not None
+        and legacy_metrics_writer.should_write_grad_zero(optimizer_step)
+    )
+    tile_contribution_mode = str(
+        getattr(args, "tide_tile_contribution_mode", "off")
+    ).lower()
+    tile_alpha_threshold = float(
+        getattr(args, "tide_tile_alpha_threshold", 1.0 / 255.0)
     )
     current_camera_ids = [cam.global_idx for cam in batched_cameras]
     curvature_camera_ids = [cam.global_idx for cam in curvature_cameras]
@@ -2276,6 +2356,23 @@ def clm_offload_train_one_batch(
             gaussians._features_dc.grad = torch.zeros_like(gaussians._features_dc)
             gaussians._features_rest.grad = torch.zeros_like(gaussians._features_rest)
 
+    grad_stats_row_count = (
+        int(sparse_grad_local_ids.numel())
+        if use_sparse_gpu_grad_accum
+        else int(gaussians._xyz.shape[0])
+    )
+    projection_cull_survivor_mask = None
+    tile_survivor_mask = None
+    tile_mask_counts = None
+    if grad_zero_sample_due:
+        projection_cull_survivor_mask = torch.zeros(
+            (grad_stats_row_count,), dtype=torch.bool, device=gaussians._xyz.device
+        )
+        tile_survivor_mask = torch.zeros_like(projection_cull_survivor_mask)
+        tile_mask_counts = torch.zeros(
+            (5,), dtype=torch.long, device=gaussians._xyz.device
+        )
+
     # Stream management: default_stream for compute, comm_stream for CPU<->GPU transfers
     default_stream = torch.cuda.current_stream()
 
@@ -2756,6 +2853,7 @@ def clm_offload_train_one_batch(
             batched_radiis,
             batched_colors_detached,
             dirs,
+            tile_meta,
         ) = pipeline_forward_one_step_shs_inplace(
             filtered_opacity_gpu,
             filtered_scaling_gpu,
@@ -2769,6 +2867,20 @@ def clm_offload_train_one_batch(
             pipe_args,
             use_autograd_for_sh=gaussians.use_gpu_features,  # Enable autograd in GPU mode
         )
+
+        if grad_zero_sample_due:
+            stats_positions = (
+                torch.searchsorted(sparse_grad_local_ids, this_filter_local)
+                if use_sparse_gpu_grad_accum
+                else this_filter_local
+            )
+            camera_projection_keep = tile_meta["projection_mask"].reshape(-1)
+            projection_cull_survivor_mask[
+                stats_positions[camera_projection_keep]
+            ] = True
+            camera_tile_keep = tile_meta["keep_mask"].reshape(-1)
+            tile_survivor_mask[stats_positions[camera_tile_keep]] = True
+            tile_mask_counts.add_(tile_meta["counts"])
 
         # Compute loss
         loss = torch_compiled_loss(
@@ -3159,10 +3271,15 @@ def clm_offload_train_one_batch(
         # Update visibility mask for sparse Adam optimizer (tracks which parameters received gradients)
         if args.sparse_adam and visibility_mask is not None:
             torch.cuda.nvtx.range_push("update visibility")
+            visibility_indices = filters[micro_idx]
+            if tile_contribution_mode == "apply":
+                visibility_indices = visibility_indices[
+                    tile_meta["keep_mask"].reshape(-1)
+                ]
             src = torch.ones(
-                (len(filters[micro_idx]),), dtype=torch.bool, device="cuda"
+                (len(visibility_indices),), dtype=torch.bool, device="cuda"
             )
-            visibility_mask.scatter_(dim=0, index=filters[micro_idx], src=src)
+            visibility_mask.scatter_(dim=0, index=visibility_indices, src=src)
             torch.cuda.nvtx.range_pop()
 
     _ts('stage4_train_done')
@@ -3177,6 +3294,128 @@ def clm_offload_train_one_batch(
     optimizer_step_stats = {}
 
     assert microbatch_idx == bsz, f"microbatch_idx should be equal to bsz. Got {microbatch_idx} vs {bsz}"
+
+    if grad_zero_sample_due:
+        if not use_sparse_gpu_grad_accum:
+            raise RuntimeError(
+                "Single-rank gradient sparsity profiling requires sparse GPU accumulation"
+            )
+        owner_grad_components = sparse_grad_components
+        if tile_contribution_mode == "off":
+            tile_survivor_mask.copy_(projection_cull_survivor_mask)
+        projection_profile = profile_gradient_sparsity(
+            owner_grad_components,
+            projection_cull_survivor_mask,
+            prefix="projection_cull",
+            active_sh_degree=int(gaussians.active_sh_degree),
+            near_zero_threshold=legacy_metrics_writer.grad_near_zero_threshold,
+            sample_rows=legacy_metrics_writer.grad_sample_rows,
+            chunk_rows=legacy_metrics_writer.grad_stats_chunk_rows,
+            include_sample_count=True,
+            include_active=True,
+        )
+        tile_profile = profile_gradient_sparsity(
+            owner_grad_components,
+            tile_survivor_mask,
+            prefix="tile_mask_keep",
+            active_sh_degree=int(gaussians.active_sh_degree),
+            near_zero_threshold=legacy_metrics_writer.grad_near_zero_threshold,
+            sample_rows=0,
+            chunk_rows=legacy_metrics_writer.grad_stats_chunk_rows,
+            include_sample_count=False,
+            include_active=True,
+        )
+        active_rows = touched_component_rows(
+            owner_grad_components,
+            grad_stats_row_count,
+            gaussians._xyz.device,
+        )
+        nonzero_mask = torch.zeros_like(projection_cull_survivor_mask)
+        nonzero_mask[active_rows] = True
+        rejected_mask = projection_cull_survivor_mask & ~tile_survivor_mask
+        rejected_count = rejected_mask.sum(dtype=torch.long)
+        rejected_nonzero = (rejected_mask & nonzero_mask).sum(dtype=torch.long)
+        metric_tensors = {
+            **projection_profile["stats"],
+            **tile_profile["stats"],
+            "projection_cull_nonzero_gradient_gaussians": (
+                projection_cull_survivor_mask & nonzero_mask
+            ).sum(dtype=torch.long),
+            "tile_mask_keep_nonzero_gradient_gaussians": (
+                tile_survivor_mask & nonzero_mask
+            ).sum(dtype=torch.long),
+            "tile_mask_rejected_gaussians": rejected_count,
+            "tile_mask_rejected_all_zero_gradient_gaussians": (
+                rejected_count - rejected_nonzero
+            ),
+            "tile_mask_rejected_nonzero_gradient_gaussians": rejected_nonzero,
+            "would_drop_nonzero_gradient_gaussians": torch.where(
+                torch.tensor(
+                    tile_contribution_mode == "profile",
+                    dtype=torch.bool,
+                    device=rejected_nonzero.device,
+                ),
+                rejected_nonzero,
+                torch.zeros_like(rejected_nonzero),
+            ),
+            "tile_mask_projection_pairs": tile_mask_counts[0],
+            "tile_mask_kept_projection_pairs": tile_mask_counts[1],
+            "tile_mask_candidate_tile_pairs_before": tile_mask_counts[2],
+            "tile_mask_candidate_tile_pairs_after": tile_mask_counts[3],
+            "tile_mask_contributing_tile_pairs": tile_mask_counts[4],
+        }
+        metric_values = dict(
+            zip(
+                GRAD_METRIC_VALUE_FIELDS,
+                torch.stack(
+                    [metric_tensors[field] for field in GRAD_METRIC_VALUE_FIELDS]
+                ).detach().cpu().tolist(),
+            )
+        )
+        active_width = active_parameter_width(int(gaussians.active_sh_degree))
+        legacy_metrics_writer.write_grad_zero(
+            {
+                "iteration": iteration,
+                "optimizer_step": optimizer_step,
+                "active_sh_degree": int(gaussians.active_sh_degree),
+                "active_parameter_width": active_width,
+                "near_zero_threshold": legacy_metrics_writer.grad_near_zero_threshold,
+                "tile_contribution_mode": tile_contribution_mode,
+                "tile_alpha_threshold": tile_alpha_threshold,
+                "tile_drop_gradients_observed": int(
+                    tile_contribution_mode == "profile"
+                ),
+                **metric_values,
+            }
+        )
+        sample_owner_rows = projection_profile["sample_owner_rows"]
+        sample_local_ids = sparse_grad_local_ids.index_select(0, sample_owner_rows)
+        legacy_metrics_writer.write_grad_sample(
+            {
+                "format_version": 2,
+                "iteration": iteration,
+                "optimizer_step": optimizer_step,
+                "active_sh_degree": int(gaussians.active_sh_degree),
+                "active_parameter_width": active_width,
+                "near_zero_threshold": legacy_metrics_writer.grad_near_zero_threshold,
+                "tile_contribution_mode": tile_contribution_mode,
+                "tile_alpha_threshold": tile_alpha_threshold,
+                "parameter_names": GRADIENT_COMPONENTS,
+                "parameter_widths": tuple(
+                    GRADIENT_WIDTHS[name] for name in GRADIENT_COMPONENTS
+                ),
+                "owner_active_rows": grad_stats_row_count,
+                "projection_cull_unique_gaussians": int(
+                    projection_cull_survivor_mask.sum().item()
+                ),
+                "owner_active_row_indices": sample_owner_rows.detach().cpu(),
+                "resident_local_ids": sample_local_ids.detach().cpu(),
+                "tile_keep": tile_survivor_mask.index_select(
+                    0, sample_owner_rows
+                ).detach().cpu(),
+                "gradients": projection_profile["sample_gradients"].detach().cpu(),
+            }
+        )
 
     # ------------------------------------------------------------------------
     # 5.1: Optimizer step (mode-dependent)

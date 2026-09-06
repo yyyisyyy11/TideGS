@@ -5,7 +5,6 @@ from typing import Dict, Sequence
 import unittest
 
 from strategies.tide_engine.distributed_metrics import (
-    GRAD_NEAR_ZERO_THRESHOLDS,
     GRAD_ZERO_VALUE_FIELDS,
 )
 
@@ -21,6 +20,14 @@ ENGINE_PATH = (
     / "tide_engine"
     / "distributed_engine.py"
 )
+
+
+def _gradient_zero_stats(*args, **kwargs):
+    from strategies.tide_engine.gradient_sparsity import (
+        profile_gradient_sparsity,
+    )
+
+    return profile_gradient_sparsity(*args, **kwargs)
 
 
 def _load_touched_component_rows():
@@ -61,11 +68,7 @@ def _load_local_ids_for_blocks():
 def _load_gradient_zero_helpers():
     tree = ast.parse(ENGINE_PATH.read_text(encoding="utf-8"))
     names = {
-        "_LEAF_NAMES",
-        "_LEAF_WIDTHS",
-        "_PARAMETERS_PER_GAUSSIAN",
         "_mark_projection_cull_survivors",
-        "_projection_cull_gradient_zero_stats",
     }
     nodes = []
     for node in tree.body:
@@ -82,14 +85,9 @@ def _load_gradient_zero_helpers():
     namespace = {
         "Dict": Dict,
         "torch": torch,
-        "GRAD_NEAR_ZERO_THRESHOLDS": GRAD_NEAR_ZERO_THRESHOLDS,
-        "GRAD_ZERO_VALUE_FIELDS": GRAD_ZERO_VALUE_FIELDS,
     }
     exec(compile(module, str(ENGINE_PATH), "exec"), namespace)
-    return (
-        namespace["_mark_projection_cull_survivors"],
-        namespace["_projection_cull_gradient_zero_stats"],
-    )
+    return namespace["_mark_projection_cull_survivors"]
 
 
 @unittest.skipIf(torch is None, "torch is unavailable")
@@ -168,7 +166,7 @@ class DistributedOwnerActiveRowsTest(unittest.TestCase):
             )
 
     def test_projection_cull_gradient_zero_stats_are_exact_and_row_grouped(self):
-        mark_survivors, gradient_zero_stats = _load_gradient_zero_helpers()
+        mark_survivors = _load_gradient_zero_helpers()
         mask = torch.zeros((4,), dtype=torch.bool)
         mark_survivors(
             mask,
@@ -215,14 +213,18 @@ class DistributedOwnerActiveRowsTest(unittest.TestCase):
             ]),
         }
 
-        profile = gradient_zero_stats(
+        profile = _gradient_zero_stats(
             components,
             mask,
+            prefix="projection_cull",
+            active_sh_degree=3,
             near_zero_threshold=1e-8,
             sample_rows=2,
             chunk_rows=2,
+            include_sample_count=True,
+            include_active=False,
         )
-        stats = dict(zip(GRAD_ZERO_VALUE_FIELDS, profile["values"].tolist()))
+        stats = profile["stats"]
         self.assertEqual(stats["projection_cull_unique_gaussians"], 3)
         self.assertEqual(stats["projection_cull_parameter_elements"], 177)
         self.assertEqual(stats["projection_cull_zero_gradient_elements"], 111)
@@ -244,13 +246,18 @@ class DistributedOwnerActiveRowsTest(unittest.TestCase):
         self.assertEqual(profile["sample_owner_rows"].tolist(), [0, 2])
 
     def test_projection_cull_gradient_zero_stats_handles_empty_owner(self):
-        _, gradient_zero_stats = _load_gradient_zero_helpers()
-        values = gradient_zero_stats({}, torch.zeros((0,), dtype=torch.bool))["values"]
-        self.assertEqual(tuple(values.shape), (len(GRAD_ZERO_VALUE_FIELDS),))
-        self.assertEqual(int(values.sum()), 0)
+        profile = _gradient_zero_stats(
+            {},
+            torch.zeros((0,), dtype=torch.bool),
+            prefix="projection_cull",
+            active_sh_degree=3,
+            include_sample_count=True,
+            include_active=False,
+        )
+        self.assertEqual(set(profile["stats"]), set(GRAD_ZERO_VALUE_FIELDS))
+        self.assertEqual(sum(int(value) for value in profile["stats"].values()), 0)
 
     def test_projection_cull_gradient_sample_can_include_every_survivor(self):
-        _, gradient_zero_stats = _load_gradient_zero_helpers()
         mask = torch.tensor([True, False, True])
         components = {
             name: torch.arange(3 * width, dtype=torch.float32).reshape(3, width)
@@ -264,7 +271,15 @@ class DistributedOwnerActiveRowsTest(unittest.TestCase):
             }.items()
         }
 
-        profile = gradient_zero_stats(components, mask, sample_rows=-1)
+        profile = _gradient_zero_stats(
+            components,
+            mask,
+            prefix="projection_cull",
+            active_sh_degree=3,
+            sample_rows=-1,
+            include_sample_count=True,
+            include_active=False,
+        )
 
         self.assertEqual(profile["sample_owner_rows"].tolist(), [0, 2])
         self.assertEqual(tuple(profile["sample_gradients"].shape), (2, 59))

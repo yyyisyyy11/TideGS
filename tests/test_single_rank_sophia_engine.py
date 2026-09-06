@@ -89,6 +89,90 @@ class _Range:
 
 
 class SingleRankSophiaBatchContractTest(unittest.TestCase):
+    def test_tile_mask_runs_only_outside_off_mode_and_controls_effective_radius(self):
+        function = _function_node("pipeline_forward_one_step_shs_inplace")
+
+        def is_tile_call(node):
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "tile_contribution_mask"
+            )
+
+        mode_if = next(
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "tile_mode"
+            and any(
+                isinstance(comparator, ast.Constant)
+                and comparator.value == "off"
+                for comparator in node.test.comparators
+            )
+        )
+        self.assertFalse(any(is_tile_call(node) for item in mode_if.body for node in ast.walk(item)))
+        self.assertTrue(any(is_tile_call(node) for item in mode_if.orelse for node in ast.walk(item)))
+
+        apply_if = next(
+            node
+            for node in ast.walk(mode_if)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "tile_mode"
+            and any(
+                isinstance(comparator, ast.Constant)
+                and comparator.value == "apply"
+                for comparator in node.test.comparators
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "where"
+                for item in apply_if.body
+                for node in ast.walk(item)
+            )
+        )
+        sh_calls = [
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "spherical_harmonics"
+        ]
+        self.assertTrue(sh_calls)
+        for call in sh_calls:
+            masks = next(keyword.value for keyword in call.keywords if keyword.arg == "masks")
+            self.assertIsInstance(masks, ast.Name)
+            self.assertEqual(masks.id, "effective_sh_mask")
+
+        source = ast.unparse(function).replace("'", '"')
+        self.assertIn(
+            'effective_sh_mask = tile_keep_mask if tile_mode == "apply" else None',
+            source,
+        )
+
+    def test_gradient_metrics_union_true_projection_and_tile_survivors(self):
+        source = ast.unparse(
+            _function_node("clm_offload_train_one_batch")
+        ).replace("'", '"')
+        self.assertIn(
+            'camera_projection_keep = tile_meta["projection_mask"].reshape(-1)',
+            source,
+        )
+        self.assertIn(
+            'stats_positions[camera_projection_keep]',
+            source,
+        )
+        self.assertIn(
+            'stats_positions[camera_tile_keep]',
+            source,
+        )
+
     def test_public_batch_entrypoint_exposes_s2_and_optimizer_clock(self):
         function = _function_node("clm_offload_train_one_batch")
         positional = [argument.arg for argument in function.args.args]

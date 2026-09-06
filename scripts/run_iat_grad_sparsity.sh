@@ -19,7 +19,13 @@ TRAJECTORY_START_OFFSET="${TIDE_TRAJECTORY_START_OFFSET:-0}"
 GPUS="${TIDE_GPUS:-2,3,4,5}"
 MANIFEST="${TIDE_MANIFEST:-$DEFAULT_MANIFEST}"
 GRAD_SAMPLE_ROWS="${TIDE_GRAD_SAMPLE_ROWS:-8192}"
-RUN_TAG="${TIDE_RUN_TAG:-grad_near_zero_adam_iat_4gpu_bsz${BSZ}_cap${CAPACITY_BLOCKS}_offset${TRAJECTORY_START_OFFSET}_$(date +%Y%m%d_%H%M%S)}"
+TILE_CONTRIBUTION_MODE="${TIDE_TILE_CONTRIBUTION_MODE:-profile}"
+TILE_ALPHA_THRESHOLD="${TIDE_TILE_ALPHA_THRESHOLD:-0.00392156862745098}"
+if [[ ! "$TILE_CONTRIBUTION_MODE" =~ ^(off|profile|apply)$ ]]; then
+  echo "TIDE_TILE_CONTRIBUTION_MODE must be off, profile, or apply; got: $TILE_CONTRIBUTION_MODE" >&2
+  exit 2
+fi
+RUN_TAG="${TIDE_RUN_TAG:-grad_near_zero_${TILE_CONTRIBUTION_MODE}_adam_iat_4gpu_bsz${BSZ}_cap${CAPACITY_BLOCKS}_offset${TRAJECTORY_START_OFFSET}_$(date +%Y%m%d_%H%M%S)}"
 MODEL_SUFFIX="_offset${TRAJECTORY_START_OFFSET}"
 if (( FORCE_ACTIVE_SH_DEGREE >= 0 )); then
   MODEL_SUFFIX="${MODEL_SUFFIX}_forcedsh${FORCE_ACTIVE_SH_DEGREE}"
@@ -62,9 +68,19 @@ git diff -- train_tidegs.py scene/dataset_readers.py \
   arguments/__init__.py storage/schedule_utils.py \
   strategies/tide_engine/distributed_engine.py \
   strategies/tide_engine/distributed_metrics.py \
+  strategies/tide_engine/engine.py \
+  strategies/tide_engine/gradient_schema.py \
+  strategies/tide_engine/gradient_sparsity.py \
   strategies/tide_engine/gsplat_backend.py \
+  submodules/clm_kernels/clm_kernels/__init__.py \
+  submodules/clm_kernels/ext.cpp \
+  submodules/clm_kernels/setup.py \
+  submodules/clm_kernels/tile_contribution.cu \
+  submodules/clm_kernels/tile_contribution.h \
   tools/patch_gsplat_distributed_packed.py \
   tools/audit_grad_sparsity_metrics.py \
+  tools/summarize_grad_samples.py \
+  tools/summarize_grad_zero_metrics.py \
   tools/analyze_scene_locality.py \
   scripts/run_iat_grad_sparsity.sh \
   scripts/run_iat_scene_locality_matrix.sh > "$RUN_ROOT/code_changes.patch"
@@ -94,7 +110,9 @@ printf '%s\n' \
   "MANIFEST=$MANIFEST" \
   "GRAD_METRICS_INTERVAL=1" \
   "GRAD_NEAR_ZERO_THRESHOLD=1e-8" \
-  "GRAD_SAMPLE_ROWS_PER_RANK_BATCH=$GRAD_SAMPLE_ROWS" | tee "$RUN_ROOT/settings.txt"
+  "GRAD_SAMPLE_ROWS_PER_RANK_BATCH=$GRAD_SAMPLE_ROWS" \
+  "TILE_CONTRIBUTION_MODE=$TILE_CONTRIBUTION_MODE" \
+  "TILE_ALPHA_THRESHOLD=$TILE_ALPHA_THRESHOLD" | tee "$RUN_ROOT/settings.txt"
 
 PYTHONDONTWRITEBYTECODE=1 \
 PYTHONWARNINGS='ignore:TORCH_CUDA_ARCH_LIST is not set:UserWarning' \
@@ -164,6 +182,8 @@ CUDA_VISIBLE_DEVICES="$GPUS" \
   --tide_grad_near_zero_threshold 1e-8 \
   --tide_grad_sample_rows "$GRAD_SAMPLE_ROWS" \
   --tide_grad_stats_chunk_rows 262144 \
+  --tide_tile_contribution_mode "$TILE_CONTRIBUTION_MODE" \
+  --tide_tile_alpha_threshold "$TILE_ALPHA_THRESHOLD" \
   --tide_force_active_sh_degree "$FORCE_ACTIVE_SH_DEGREE" \
   --tide_free_unified_params \
   --pure_ssd_schedule_cache_dir "$SCHEDULE_CACHE" \

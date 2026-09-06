@@ -35,6 +35,19 @@ def _patched_rasterization():
     return _tide_projection_events
 
 
+def _tile_patched_rasterization():
+    _tide_owner_tile_survivor_mask = None
+    _tide_tile_contribution_mask = None
+    _tide_original_projection_radii = None
+    _tide_radius_mask = None
+    return (
+        _tide_owner_tile_survivor_mask,
+        _tide_tile_contribution_mask,
+        _tide_original_projection_radii,
+        _tide_radius_mask,
+    )
+
+
 class _Event:
     def __init__(self, elapsed=0.0):
         self.elapsed = float(elapsed)
@@ -56,6 +69,15 @@ class GsplatBackendGuardTest(unittest.TestCase):
     def test_detailed_metrics_accept_projection_patch(self):
         gsplat = types.SimpleNamespace(rasterization=_patched_rasterization)
         BACKEND._require_projection_timing_fix(gsplat)
+
+    def test_tile_mask_rejects_incomplete_patch(self):
+        gsplat = types.SimpleNamespace(rasterization=_unpatched_rasterization)
+        with self.assertRaisesRegex(RuntimeError, "tile-mask patch"):
+            BACKEND._require_tile_contribution_fix(gsplat)
+
+    def test_tile_mask_accepts_complete_patch(self):
+        gsplat = types.SimpleNamespace(rasterization=_tile_patched_rasterization)
+        BACKEND._require_tile_contribution_fix(gsplat)
 
     def test_projection_elapsed_time_is_nonnegative(self):
         start = _Event()

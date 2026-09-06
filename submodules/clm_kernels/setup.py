@@ -20,6 +20,7 @@ setup(
                 "ssim.cu",
                 "adam.cu",
                 "compute_sh_bwd.cu",
+                "tile_contribution.cu",
                 "ext.cpp",
             ],
             include_dirs=[glm_path],

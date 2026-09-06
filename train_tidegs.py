@@ -767,6 +767,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             distributed_context,
             enable_timing=bool(args.tide_detailed_metrics),
             enable_grad_zero_metrics=bool(args.tide_grad_zero_metrics),
+            tile_contribution_mode=str(args.tide_tile_contribution_mode),
+            tile_alpha_threshold=float(args.tide_tile_alpha_threshold),
         )
     # ------------------------------------------------------------------------
     # 1.1: Setup auxiliary tools and GPU configuration

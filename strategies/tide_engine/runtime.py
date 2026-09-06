@@ -54,6 +54,25 @@ def validate_tide_runtime_args(args: Any) -> None:
     _require_lower(args, "paper_optimizer_deferred_mode", "off")
     _require_attr(args, "paper_free_unified_params", True)
     _require_attr(args, "disable_auto_densification", True)
+    tile_mode = str(
+        getattr(args, "tide_tile_contribution_mode", "off")
+    ).lower()
+    if tile_mode not in {"off", "profile", "apply"}:
+        raise RuntimeError(
+            "tide_tile_contribution_mode must be off, profile, or apply"
+        )
+    tile_threshold = float(
+        getattr(args, "tide_tile_alpha_threshold", 1.0 / 255.0)
+    )
+    if not math.isfinite(tile_threshold) or not 0.0 < tile_threshold <= 1.0 / 255.0:
+        raise RuntimeError("tide_tile_alpha_threshold must be in (0, 1/255]")
+    if tile_mode == "profile" and not bool(
+        getattr(args, "tide_grad_zero_metrics", False)
+    ):
+        raise RuntimeError(
+            "tide_tile_contribution_mode=profile requires "
+            "--tide_grad_zero_metrics"
+        )
 
 
 def paper_debug_logging_enabled(args: Any, is_paper_ssd_mode: bool = True) -> bool:
