@@ -686,10 +686,16 @@ def _resolve_single_rank_sophia_batch(
     algorithm = str(getattr(args, "paper_optimizer_algorithm", "adam")).lower()
     if algorithm not in {"adam", "3dgs2_tr"}:
         raise RuntimeError(f"Unsupported resident optimizer algorithm: {algorithm!r}")
-    if algorithm == "adam":
-        return False, None, False, [], list(gradient_cameras)
-
     gradient_cameras = list(gradient_cameras)
+    if algorithm == "adam":
+        resolved_step, _ = resolve_curvature_schedule(
+            iteration=iteration,
+            batch_size=int(getattr(args, "bsz", len(gradient_cameras))),
+            interval=1,
+            optimizer_step=optimizer_step,
+        )
+        return False, resolved_step, False, [], gradient_cameras
+
     gradient_batch_size = len(gradient_cameras)
     configured_batch_size = int(getattr(args, "bsz", gradient_batch_size))
     if gradient_batch_size <= 0:

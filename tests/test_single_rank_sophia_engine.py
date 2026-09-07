@@ -97,18 +97,27 @@ class SingleRankSophiaBatchContractTest(unittest.TestCase):
         self.assertTrue(all(isinstance(value, ast.Constant) and value.value is None
                             for value in function.args.defaults[-2:]))
 
-    def test_adam_ignores_sophia_only_inputs(self):
+    def test_adam_resolves_optimizer_clock_without_sophia_inputs(self):
         resolve = _load_batch_resolver()
         s1 = [object(), object()]
         result = resolve(
-            args=SimpleNamespace(paper_optimizer_algorithm="adam"),
-            iteration=1,
+            args=SimpleNamespace(paper_optimizer_algorithm="adam", bsz=2),
+            iteration=3,
             gradient_cameras=s1,
             curvature_cameras=[object()],
-            optimizer_step=999,
+            optimizer_step=None,
         )
-        self.assertEqual(result[:4], (False, None, False, []))
+        self.assertEqual(result[:4], (False, 2, False, []))
         self.assertEqual(result[4], s1)
+
+        with self.assertRaisesRegex(ValueError, "iteration-derived"):
+            resolve(
+                args=SimpleNamespace(paper_optimizer_algorithm="adam", bsz=2),
+                iteration=3,
+                gradient_cameras=s1,
+                curvature_cameras=None,
+                optimizer_step=1,
+            )
 
     def test_curvature_step_requires_equal_s1_and_s2_batches(self):
         resolve = _load_batch_resolver()
