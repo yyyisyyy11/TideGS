@@ -1197,6 +1197,7 @@ class TideStorageAdapter:
             iteration=iteration,
             needed_blocks=sorted(set(current_blocks)),
             future_blocks=sorted(set(future_blocks)),
+            future_target_iteration=int(iteration) + int(batch_size),
         )
 
     def wait_and_load_blocks(self, iteration: int, timeout: float = 30.0) -> Dict[int, torch.Tensor]:

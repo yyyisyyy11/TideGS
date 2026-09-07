@@ -1280,6 +1280,9 @@ def clm_offload_train_one_batch(
     tile_alpha_threshold = float(
         getattr(args, "tide_tile_alpha_threshold", 1.0 / 255.0)
     )
+    optimizer_algorithm = str(
+        getattr(args, "paper_optimizer_algorithm", "adam")
+    ).lower()
     current_camera_ids = [cam.global_idx for cam in batched_cameras]
     curvature_camera_ids = [cam.global_idx for cam in curvature_cameras]
     resident_camera_ids = current_camera_ids + curvature_camera_ids
@@ -1405,6 +1408,20 @@ def clm_offload_train_one_batch(
                 cam_to_blocks[cam_global_idx] = len(blocks)
 
         visible_block_ids = sorted(list(visible_block_ids_set))
+        gradient_active_block_ids = sorted(
+            {
+                block_id
+                for camera_id in current_camera_ids
+                for block_id in current_camera_blocks[int(camera_id)]
+            }
+        )
+        curvature_active_block_ids = sorted(
+            {
+                block_id
+                for camera_id in curvature_camera_ids
+                for block_id in current_camera_blocks[int(camera_id)]
+            }
+        )
         
         _log_paper_block_visibility_debug(
             enabled=paper_debug_logging,
@@ -3854,6 +3871,9 @@ def clm_offload_train_one_batch(
 
         legacy_metrics_row = {
             "iteration": iteration,
+            "optimizer_algorithm": optimizer_algorithm,
+            "optimizer_step": optimizer_step,
+            "curvature_due": int(curvature_due),
             "local_cameras": bsz,
             "global_active_blocks": len(visible_block_ids),
             "global_resident_blocks": len(current_loaded_blocks),
@@ -3864,6 +3884,8 @@ def clm_offload_train_one_batch(
             "prediction_repair_ms": 0.0,
             "prediction_exact_plan_ms": 0.0,
             "rank_active_blocks": len(visible_block_ids),
+            "rank_gradient_active_blocks": len(gradient_active_block_ids),
+            "rank_curvature_active_blocks": len(curvature_active_block_ids),
             "rank_resident_blocks": len(current_loaded_blocks),
             "cold_blocks": int(legacy_retention_stats.get("cold_count", 0)),
             "retained_blocks": int(legacy_retention_stats.get("hotspot_count", 0)),
@@ -3873,7 +3895,40 @@ def clm_offload_train_one_batch(
             "gpu_slot_growth_blocks": int(
                 legacy_retention_stats.get("gpu_slot_growth_blocks", 0)
             ),
-            "touched_gaussians": int(optimizer_step_stats.get("touched_rows", 0)),
+            "owner_active_gaussians": grad_stats_row_count,
+            "collective_participation_gaussians": grad_stats_row_count,
+            "uses_zero_opacity_sentinel": 0,
+            "touched_gaussians": grad_stats_row_count,
+            "gradient_participation_rows": grad_stats_row_count,
+            "curvature_participation_rows": (
+                int(sparse_curvature_local_ids.numel())
+                if sparse_curvature_local_ids is not None
+                else 0
+            ),
+            "updated_blocks": int(
+                optimizer_step_stats.get("updated_blocks", 0)
+            ),
+            "optimizer_touched_rows": int(
+                optimizer_step_stats.get("touched_rows", 0)
+            ),
+            "optimizer_cold_rows": int(
+                optimizer_step_stats.get("cold_rows", 0)
+            ),
+            "curvature_blocks": len(
+                optimizer_step_stats.get("curvature_block_ids", [])
+            ),
+            "curvature_rows": int(
+                optimizer_step_stats.get("curvature_rows", 0)
+            ),
+            "clipped_values": int(
+                optimizer_step_stats.get("clipped_values", 0)
+            ),
+            "rows_skipped_without_curvature": int(
+                optimizer_step_stats.get("rows_skipped_without_curvature", 0)
+            ),
+            "trust_region_epsilon": float(
+                optimizer_step_stats.get("trust_region_epsilon", 0.0)
+            ),
             "block_cull_ms": legacy_block_cull_ms,
             "block_cull_backend": str(
                 legacy_block_cull_metrics.get("block_cull_backend", "cpu")

@@ -93,6 +93,14 @@ def audit(run_dir: Path) -> Dict[str, object]:
             grad["projection_cull_all_zero_gradient_gaussians"],
             field="projection_cull_all_zero_gradient_gaussians",
         )
+        nonzero_rows = cull_rows - all_zero_rows
+        reported_nonzero_rows = _integer(
+            grad["projection_cull_nonzero_gradient_gaussians"],
+            field="projection_cull_nonzero_gradient_gaussians",
+        )
+        owner_active_rows = _integer(
+            batch["owner_active_gaussians"], field="owner_active_gaussians"
+        )
         adam_touched_rows = _integer(
             batch["optimizer_touched_rows"], field="optimizer_touched_rows"
         )
@@ -116,21 +124,29 @@ def audit(run_dir: Path) -> Dict[str, object]:
             field="projection_cull_nonfinite_gradient_elements",
         )
 
-        if not 0 <= all_zero_rows <= cull_rows <= resident_rows:
+        if not 0 <= all_zero_rows <= cull_rows <= owner_active_rows <= resident_rows:
             raise AssertionError(
                 f"invalid row nesting at iteration {iteration}: "
-                f"all_zero={all_zero_rows}, cull={cull_rows}, resident={resident_rows}"
+                f"all_zero={all_zero_rows}, cull={cull_rows}, "
+                f"owner_active={owner_active_rows}, resident={resident_rows}"
             )
         if parameter_elements != PARAMETERS_PER_GAUSSIAN * cull_rows:
             raise AssertionError(
                 f"59*d mismatch at iteration {iteration}: "
                 f"elements={parameter_elements}, d={cull_rows}"
             )
-        if cull_rows - all_zero_rows != adam_touched_rows:
+        if reported_nonzero_rows != nonzero_rows:
             raise AssertionError(
-                f"Adam row identity failed at iteration {iteration}: "
+                f"nonzero-gradient row metric mismatch at iteration {iteration}: "
                 f"cull({cull_rows}) - all_zero({all_zero_rows}) "
-                f"!= touched({adam_touched_rows})"
+                f"!= reported_nonzero({reported_nonzero_rows})"
+            )
+        if not nonzero_rows <= adam_touched_rows <= owner_active_rows:
+            raise AssertionError(
+                f"invalid optimizer row nesting at iteration {iteration}: "
+                f"nonzero_gradient={nonzero_rows}, "
+                f"optimizer_touched={adam_touched_rows}, "
+                f"owner_active={owner_active_rows}"
             )
         ordered_near = [near_zero_elements[token] for token, _ in NEAR_ZERO_THRESHOLDS]
         if not (
@@ -370,9 +386,11 @@ def audit(run_dir: Path) -> Dict[str, object]:
             {
                 "iteration": iteration,
                 "resident_rows": resident_rows,
+                "owner_active_rows": owner_active_rows,
                 "not_culled_rows": resident_rows - cull_rows,
                 "cull_all_zero_rows": all_zero_rows,
-                "cull_nonzero_rows": adam_touched_rows,
+                "cull_nonzero_rows": nonzero_rows,
+                "optimizer_touched_rows": adam_touched_rows,
                 "cull_rows": cull_rows,
                 "tile_keep_rows": tile_keep_rows,
                 "tile_rejected_rows": tile_rejected_rows,
@@ -419,9 +437,11 @@ def audit(run_dir: Path) -> Dict[str, object]:
                     )
 
     resident_rows = sum(row["resident_rows"] for row in per_batch)
+    owner_active_rows = sum(row["owner_active_rows"] for row in per_batch)
     not_culled_rows = sum(row["not_culled_rows"] for row in per_batch)
     all_zero_rows = sum(row["cull_all_zero_rows"] for row in per_batch)
-    touched_rows = sum(row["cull_nonzero_rows"] for row in per_batch)
+    nonzero_rows = sum(row["cull_nonzero_rows"] for row in per_batch)
+    touched_rows = sum(row["optimizer_touched_rows"] for row in per_batch)
     cull_rows = sum(row["cull_rows"] for row in per_batch)
     tile_keep_rows = sum(row["tile_keep_rows"] for row in per_batch)
     tile_rejected_rows = sum(row["tile_rejected_rows"] for row in per_batch)
@@ -438,9 +458,9 @@ def audit(run_dir: Path) -> Dict[str, object]:
         for token, _ in NEAR_ZERO_THRESHOLDS
     }
 
-    if not_culled_rows + all_zero_rows + touched_rows != resident_rows:
+    if not_culled_rows + all_zero_rows + nonzero_rows != resident_rows:
         raise AssertionError("working-set Gaussian row categories do not sum to 100%")
-    if cull_rows != all_zero_rows + touched_rows:
+    if cull_rows != all_zero_rows + nonzero_rows:
         raise AssertionError("cull Gaussian row categories do not sum to 100%")
     nonzero_elements = cull_parameter_elements - exact_zero_elements
     no_gradient_elements = PARAMETERS_PER_GAUSSIAN * not_culled_rows
@@ -452,12 +472,14 @@ def audit(run_dir: Path) -> Dict[str, object]:
         "rank_files": len(rank_paths),
         "counts": {
             "working_set_gaussian_rows": resident_rows,
+            "owner_active_gaussian_rows": owner_active_rows,
             "not_culled_gaussian_rows": not_culled_rows,
             "cull_gaussian_rows": cull_rows,
             "tile_keep_gaussian_rows": tile_keep_rows,
             "tile_rejected_gaussian_rows": tile_rejected_rows,
             "tile_rejected_nonzero_gradient_rows": tile_rejected_nonzero_rows,
             "cull_all_zero_gaussian_rows": all_zero_rows,
+            "cull_nonzero_gaussian_rows": nonzero_rows,
             "adam_touched_gaussian_rows": touched_rows,
             "working_set_parameter_elements": working_parameter_elements,
             "no_gradient_parameter_elements": no_gradient_elements,
@@ -475,13 +497,15 @@ def audit(run_dir: Path) -> Dict[str, object]:
             "cull_all_zero_over_working_set": _percentage(
                 all_zero_rows, resident_rows
             ),
-            "cull_nonzero_adam_touched_over_working_set": _percentage(
-                touched_rows, resident_rows
+            "cull_nonzero_over_working_set": _percentage(
+                nonzero_rows, resident_rows
             ),
+            "adam_touched_over_working_set": _percentage(touched_rows, resident_rows),
             "cull_over_working_set": _percentage(cull_rows, resident_rows),
             "cull_all_zero_over_cull": _percentage(all_zero_rows, cull_rows),
-            "cull_nonzero_adam_touched_over_cull": _percentage(
-                touched_rows, cull_rows
+            "cull_nonzero_over_cull": _percentage(nonzero_rows, cull_rows),
+            "adam_touched_over_owner_active": _percentage(
+                touched_rows, owner_active_rows
             ),
         },
         "parameter_element_percentages": {
@@ -515,7 +539,8 @@ def audit(run_dir: Path) -> Dict[str, object]:
             "per_batch_histograms": "PASS",
             "per_batch_component_sums": "PASS",
             "all_near_zero_thresholds_monotonic": "PASS",
-            "per_batch_cull_minus_all_zero_equals_adam_touched": "PASS",
+            "per_batch_reported_nonzero_matches_gradient_rows": "PASS",
+            "per_batch_optimizer_rows_contain_nonzero_gradient_rows": "PASS",
             "projection_rows_partition_into_tile_keep_and_reject": "PASS",
             "profile_would_drop_rows_have_zero_gradient": (
                 "PASS" if profiled_drop_batches else "NOT_CHECKED"

@@ -465,6 +465,42 @@ def _mark_projection_cull_survivors(
     survivor_mask |= owner_mask
 
 
+def _merge_owner_tile_survivors(
+    survivor_mask: torch.Tensor,
+    tile_counts: torch.Tensor,
+    meta: Dict[str, object],
+    *,
+    owner_active_rows: int,
+    participation_rows: int,
+    uses_sentinel: bool,
+) -> None:
+    """Union real owner rows while excluding collective-only sentinels."""
+
+    owner_mask = meta.get("_tide_owner_tile_survivor_mask")
+    expected_rows = participation_rows if uses_sentinel else owner_active_rows
+    if (
+        not torch.is_tensor(owner_mask)
+        or owner_mask.dtype != torch.bool
+        or owner_mask.numel() != expected_rows
+    ):
+        raise RuntimeError(
+            "gsplat owner tile-survivor mask has invalid shape or dtype"
+        )
+    counts = meta.get("_tide_tile_mask_counts")
+    if (
+        not torch.is_tensor(counts)
+        or counts.dtype != torch.long
+        or counts.numel() != 5
+    ):
+        raise RuntimeError("gsplat tile-mask counters have invalid shape or dtype")
+    if uses_sentinel:
+        if owner_active_rows != 0:
+            raise RuntimeError("tile-mask sentinel requires an empty owner rank")
+        return
+    survivor_mask |= owner_mask.reshape(-1)
+    tile_counts.add_(counts.reshape(-1))
+
+
 def _sync_bounds(
     *,
     context: DistributedContext,
@@ -996,28 +1032,14 @@ def train_distributed_tide_batch(
                 if tile_contribution_mode == "off":
                     tile_survivor_mask.copy_(projection_cull_survivor_mask)
                 else:
-                    owner_tile_mask = meta.get(
-                        "_tide_owner_tile_survivor_mask"
+                    _merge_owner_tile_survivors(
+                        tile_survivor_mask,
+                        tile_mask_counts,
+                        meta,
+                        owner_active_rows=owner_active_rows,
+                        participation_rows=participation_rows,
+                        uses_sentinel=uses_sentinel,
                     )
-                    if (
-                        not torch.is_tensor(owner_tile_mask)
-                        or owner_tile_mask.dtype != torch.bool
-                        or owner_tile_mask.numel() != owner_active_rows
-                    ):
-                        raise RuntimeError(
-                            "gsplat owner tile-survivor mask has invalid shape or dtype"
-                        )
-                    tile_survivor_mask |= owner_tile_mask.reshape(-1)
-                    counts = meta.get("_tide_tile_mask_counts")
-                    if (
-                        not torch.is_tensor(counts)
-                        or counts.dtype != torch.long
-                        or counts.numel() != 5
-                    ):
-                        raise RuntimeError(
-                            "gsplat tile-mask counters have invalid shape or dtype"
-                        )
-                    tile_mask_counts.add_(counts.reshape(-1))
             detached_losses.extend(loss.detach() for loss in micro_losses)
             write_memory_point(
                 phase="after_forward",

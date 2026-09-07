@@ -57,6 +57,7 @@ def _load_gradient_zero_helpers():
     tree = ast.parse(ENGINE_PATH.read_text(encoding="utf-8"))
     names = {
         "_mark_projection_cull_survivors",
+        "_merge_owner_tile_survivors",
     }
     nodes = []
     for node in tree.body:
@@ -75,7 +76,10 @@ def _load_gradient_zero_helpers():
         "torch": torch,
     }
     exec(compile(module, str(ENGINE_PATH), "exec"), namespace)
-    return namespace["_mark_projection_cull_survivors"]
+    return (
+        namespace["_mark_projection_cull_survivors"],
+        namespace["_merge_owner_tile_survivors"],
+    )
 
 
 @unittest.skipIf(torch is None, "torch is unavailable")
@@ -154,7 +158,7 @@ class DistributedOwnerActiveRowsTest(unittest.TestCase):
             )
 
     def test_projection_cull_gradient_zero_stats_are_exact_and_row_grouped(self):
-        mark_survivors = _load_gradient_zero_helpers()
+        mark_survivors, _ = _load_gradient_zero_helpers()
         mask = torch.zeros((4,), dtype=torch.bool)
         mark_survivors(
             mask,
@@ -232,6 +236,63 @@ class DistributedOwnerActiveRowsTest(unittest.TestCase):
         self.assertEqual(stats["projection_cull_near_zero_elements_59_gaussians"], 1)
         self.assertEqual(tuple(profile["sample_gradients"].shape), (2, 59))
         self.assertEqual(profile["sample_owner_rows"].tolist(), [0, 2])
+
+    def test_empty_owner_tile_mask_ignores_collective_sentinel(self):
+        _, merge_tile_survivors = _load_gradient_zero_helpers()
+        survivors = torch.zeros((0,), dtype=torch.bool)
+        counts = torch.zeros((5,), dtype=torch.long)
+
+        merge_tile_survivors(
+            survivors,
+            counts,
+            {
+                "_tide_owner_tile_survivor_mask": torch.tensor([True]),
+                "_tide_tile_mask_counts": torch.tensor([1, 1, 2, 2, 1]),
+            },
+            owner_active_rows=0,
+            participation_rows=1,
+            uses_sentinel=True,
+        )
+
+        self.assertEqual(int(survivors.numel()), 0)
+        self.assertEqual(counts.tolist(), [0, 0, 0, 0, 0])
+
+    def test_nonempty_owner_tile_mask_merges_rows_and_counts(self):
+        _, merge_tile_survivors = _load_gradient_zero_helpers()
+        survivors = torch.tensor([True, False, False])
+        counts = torch.tensor([1, 1, 2, 1, 1], dtype=torch.long)
+
+        merge_tile_survivors(
+            survivors,
+            counts,
+            {
+                "_tide_owner_tile_survivor_mask": torch.tensor(
+                    [False, True, False]
+                ),
+                "_tide_tile_mask_counts": torch.tensor([3, 2, 5, 3, 2]),
+            },
+            owner_active_rows=3,
+            participation_rows=3,
+            uses_sentinel=False,
+        )
+
+        self.assertEqual(survivors.tolist(), [True, True, False])
+        self.assertEqual(counts.tolist(), [4, 3, 7, 4, 3])
+
+    def test_nonempty_owner_tile_mask_rejects_wrong_shape(self):
+        _, merge_tile_survivors = _load_gradient_zero_helpers()
+        with self.assertRaisesRegex(RuntimeError, "invalid shape"):
+            merge_tile_survivors(
+                torch.zeros((3,), dtype=torch.bool),
+                torch.zeros((5,), dtype=torch.long),
+                {
+                    "_tide_owner_tile_survivor_mask": torch.tensor([True]),
+                    "_tide_tile_mask_counts": torch.zeros((5,), dtype=torch.long),
+                },
+                owner_active_rows=3,
+                participation_rows=3,
+                uses_sentinel=False,
+            )
 
     def test_projection_cull_gradient_zero_stats_handles_empty_owner(self):
         profile = _gradient_zero_stats(

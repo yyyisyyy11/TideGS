@@ -70,7 +70,7 @@ def _all_zero_profile_row():
 
 
 class GradSparsityAuditTest(unittest.TestCase):
-    def _audit(self, grad_row, optimizer_touched_rows):
+    def _audit(self, grad_row, optimizer_touched_rows, owner_active_rows=1):
         with tempfile.TemporaryDirectory() as directory:
             run_dir = Path(directory)
             _write_tsv(
@@ -80,10 +80,16 @@ class GradSparsityAuditTest(unittest.TestCase):
             )
             _write_tsv(
                 run_dir / "metrics_batch_global.tsv",
-                ["iteration", "global_resident_blocks", "optimizer_touched_rows"],
+                [
+                    "iteration",
+                    "global_resident_blocks",
+                    "owner_active_gaussians",
+                    "optimizer_touched_rows",
+                ],
                 {
                     "iteration": 1,
                     "global_resident_blocks": 1,
+                    "owner_active_gaussians": owner_active_rows,
                     "optimizer_touched_rows": optimizer_touched_rows,
                 },
             )
@@ -105,6 +111,7 @@ class GradSparsityAuditTest(unittest.TestCase):
         row.update(
             {
                 "projection_cull_all_zero_gradient_gaussians": 0,
+                "projection_cull_nonzero_gradient_gaussians": 1,
                 "tile_mask_rejected_all_zero_gradient_gaussians": 0,
                 "tile_mask_rejected_nonzero_gradient_gaussians": 1,
                 "would_drop_nonzero_gradient_gaussians": 1,
@@ -134,6 +141,34 @@ class GradSparsityAuditTest(unittest.TestCase):
             result["checks"]["apply_equivalence_under_profiled_threshold"],
             "NOT_ESTABLISHED",
         )
+
+    def test_zero_gradient_row_may_still_be_touched_by_adam(self):
+        result = self._audit(
+            _all_zero_profile_row(),
+            optimizer_touched_rows=1,
+        )
+        self.assertEqual(result["counts"]["cull_nonzero_gaussian_rows"], 0)
+        self.assertEqual(result["counts"]["adam_touched_gaussian_rows"], 1)
+        self.assertEqual(
+            result["checks"][
+                "per_batch_optimizer_rows_contain_nonzero_gradient_rows"
+            ],
+            "PASS",
+        )
+
+    def test_reported_nonzero_gradient_rows_must_match_derived_count(self):
+        row = _all_zero_profile_row()
+        row["projection_cull_nonzero_gradient_gaussians"] = 1
+        with self.assertRaisesRegex(AssertionError, "metric mismatch"):
+            self._audit(row, optimizer_touched_rows=1)
+
+    def test_optimizer_rows_cannot_exceed_owner_active_rows(self):
+        with self.assertRaisesRegex(AssertionError, "optimizer row nesting"):
+            self._audit(
+                _all_zero_profile_row(),
+                optimizer_touched_rows=2,
+                owner_active_rows=1,
+            )
 
 
 if __name__ == "__main__":

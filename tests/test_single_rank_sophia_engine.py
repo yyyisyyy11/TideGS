@@ -358,7 +358,10 @@ class SingleRankSophiaBatchContractTest(unittest.TestCase):
             selection_kwargs["next_camera_blocks_override"],
             {10: [1], 11: [2], 12: [3]},
         )
-        reader.hint_future.assert_called_once_with([3])
+        reader.hint_future.assert_called_once_with(
+            [3],
+            target_iteration=21,
+        )
         prefetch_kwargs = double_buffer.start_prefetch.call_args.kwargs
         self.assertEqual(prefetch_kwargs["iteration"], 21)
         self.assertEqual(prefetch_kwargs["visible_block_ids"], [1, 3])
@@ -401,6 +404,56 @@ class SingleRankSophiaBatchContractTest(unittest.TestCase):
         self.assertEqual(
             keyword_values["current_optimizer_step"].id, "optimizer_step"
         )
+
+    def test_single_rank_batch_metrics_include_nondefault_optimizer_rows(self):
+        function = _function_node("clm_offload_train_one_batch")
+        metrics_rows = [
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.Dict)
+            and any(
+                isinstance(key, ast.Constant)
+                and key.value == "next_plan_target_iteration"
+                for key in node.keys
+            )
+        ]
+        self.assertEqual(len(metrics_rows), 1)
+        keys = {
+            key.value
+            for key in metrics_rows[0].keys
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        }
+        self.assertEqual(
+            {
+                "optimizer_algorithm",
+                "optimizer_step",
+                "owner_active_gaussians",
+                "rank_gradient_active_blocks",
+                "rank_curvature_active_blocks",
+                "gradient_participation_rows",
+                "optimizer_touched_rows",
+                "updated_blocks",
+                "curvature_participation_rows",
+                "curvature_blocks",
+                "curvature_rows",
+            }.difference(keys),
+            set(),
+        )
+        values = {
+            key.value: value
+            for key, value in zip(metrics_rows[0].keys, metrics_rows[0].values)
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        }
+        for key in (
+            "owner_active_gaussians",
+            "gradient_participation_rows",
+            "optimizer_touched_rows",
+            "updated_blocks",
+        ):
+            self.assertFalse(
+                isinstance(values[key], ast.Constant) and values[key].value == 0,
+                f"{key} must come from live batch state",
+            )
 
 
 if __name__ == "__main__":

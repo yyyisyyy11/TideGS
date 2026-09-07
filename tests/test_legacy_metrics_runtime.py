@@ -22,8 +22,8 @@ class _Reader:
     def __init__(self):
         self.hints = []
 
-    def hint_future(self, blocks):
-        self.hints.append(list(blocks))
+    def hint_future(self, blocks, *, target_iteration=None):
+        self.hints.append((list(blocks), target_iteration))
         return len(blocks)
 
 
@@ -86,7 +86,7 @@ class LegacyRuntimeMetricsTest(unittest.TestCase):
             set(result["next_plan_timeline"]),
             {"cull", "select", "hint_submit", "buffer_submit"},
         )
-        self.assertEqual(reader.hints, [[3]])
+        self.assertEqual(reader.hints, [([3], 65)])
         self.assertEqual(double_buffer.prefetch_calls[0]["iteration"], 65)
 
 

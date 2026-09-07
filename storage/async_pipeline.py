@@ -127,14 +127,17 @@ class AsyncPipeline:
     def _future_prefetch_worker(self):
         while self.running:
             try:
-                iteration, future = self.future_prefetch_queue.get(timeout=0.1)
+                target_iteration, future = self.future_prefetch_queue.get(timeout=0.1)
             except Empty:
                 continue
 
             try:
                 if future:
                     t0 = time.time()
-                    loaded_count = self.cache.prefetch_future(future)
+                    loaded_count = self.cache.prefetch_future(
+                        future,
+                        target_iteration=target_iteration,
+                    )
                     t1 = time.time()
                     self.stats['future_prefetch_time'] += t1 - t0
                     self.stats['future_prefetch_jobs'] += 1
@@ -148,7 +151,8 @@ class AsyncPipeline:
         self,
         iteration: int,
         needed_blocks: List[int],
-        future_blocks: Optional[List[int]] = None
+        future_blocks: Optional[List[int]] = None,
+        future_target_iteration: Optional[int] = None,
     ):
         """
         Request prefetch of blocks (non-blocking).
@@ -164,7 +168,14 @@ class AsyncPipeline:
 
         if future_blocks:
             try:
-                self.future_prefetch_queue.put_nowait((iteration, future_blocks))
+                target_iteration = (
+                    iteration
+                    if future_target_iteration is None
+                    else int(future_target_iteration)
+                )
+                self.future_prefetch_queue.put_nowait(
+                    (target_iteration, future_blocks)
+                )
             except Exception:
                 pass
 

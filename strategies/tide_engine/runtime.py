@@ -533,7 +533,13 @@ def plan_and_start_resident_prefetch(
     hint_start_ns = time.perf_counter_ns()
     if active_block_reader is not None and stream_in_blocks:
         with torch.cuda.nvtx.range("Tide N+1: cache hint"):
-            future_submitted = int(active_block_reader.hint_future(stream_in_blocks) or 0)
+            future_submitted = int(
+                active_block_reader.hint_future(
+                    stream_in_blocks,
+                    target_iteration=target_iteration,
+                )
+                or 0
+            )
     hint_end_ns = time.perf_counter_ns()
 
     prefetch_started = False
