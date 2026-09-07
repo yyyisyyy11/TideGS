@@ -26,7 +26,7 @@ __device__ __forceinline__ float quadratic(
 
 __device__ float rectangle_min_quadratic(
     float x0, float x1, float y0, float y1, float a, float b, float c) {
-    float best = CUDART_INF_F;
+    float best = std::numeric_limits<float>::infinity();
     if (x0 <= 0.0f && 0.0f <= x1 && y0 <= 0.0f && 0.0f <= y1) {
         return 0.0f;
     }
