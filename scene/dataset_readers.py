@@ -62,6 +62,24 @@ class SceneInfo(NamedTuple):
     ply_path: str
 
 
+def _resolve_city_ply_path(
+    path, dense_ply_file, resume_source_ply, *, allow_missing=False
+):
+    ply_path = dense_ply_file or resume_source_ply
+    if ply_path:
+        return ply_path
+
+    ply_candidates = glob.glob(os.path.join(path, "*.ply"))
+    if ply_candidates:
+        return ply_candidates[0]
+    if allow_missing:
+        return ""
+    raise FileNotFoundError(
+        f"No ply file found in {path}. "
+        "Pass --dense_ply_file to specify the point cloud explicitly."
+    )
+
+
 def _sample_frames_for_debug(frames, max_cameras: int, mode: str):
     """Subsample camera frames for faster smoke/debug runs."""
     if max_cameras is None or max_cameras <= 0 or len(frames) <= max_cameras:
@@ -786,16 +804,12 @@ def readCityInfo(
     pure_ssd_metadata_manifest = pure_ssd_prebuilt_manifest or pure_ssd_resume_manifest
     resume_source_ply = (pure_ssd_metadata_manifest or {}).get("source_ply", "")
 
-    if args.dense_ply_file == "" and not resume_source_ply:
-        ply_candidates = glob.glob(os.path.join(path, "*.ply"))
-        if len(ply_candidates) == 0:
-            raise FileNotFoundError(
-                f"No ply file found in {path}. "
-                "Pass --dense_ply_file to specify the point cloud explicitly."
-            )
-        ply_path = ply_candidates[0]
-    else:
-        ply_path = args.dense_ply_file or resume_source_ply
+    ply_path = _resolve_city_ply_path(
+        path,
+        args.dense_ply_file,
+        resume_source_ply,
+        allow_missing=pure_ssd_prebuilt_manifest is not None,
+    )
 
     if pure_ssd_prebuilt_manifest is not None:
         utils.print_rank_0(
