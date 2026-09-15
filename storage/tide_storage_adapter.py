@@ -472,34 +472,36 @@ class TideStorageAdapter:
             if callable(versions_for_blocks)
             else None
         )
-        latest_dirty_iteration = getattr(
-            resident_state,
-            "latest_dirty_iteration",
-            None,
-        )
-        origins_for_blocks = getattr(
-            resident_state,
-            "origins_for_blocks",
-            None,
-        )
-        block_origin_iterations = (
-            origins_for_blocks(dirty_blocks)
-            if callable(origins_for_blocks)
-            else None
-        )
-        origin_iteration = (
-            latest_dirty_iteration(dirty_blocks)
-            if callable(latest_dirty_iteration)
-            else None
-        )
-        stage_kwargs = {}
         if block_versions:
-            stage_kwargs["block_versions"] = block_versions
-        if block_origin_iterations:
-            stage_kwargs["block_origin_iterations"] = block_origin_iterations
-        if origin_iteration is not None:
-            stage_kwargs["origin_iteration"] = origin_iteration
-        payload = working_set.stage_updated_blocks(dirty_blocks, **stage_kwargs)
+            latest_dirty_iteration = getattr(
+                resident_state,
+                "latest_dirty_iteration",
+                None,
+            )
+            origins_for_blocks = getattr(
+                resident_state,
+                "origins_for_blocks",
+                None,
+            )
+            payload = working_set.stage_updated_blocks(
+                dirty_blocks,
+                block_versions=block_versions,
+                block_origin_iterations=(
+                    origins_for_blocks(dirty_blocks)
+                    if callable(origins_for_blocks)
+                    else None
+                ),
+                origin_iteration=(
+                    latest_dirty_iteration(dirty_blocks)
+                    if (
+                        not callable(origins_for_blocks)
+                        and callable(latest_dirty_iteration)
+                    )
+                    else None
+                ),
+            )
+        else:
+            payload = working_set.stage_updated_blocks(dirty_blocks)
         if payload is None or set(payload.block_ids) != set(dirty_blocks):
             staged_ids = [] if payload is None else payload.block_ids
             raise RuntimeError(

@@ -42,9 +42,8 @@ class _Cache:
 
 
 class _ResidentState:
-    def __init__(self, block_ids, origin_iterations=None):
+    def __init__(self, block_ids):
         self._dirty = set(block_ids)
-        self._origin_iterations = dict(origin_iterations or {})
 
     def dirty_blocks(self):
         return sorted(self._dirty)
@@ -52,33 +51,15 @@ class _ResidentState:
     def mark_blocks_written_back(self, block_ids):
         self._dirty.difference_update(block_ids)
 
-    def origins_for_blocks(self, block_ids):
-        return {
-            block_id: self._origin_iterations[block_id]
-            for block_id in block_ids
-            if block_id in self._origin_iterations
-        }
-
-    def latest_dirty_iteration(self, block_ids):
-        origins = set(self.origins_for_blocks(block_ids).values())
-        return next(iter(origins)) if len(origins) == 1 else None
-
 
 class _WorkingSet:
     def __init__(self, payloads):
         self.payloads = payloads
-        self.stage_kwargs = []
 
-    def stage_updated_blocks(self, block_ids, **kwargs):
+    def stage_updated_blocks(self, block_ids):
         payload = _Payload(block_ids[0], torch.full((4, 59), 9.0))
-        payload.origin_iteration = kwargs.get("origin_iteration")
-        payload.block_origin_iterations = kwargs.get(
-            "block_origin_iterations",
-            {},
-        )
         payload.ready.set()
         self.payloads.append(payload)
-        self.stage_kwargs.append(dict(kwargs))
         return payload
 
 
@@ -103,24 +84,11 @@ class AsyncCacheCommitTest(unittest.TestCase):
         self.adapter._cache_commit_thread = None
         self.payloads = []
         self.refresh_bounds_flags = []
-        self.sync_origin_metadata = []
         self.cache = _Cache(3, torch.zeros(4, 59))
         self.adapter.cache = self.cache
 
-        def sync_cache(
-            updated,
-            *,
-            refresh_bounds=True,
-            origin_iteration=None,
-            block_origin_iterations=None,
-        ):
+        def sync_cache(updated, *, refresh_bounds=True):
             self.refresh_bounds_flags.append(bool(refresh_bounds))
-            self.sync_origin_metadata.append(
-                {
-                    "origin_iteration": origin_iteration,
-                    "block_origin_iterations": block_origin_iterations,
-                }
-            )
             self.cache.data.update(
                 {block_id: tensor.clone() for block_id, tensor in updated.items()}
             )
@@ -183,19 +151,11 @@ class AsyncCacheCommitTest(unittest.TestCase):
         self.assertEqual(self.refresh_bounds_flags[-1], False)
 
     def test_checkpoint_flushes_gpu_dirty_resident_blocks(self):
-        resident = _ResidentState([3], origin_iterations={3: 33})
+        resident = _ResidentState([3])
         working_set = _WorkingSet(self.payloads)
         self.adapter.bind_resident_writeback(resident, working_set)
 
         self.assertEqual(self.adapter.flush_resident_dirty(), 1)
-        self.assertEqual(
-            working_set.stage_kwargs,
-            [{"block_origin_iterations": {3: 33}, "origin_iteration": 33}],
-        )
-        self.assertEqual(
-            self.sync_origin_metadata,
-            [{"block_origin_iterations": {3: 33}, "origin_iteration": 33}],
-        )
         self.assertEqual(resident.dirty_blocks(), [])
         self.assertTrue(torch.equal(self.cache.data[3], torch.full((4, 59), 9.0)))
         self.assertTrue(self.payloads[-1].released.is_set())
