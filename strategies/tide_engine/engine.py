@@ -647,6 +647,19 @@ def pipeline_forward_one_step_shs_inplace(
         backgrounds=backgrounds,
     )
 
+    # An all-rejected tile mask can make the rasterizer return a detached
+    # background tensor. Keep backward valid and expose explicit zero grads for
+    # every GPU-resident component in that case.
+    if use_autograd_for_sh and not rendered_image.requires_grad:
+        zero_grad_anchor = (
+            filtered_xyz_gpu.sum()
+            + filtered_opacity_gpu.sum()
+            + filtered_scaling_gpu.sum()
+            + filtered_rotation_gpu.sum()
+            + filtered_shs.sum()
+        ) * 0.0
+        rendered_image = rendered_image + zero_grad_anchor
+
     rendered_image = rendered_image.squeeze(0).permute(2, 0, 1).contiguous()
 
     return (
@@ -745,6 +758,39 @@ def _allocate_sparse_sophia_components(
             device=local_ids.device,
         )
         for name, width in _SOPHIA_COMPONENT_WIDTHS.items()
+    }
+
+
+def _select_tile_masked_optimizer_inputs(
+    *,
+    projection_local_ids: torch.Tensor,
+    projection_grad_components: Dict[str, torch.Tensor],
+    per_camera_tile_local_ids: List[torch.Tensor],
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Restrict sparse optimizer inputs to this batch's tile survivors."""
+    non_empty = [
+        ids.to(device=projection_local_ids.device, dtype=torch.long)
+        for ids in per_camera_tile_local_ids
+        if ids is not None and ids.numel() > 0
+    ]
+    if not non_empty:
+        empty_ids = projection_local_ids[:0]
+        return empty_ids, {
+            name: value[:0].contiguous()
+            for name, value in projection_grad_components.items()
+        }
+
+    tile_local_ids = torch.unique(torch.cat(non_empty, dim=0), sorted=True)
+    positions = torch.searchsorted(projection_local_ids, tile_local_ids)
+    if torch.any(positions >= projection_local_ids.numel()):
+        raise RuntimeError("Tile mask produced a Gaussian outside projection rows")
+    if not torch.equal(
+        projection_local_ids.index_select(0, positions), tile_local_ids
+    ):
+        raise RuntimeError("Tile mask produced a Gaussian outside projection rows")
+    return tile_local_ids, {
+        name: value.index_select(0, positions).contiguous()
+        for name, value in projection_grad_components.items()
     }
 
 
@@ -2338,6 +2384,9 @@ def clm_offload_train_one_batch(
     sparse_curvature_local_ids = None
     sparse_curvature_components = None
     sparse_visibility_indices = None
+    # Per-camera tile survivors live for this batch only.  They are the common
+    # source for forward participation and, in apply mode, optimizer rows.
+    tile_filters_local: List[torch.Tensor] = []
 
     if use_sparse_gpu_grad_accum:
         with torch.cuda.stream(comm_stream), torch.no_grad():
@@ -2478,6 +2527,8 @@ def clm_offload_train_one_batch(
             # Keep the archived optimizer signal index in sync.
             if signal_tensor_pinned is not None:
                 clm_kernels.set_signal(signal_tensor_pinned, microbatch_idx, 1)
+
+            tile_filters_local.append(this_filter_local[:0])
             
             microbatch_idx += 1  # Increment even when skipping
             torch.cuda.nvtx.range_pop()  # Close micro_batch_idx range
@@ -2888,6 +2939,18 @@ def clm_offload_train_one_batch(
             use_autograd_for_sh=gaussians.use_gpu_features,  # Enable autograd in GPU mode
         )
 
+        camera_tile_keep = tile_meta["keep_mask"].reshape(-1).to(torch.bool)
+        if camera_tile_keep.numel() != this_filter_local.numel():
+            raise RuntimeError(
+                "Tile mask row count does not match the camera projection filter: "
+                f"mask={camera_tile_keep.numel()}, filter={this_filter_local.numel()}"
+            )
+        tile_filters_local.append(
+            this_filter_local[camera_tile_keep]
+            if tile_contribution_mode == "apply"
+            else this_filter_local
+        )
+
         if grad_zero_sample_due:
             stats_positions = (
                 torch.searchsorted(sparse_grad_local_ids, this_filter_local)
@@ -2898,7 +2961,6 @@ def clm_offload_train_one_batch(
             projection_cull_survivor_mask[
                 stats_positions[camera_projection_keep]
             ] = True
-            camera_tile_keep = tile_meta["keep_mask"].reshape(-1)
             tile_survivor_mask[stats_positions[camera_tile_keep]] = True
             tile_mask_counts.add_(tile_meta["counts"])
 
@@ -3352,6 +3414,39 @@ def clm_offload_train_one_batch(
     # ------------------------------------------------------------------------
     # 5.1: Optimizer step (mode-dependent)
     # ------------------------------------------------------------------------
+    optimizer_sparse_grad_local_ids = sparse_grad_local_ids
+    optimizer_sparse_grad_components = sparse_grad_components
+    optimizer_sparse_visibility_indices = sparse_visibility_indices
+    if (
+        tile_contribution_mode == "apply"
+        and use_sparse_gpu_grad_accum
+        and sparse_grad_local_ids is not None
+        and sparse_grad_components is not None
+    ):
+        (
+            optimizer_sparse_grad_local_ids,
+            optimizer_sparse_grad_components,
+        ) = _select_tile_masked_optimizer_inputs(
+            projection_local_ids=sparse_grad_local_ids,
+            projection_grad_components=sparse_grad_components,
+            per_camera_tile_local_ids=tile_filters_local,
+        )
+        local_to_global = ensure_local_to_global_mapping(
+            gaussians,
+            total_n_gaussians,
+            log_file=log_file,
+            context=f"tile_mask_optimizer_rows_iter_{iteration}",
+        )
+        optimizer_sparse_visibility_indices = local_to_global[
+            optimizer_sparse_grad_local_ids
+        ].cpu()
+        write_paper_phase1_log(
+            f"[TILE MASK] Iter {iteration}: optimizer rows "
+            f"{optimizer_sparse_grad_local_ids.numel()}/"
+            f"{sparse_grad_local_ids.numel()} projection-union rows\n",
+            log_file=log_file,
+        )
+
     if not gaussians.use_gpu_features:
         raise RuntimeError("Pure SSD release path requires GPU working-set features.")
 
@@ -3380,9 +3475,9 @@ def clm_offload_train_one_batch(
             args=args,
             iteration=iteration,
             total_n_gaussians=total_n_gaussians,
-            sparse_visibility_indices=sparse_visibility_indices,
-            sparse_grad_local_ids=sparse_grad_local_ids,
-            sparse_grad_components=sparse_grad_components,
+            sparse_visibility_indices=optimizer_sparse_visibility_indices,
+            sparse_grad_local_ids=optimizer_sparse_grad_local_ids,
+            sparse_grad_components=optimizer_sparse_grad_components,
             sparse_curvature_local_ids=sparse_curvature_local_ids,
             sparse_curvature_components=sparse_curvature_components,
             curvature_due=curvature_due,
@@ -3531,7 +3626,10 @@ def clm_offload_train_one_batch(
                     device='cuda',
                 )
                 with torch.cuda.nvtx.range("Tide writeback: mark dirty blocks"):
-                    double_buffer.mark_dirty_blocks(updated_block_ids)
+                    double_buffer.mark_dirty_blocks(
+                        updated_block_ids,
+                        iteration=iteration,
+                    )
 
                 with torch.cuda.nvtx.range("Tide writeback: stage block bounds"):
                     legacy_bounds_refresh_start_ns = time.perf_counter_ns()

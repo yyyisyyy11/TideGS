@@ -400,6 +400,7 @@ class DoubleBufferGPUWorkingSet:
             dtype=torch.bool,
             device=self.device,
         )
+        self._dirty_origin_iterations: Dict[int, int] = {}
         
         # Lock for thread safety
         self.lock = threading.Lock()
@@ -491,7 +492,12 @@ class DoubleBufferGPUWorkingSet:
             )
         return _global_ids_to_local(global_ids, buf._block_starts, self.block_size)
 
-    def mark_dirty_blocks(self, block_ids: List[int]) -> int:
+    def mark_dirty_blocks(
+        self,
+        block_ids: List[int],
+        *,
+        iteration: Optional[int] = None,
+    ) -> int:
         block_ids = sorted(
             set(
                 int(block_id)
@@ -504,8 +510,28 @@ class DoubleBufferGPUWorkingSet:
         ids = torch.tensor(block_ids, dtype=torch.long, device=self.device)
         with self.lock:
             self._dirty_bitmap.index_fill_(0, ids, True)
+            if iteration is not None:
+                for block_id in block_ids:
+                    self._dirty_origin_iterations[block_id] = int(iteration)
             self.stats['dirty_blocks_marked'] += len(block_ids)
         return len(block_ids)
+
+    def latest_dirty_iteration(self, block_ids: List[int]) -> Optional[int]:
+        with self.lock:
+            origins = {
+                self._dirty_origin_iterations[block_id]
+                for block_id in block_ids
+                if block_id in self._dirty_origin_iterations
+            }
+        return next(iter(origins)) if len(origins) == 1 else None
+
+    def origins_for_blocks(self, block_ids: List[int]) -> Dict[int, int]:
+        with self.lock:
+            return {
+                block_id: self._dirty_origin_iterations[block_id]
+                for block_id in block_ids
+                if block_id in self._dirty_origin_iterations
+            }
 
     def dirty_blocks_for_eviction(self, evicted_block_ids: List[int]) -> List[int]:
         evicted = sorted(
@@ -540,6 +566,8 @@ class DoubleBufferGPUWorkingSet:
         ids = torch.tensor(block_ids, dtype=torch.long, device=self.device)
         with self.lock:
             self._dirty_bitmap.index_fill_(0, ids, False)
+            for block_id in block_ids:
+                self._dirty_origin_iterations.pop(block_id, None)
             self.stats['dirty_blocks_written_back'] += len(block_ids)
 
     def submit_resident_plan(
@@ -1729,6 +1757,7 @@ class DoubleBufferGPUWorkingSet:
         self._target_layout_ready.clear()
         self.resident_refresh_complete_event = None
         self._dirty_bitmap.zero_()
+        self._dirty_origin_iterations.clear()
         self.stats['host_staging_bytes'] = 0
         self.stats['host_staging_pinned'] = False
         if torch.cuda.is_available():

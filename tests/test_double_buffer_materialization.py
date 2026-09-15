@@ -172,10 +172,17 @@ class DoubleBufferMaterializationTest(unittest.TestCase):
         )
         self.addCleanup(manager.clear)
 
-        self.assertEqual(manager.mark_dirty_blocks([0, 1, 1]), 2)
+        self.assertEqual(manager.mark_dirty_blocks([0, 1, 1], iteration=1), 2)
+        self.assertEqual(manager.origins_for_blocks([0, 1]), {0: 1, 1: 1})
+        self.assertEqual(manager.latest_dirty_iteration([0, 1]), 1)
+
+        self.assertEqual(manager.mark_dirty_blocks([1], iteration=33), 1)
+        self.assertEqual(manager.origins_for_blocks([0, 1]), {0: 1, 1: 33})
+        self.assertIsNone(manager.latest_dirty_iteration([0, 1]))
         self.assertEqual(manager.dirty_blocks_for_eviction([1, 2]), [1])
         manager.mark_blocks_written_back([1])
         self.assertEqual(manager.dirty_blocks(), [0])
+        self.assertEqual(manager.origins_for_blocks([0, 1]), {0: 1})
 
     def test_resident_plan_runs_on_background_worker(self):
         manager = DoubleBufferGPUWorkingSet(
