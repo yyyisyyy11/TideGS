@@ -2055,8 +2055,22 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     gaussians,
                     distributed_context,
                 )
+                pending_io_events = storage_adapter.cache.drain_io_events()
+                fallback_io_iteration = int(
+                    last_iteration
+                    if last_iteration is not None
+                    else opt_args.iterations
+                )
+                for event in pending_io_events:
+                    if (
+                        event.get("operation")
+                        in {"gpu_d2h", "cpu_cache_commit", "ssd_write_async", "ssd_write_sync"}
+                        and event.get("origin_iteration") is None
+                    ):
+                        # Compatibility for writeback events emitted without source attribution.
+                        event["origin_iteration"] = fallback_io_iteration
                 metrics_writer.write_io_events(
-                    storage_adapter.cache.drain_io_events()
+                    pending_io_events
                 )
                 metrics_writer.finalize_async_metrics()
 
