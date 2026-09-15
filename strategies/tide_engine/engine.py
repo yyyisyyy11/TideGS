@@ -14,8 +14,13 @@ from strategies.tide_engine.gpu_resident_optimizer import (
     GPUResidentSophiaTR,
 )
 from strategies.tide_engine.distributed_metrics import (
+    GRAD_METRIC_VALUE_FIELDS,
     get_distributed_metrics_writer,
     get_legacy_cuda_metrics_collector,
+)
+from strategies.tide_engine.gradient_sparsity import (
+    build_gradient_sparsity_records,
+    collect_gradient_sparsity,
 )
 from utils.distributed import get_distributed_context
 
@@ -523,6 +528,54 @@ def pipeline_forward_one_step_shs_inplace(
 
     batched_means2D.retain_grad()  # this is only for training.
 
+    batched_opacities = filtered_opacity_gpu.squeeze(1).unsqueeze(0)
+    tile_mode = str(
+        getattr(utils.get_args(), "tide_tile_contribution_mode", "off")
+    ).lower()
+    tile_threshold = float(
+        getattr(utils.get_args(), "tide_tile_alpha_threshold", 1.0 / 255.0)
+    )
+    projection_mask = (
+        (batched_radiis > 0).all(dim=-1)
+        if batched_radiis.dim() == batched_means2D.dim()
+        else batched_radiis > 0
+    )
+    if tile_mode == "off":
+        tile_keep_mask = projection_mask
+        tile_counts = torch.zeros(
+            (5,), dtype=torch.long, device=batched_means2D.device
+        )
+    else:
+        tile_keep_mask, candidate_counts, contributing_counts = (
+            clm_kernels.tile_contribution_mask(
+                batched_means2D,
+                batched_conics,
+                batched_opacities,
+                batched_radiis,
+                image_width,
+                image_height,
+                TILE_SIZE,
+                tile_threshold,
+            )
+        )
+        tile_counts = torch.stack(
+            (
+                projection_mask.sum(dtype=torch.long),
+                tile_keep_mask.sum(dtype=torch.long),
+                candidate_counts.sum(dtype=torch.long),
+                candidate_counts[tile_keep_mask].sum(dtype=torch.long),
+                contributing_counts.sum(dtype=torch.long),
+            )
+        )
+        if tile_mode == "apply":
+            radius_mask = tile_keep_mask
+            if batched_radiis.dim() == radius_mask.dim() + 1:
+                radius_mask = radius_mask.unsqueeze(-1)
+            batched_radiis = torch.where(
+                radius_mask, batched_radiis, torch.zeros_like(batched_radiis)
+            )
+    effective_sh_mask = tile_keep_mask if tile_mode == "apply" else None
+
     sh_degree = gaussians.active_sh_degree
     camtoworlds = camera.camtoworlds
     # camtoworlds = torch.inverse(viewmat.unsqueeze(0)) # (4, 4)
@@ -536,7 +589,10 @@ def pipeline_forward_one_step_shs_inplace(
         # GPU-resident path: let PyTorch autograd handle SH gradients.
         # This is cleaner and avoids manual gradient computation
         batched_colors_origin = spherical_harmonics(
-            degrees_to_use=sh_degree, dirs=dirs, coeffs=filtered_shs
+            degrees_to_use=sh_degree,
+            dirs=dirs,
+            coeffs=filtered_shs,
+            masks=effective_sh_mask,
         )
         batched_colors_detached = batched_colors_origin  # No detach needed!
         batched_colors = torch.clamp_min(batched_colors_origin + 0.5, 0.0)
@@ -545,13 +601,14 @@ def pipeline_forward_one_step_shs_inplace(
         dirs.retain_grad()  # Need to retain for manual backward
         with torch.no_grad():
             batched_colors_origin = spherical_harmonics(
-                degrees_to_use=sh_degree, dirs=dirs, coeffs=filtered_shs
+                degrees_to_use=sh_degree,
+                dirs=dirs,
+                coeffs=filtered_shs,
+                masks=effective_sh_mask,
             )
         batched_colors_detached = batched_colors_origin.detach().requires_grad_()
         batched_colors = torch.clamp_min(batched_colors_detached + 0.5, 0.0)
     
-    batched_opacities = filtered_opacity_gpu.squeeze(1).unsqueeze(0)  # (N, 1) -> (1, N)
-
     # NOTE: In the above code, we keep the first batch dimension, even if it is always 1.
 
     # render
@@ -590,6 +647,19 @@ def pipeline_forward_one_step_shs_inplace(
         backgrounds=backgrounds,
     )
 
+    # An all-rejected tile mask can make the rasterizer return a detached
+    # background tensor. Keep backward valid and expose explicit zero grads for
+    # every GPU-resident component in that case.
+    if use_autograd_for_sh and not rendered_image.requires_grad:
+        zero_grad_anchor = (
+            filtered_xyz_gpu.sum()
+            + filtered_opacity_gpu.sum()
+            + filtered_scaling_gpu.sum()
+            + filtered_rotation_gpu.sum()
+            + filtered_shs.sum()
+        ) * 0.0
+        rendered_image = rendered_image + zero_grad_anchor
+
     rendered_image = rendered_image.squeeze(0).permute(2, 0, 1).contiguous()
 
     return (
@@ -598,6 +668,11 @@ def pipeline_forward_one_step_shs_inplace(
         batched_radiis,
         batched_colors_detached,
         dirs,
+        {
+            "projection_mask": projection_mask,
+            "keep_mask": tile_keep_mask,
+            "counts": tile_counts,
+        },
     )
 
 
@@ -624,10 +699,16 @@ def _resolve_single_rank_sophia_batch(
     algorithm = str(getattr(args, "paper_optimizer_algorithm", "adam")).lower()
     if algorithm not in {"adam", "3dgs2_tr"}:
         raise RuntimeError(f"Unsupported resident optimizer algorithm: {algorithm!r}")
-    if algorithm == "adam":
-        return False, None, False, [], list(gradient_cameras)
-
     gradient_cameras = list(gradient_cameras)
+    if algorithm == "adam":
+        resolved_step, _ = resolve_curvature_schedule(
+            iteration=iteration,
+            batch_size=int(getattr(args, "bsz", len(gradient_cameras))),
+            interval=1,
+            optimizer_step=optimizer_step,
+        )
+        return False, resolved_step, False, [], gradient_cameras
+
     gradient_batch_size = len(gradient_cameras)
     configured_batch_size = int(getattr(args, "bsz", gradient_batch_size))
     if gradient_batch_size <= 0:
@@ -677,6 +758,39 @@ def _allocate_sparse_sophia_components(
             device=local_ids.device,
         )
         for name, width in _SOPHIA_COMPONENT_WIDTHS.items()
+    }
+
+
+def _select_tile_masked_optimizer_inputs(
+    *,
+    projection_local_ids: torch.Tensor,
+    projection_grad_components: Dict[str, torch.Tensor],
+    per_camera_tile_local_ids: List[torch.Tensor],
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Restrict sparse optimizer inputs to this batch's tile survivors."""
+    non_empty = [
+        ids.to(device=projection_local_ids.device, dtype=torch.long)
+        for ids in per_camera_tile_local_ids
+        if ids is not None and ids.numel() > 0
+    ]
+    if not non_empty:
+        empty_ids = projection_local_ids[:0]
+        return empty_ids, {
+            name: value[:0].contiguous()
+            for name, value in projection_grad_components.items()
+        }
+
+    tile_local_ids = torch.unique(torch.cat(non_empty, dim=0), sorted=True)
+    positions = torch.searchsorted(projection_local_ids, tile_local_ids)
+    if torch.any(positions >= projection_local_ids.numel()):
+        raise RuntimeError("Tile mask produced a Gaussian outside projection rows")
+    if not torch.equal(
+        projection_local_ids.index_select(0, positions), tile_local_ids
+    ):
+        raise RuntimeError("Tile mask produced a Gaussian outside projection rows")
+    return tile_local_ids, {
+        name: value.index_select(0, positions).contiguous()
+        for name, value in projection_grad_components.items()
     }
 
 
@@ -770,7 +884,7 @@ def _run_single_rank_sophia_curvature_batch(
             dim=1,
         ).contiguous().requires_grad_(True)
 
-        rendered_image, means2d, radii, colors, dirs = (
+        rendered_image, means2d, radii, colors, dirs, _ = (
             pipeline_forward_one_step_shs_inplace(
                 gaussians.opacity_activation(raw_opacity),
                 gaussians.scaling_activation(raw_scaling),
@@ -1121,16 +1235,21 @@ def clm_offload_train_one_batch(
         storage_adapter is not None
         and getattr(args, "tide_detailed_metrics", False)
     )
+    legacy_grad_metrics_enabled = bool(
+        storage_adapter is not None
+        and getattr(args, "tide_grad_zero_metrics", False)
+    )
     legacy_metrics_writer = None
     legacy_metrics_collector = None
     legacy_cache_before = None
     legacy_batch_start = time.perf_counter()
     legacy_gpu_ranges = {}
-    if legacy_metrics_enabled:
+    if legacy_metrics_enabled or legacy_grad_metrics_enabled:
         legacy_context = get_distributed_context(args)
         legacy_metrics_writer = get_distributed_metrics_writer(
             gaussians, legacy_context
         )
+    if legacy_metrics_enabled:
         legacy_metrics_collector = get_legacy_cuda_metrics_collector(
             gaussians, legacy_context
         )
@@ -1197,6 +1316,19 @@ def clm_offload_train_one_batch(
         curvature_cameras=curvature_cameras,
         optimizer_step=optimizer_step,
     )
+    grad_zero_sample_due = bool(
+        legacy_metrics_writer is not None
+        and legacy_metrics_writer.should_write_grad_zero(optimizer_step)
+    )
+    tile_contribution_mode = str(
+        getattr(args, "tide_tile_contribution_mode", "off")
+    ).lower()
+    tile_alpha_threshold = float(
+        getattr(args, "tide_tile_alpha_threshold", 1.0 / 255.0)
+    )
+    optimizer_algorithm = str(
+        getattr(args, "paper_optimizer_algorithm", "adam")
+    ).lower()
     current_camera_ids = [cam.global_idx for cam in batched_cameras]
     curvature_camera_ids = [cam.global_idx for cam in curvature_cameras]
     resident_camera_ids = current_camera_ids + curvature_camera_ids
@@ -1322,6 +1454,20 @@ def clm_offload_train_one_batch(
                 cam_to_blocks[cam_global_idx] = len(blocks)
 
         visible_block_ids = sorted(list(visible_block_ids_set))
+        gradient_active_block_ids = sorted(
+            {
+                block_id
+                for camera_id in current_camera_ids
+                for block_id in current_camera_blocks[int(camera_id)]
+            }
+        )
+        curvature_active_block_ids = sorted(
+            {
+                block_id
+                for camera_id in curvature_camera_ids
+                for block_id in current_camera_blocks[int(camera_id)]
+            }
+        )
         
         _log_paper_block_visibility_debug(
             enabled=paper_debug_logging,
@@ -2238,6 +2384,9 @@ def clm_offload_train_one_batch(
     sparse_curvature_local_ids = None
     sparse_curvature_components = None
     sparse_visibility_indices = None
+    # Per-camera tile survivors live for this batch only.  They are the common
+    # source for forward participation and, in apply mode, optimizer rows.
+    tile_filters_local: List[torch.Tensor] = []
 
     if use_sparse_gpu_grad_accum:
         with torch.cuda.stream(comm_stream), torch.no_grad():
@@ -2275,6 +2424,23 @@ def clm_offload_train_one_batch(
         if gaussians.use_gpu_features:
             gaussians._features_dc.grad = torch.zeros_like(gaussians._features_dc)
             gaussians._features_rest.grad = torch.zeros_like(gaussians._features_rest)
+
+    grad_stats_row_count = (
+        int(sparse_grad_local_ids.numel())
+        if use_sparse_gpu_grad_accum
+        else int(gaussians._xyz.shape[0])
+    )
+    projection_cull_survivor_mask = None
+    tile_survivor_mask = None
+    tile_mask_counts = None
+    if grad_zero_sample_due:
+        projection_cull_survivor_mask = torch.zeros(
+            (grad_stats_row_count,), dtype=torch.bool, device=gaussians._xyz.device
+        )
+        tile_survivor_mask = torch.zeros_like(projection_cull_survivor_mask)
+        tile_mask_counts = torch.zeros(
+            (5,), dtype=torch.long, device=gaussians._xyz.device
+        )
 
     # Stream management: default_stream for compute, comm_stream for CPU<->GPU transfers
     default_stream = torch.cuda.current_stream()
@@ -2361,6 +2527,8 @@ def clm_offload_train_one_batch(
             # Keep the archived optimizer signal index in sync.
             if signal_tensor_pinned is not None:
                 clm_kernels.set_signal(signal_tensor_pinned, microbatch_idx, 1)
+
+            tile_filters_local.append(this_filter_local[:0])
             
             microbatch_idx += 1  # Increment even when skipping
             torch.cuda.nvtx.range_pop()  # Close micro_batch_idx range
@@ -2756,6 +2924,7 @@ def clm_offload_train_one_batch(
             batched_radiis,
             batched_colors_detached,
             dirs,
+            tile_meta,
         ) = pipeline_forward_one_step_shs_inplace(
             filtered_opacity_gpu,
             filtered_scaling_gpu,
@@ -2769,6 +2938,31 @@ def clm_offload_train_one_batch(
             pipe_args,
             use_autograd_for_sh=gaussians.use_gpu_features,  # Enable autograd in GPU mode
         )
+
+        camera_tile_keep = tile_meta["keep_mask"].reshape(-1).to(torch.bool)
+        if camera_tile_keep.numel() != this_filter_local.numel():
+            raise RuntimeError(
+                "Tile mask row count does not match the camera projection filter: "
+                f"mask={camera_tile_keep.numel()}, filter={this_filter_local.numel()}"
+            )
+        tile_filters_local.append(
+            this_filter_local[camera_tile_keep]
+            if tile_contribution_mode == "apply"
+            else this_filter_local
+        )
+
+        if grad_zero_sample_due:
+            stats_positions = (
+                torch.searchsorted(sparse_grad_local_ids, this_filter_local)
+                if use_sparse_gpu_grad_accum
+                else this_filter_local
+            )
+            camera_projection_keep = tile_meta["projection_mask"].reshape(-1)
+            projection_cull_survivor_mask[
+                stats_positions[camera_projection_keep]
+            ] = True
+            tile_survivor_mask[stats_positions[camera_tile_keep]] = True
+            tile_mask_counts.add_(tile_meta["counts"])
 
         # Compute loss
         loss = torch_compiled_loss(
@@ -3159,10 +3353,15 @@ def clm_offload_train_one_batch(
         # Update visibility mask for sparse Adam optimizer (tracks which parameters received gradients)
         if args.sparse_adam and visibility_mask is not None:
             torch.cuda.nvtx.range_push("update visibility")
+            visibility_indices = filters[micro_idx]
+            if tile_contribution_mode == "apply":
+                visibility_indices = visibility_indices[
+                    tile_meta["keep_mask"].reshape(-1)
+                ]
             src = torch.ones(
-                (len(filters[micro_idx]),), dtype=torch.bool, device="cuda"
+                (len(visibility_indices),), dtype=torch.bool, device="cuda"
             )
-            visibility_mask.scatter_(dim=0, index=filters[micro_idx], src=src)
+            visibility_mask.scatter_(dim=0, index=visibility_indices, src=src)
             torch.cuda.nvtx.range_pop()
 
     _ts('stage4_train_done')
@@ -3178,9 +3377,76 @@ def clm_offload_train_one_batch(
 
     assert microbatch_idx == bsz, f"microbatch_idx should be equal to bsz. Got {microbatch_idx} vs {bsz}"
 
+    if grad_zero_sample_due:
+        if not use_sparse_gpu_grad_accum:
+            raise RuntimeError(
+                "Single-rank gradient sparsity profiling requires sparse GPU accumulation"
+            )
+        owner_grad_components = sparse_grad_components
+        if tile_contribution_mode == "off":
+            tile_survivor_mask.copy_(projection_cull_survivor_mask)
+        grad_profile = collect_gradient_sparsity(
+            owner_grad_components,
+            projection_cull_survivor_mask,
+            tile_survivor_mask,
+            active_sh_degree=int(gaussians.active_sh_degree),
+            tile_mode=tile_contribution_mode,
+            tile_counts=tile_mask_counts,
+            near_zero_threshold=legacy_metrics_writer.grad_near_zero_threshold,
+            sample_rows=legacy_metrics_writer.grad_sample_rows,
+            chunk_rows=legacy_metrics_writer.grad_stats_chunk_rows,
+        )
+        grad_zero_record, grad_sample_record = build_gradient_sparsity_records(
+            grad_profile,
+            GRAD_METRIC_VALUE_FIELDS,
+            sparse_grad_local_ids,
+            tile_survivor_mask,
+            iteration=iteration,
+            optimizer_step=optimizer_step,
+            active_sh_degree=int(gaussians.active_sh_degree),
+            near_zero_threshold=legacy_metrics_writer.grad_near_zero_threshold,
+            tile_mode=tile_contribution_mode,
+            tile_alpha_threshold=tile_alpha_threshold,
+        )
+        legacy_metrics_writer.write_grad_zero(grad_zero_record)
+        legacy_metrics_writer.write_grad_sample(grad_sample_record)
+
     # ------------------------------------------------------------------------
     # 5.1: Optimizer step (mode-dependent)
     # ------------------------------------------------------------------------
+    optimizer_sparse_grad_local_ids = sparse_grad_local_ids
+    optimizer_sparse_grad_components = sparse_grad_components
+    optimizer_sparse_visibility_indices = sparse_visibility_indices
+    if (
+        tile_contribution_mode == "apply"
+        and use_sparse_gpu_grad_accum
+        and sparse_grad_local_ids is not None
+        and sparse_grad_components is not None
+    ):
+        (
+            optimizer_sparse_grad_local_ids,
+            optimizer_sparse_grad_components,
+        ) = _select_tile_masked_optimizer_inputs(
+            projection_local_ids=sparse_grad_local_ids,
+            projection_grad_components=sparse_grad_components,
+            per_camera_tile_local_ids=tile_filters_local,
+        )
+        local_to_global = ensure_local_to_global_mapping(
+            gaussians,
+            total_n_gaussians,
+            log_file=log_file,
+            context=f"tile_mask_optimizer_rows_iter_{iteration}",
+        )
+        optimizer_sparse_visibility_indices = local_to_global[
+            optimizer_sparse_grad_local_ids
+        ].cpu()
+        write_paper_phase1_log(
+            f"[TILE MASK] Iter {iteration}: optimizer rows "
+            f"{optimizer_sparse_grad_local_ids.numel()}/"
+            f"{sparse_grad_local_ids.numel()} projection-union rows\n",
+            log_file=log_file,
+        )
+
     if not gaussians.use_gpu_features:
         raise RuntimeError("Pure SSD release path requires GPU working-set features.")
 
@@ -3209,9 +3475,9 @@ def clm_offload_train_one_batch(
             args=args,
             iteration=iteration,
             total_n_gaussians=total_n_gaussians,
-            sparse_visibility_indices=sparse_visibility_indices,
-            sparse_grad_local_ids=sparse_grad_local_ids,
-            sparse_grad_components=sparse_grad_components,
+            sparse_visibility_indices=optimizer_sparse_visibility_indices,
+            sparse_grad_local_ids=optimizer_sparse_grad_local_ids,
+            sparse_grad_components=optimizer_sparse_grad_components,
             sparse_curvature_local_ids=sparse_curvature_local_ids,
             sparse_curvature_components=sparse_curvature_components,
             curvature_due=curvature_due,
@@ -3360,7 +3626,10 @@ def clm_offload_train_one_batch(
                     device='cuda',
                 )
                 with torch.cuda.nvtx.range("Tide writeback: mark dirty blocks"):
-                    double_buffer.mark_dirty_blocks(updated_block_ids)
+                    double_buffer.mark_dirty_blocks(
+                        updated_block_ids,
+                        iteration=iteration,
+                    )
 
                 with torch.cuda.nvtx.range("Tide writeback: stage block bounds"):
                     legacy_bounds_refresh_start_ns = time.perf_counter_ns()
@@ -3700,6 +3969,9 @@ def clm_offload_train_one_batch(
 
         legacy_metrics_row = {
             "iteration": iteration,
+            "optimizer_algorithm": optimizer_algorithm,
+            "optimizer_step": optimizer_step,
+            "curvature_due": int(curvature_due),
             "local_cameras": bsz,
             "global_active_blocks": len(visible_block_ids),
             "global_resident_blocks": len(current_loaded_blocks),
@@ -3710,6 +3982,8 @@ def clm_offload_train_one_batch(
             "prediction_repair_ms": 0.0,
             "prediction_exact_plan_ms": 0.0,
             "rank_active_blocks": len(visible_block_ids),
+            "rank_gradient_active_blocks": len(gradient_active_block_ids),
+            "rank_curvature_active_blocks": len(curvature_active_block_ids),
             "rank_resident_blocks": len(current_loaded_blocks),
             "cold_blocks": int(legacy_retention_stats.get("cold_count", 0)),
             "retained_blocks": int(legacy_retention_stats.get("hotspot_count", 0)),
@@ -3719,7 +3993,40 @@ def clm_offload_train_one_batch(
             "gpu_slot_growth_blocks": int(
                 legacy_retention_stats.get("gpu_slot_growth_blocks", 0)
             ),
-            "touched_gaussians": int(optimizer_step_stats.get("touched_rows", 0)),
+            "owner_active_gaussians": grad_stats_row_count,
+            "collective_participation_gaussians": grad_stats_row_count,
+            "uses_zero_opacity_sentinel": 0,
+            "touched_gaussians": grad_stats_row_count,
+            "gradient_participation_rows": grad_stats_row_count,
+            "curvature_participation_rows": (
+                int(sparse_curvature_local_ids.numel())
+                if sparse_curvature_local_ids is not None
+                else 0
+            ),
+            "updated_blocks": int(
+                optimizer_step_stats.get("updated_blocks", 0)
+            ),
+            "optimizer_touched_rows": int(
+                optimizer_step_stats.get("touched_rows", 0)
+            ),
+            "optimizer_cold_rows": int(
+                optimizer_step_stats.get("cold_rows", 0)
+            ),
+            "curvature_blocks": len(
+                optimizer_step_stats.get("curvature_block_ids", [])
+            ),
+            "curvature_rows": int(
+                optimizer_step_stats.get("curvature_rows", 0)
+            ),
+            "clipped_values": int(
+                optimizer_step_stats.get("clipped_values", 0)
+            ),
+            "rows_skipped_without_curvature": int(
+                optimizer_step_stats.get("rows_skipped_without_curvature", 0)
+            ),
+            "trust_region_epsilon": float(
+                optimizer_step_stats.get("trust_region_epsilon", 0.0)
+            ),
             "block_cull_ms": legacy_block_cull_ms,
             "block_cull_backend": str(
                 legacy_block_cull_metrics.get("block_cull_backend", "cpu")
