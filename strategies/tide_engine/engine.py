@@ -3440,7 +3440,7 @@ def clm_offload_train_one_batch(
         optimizer_sparse_visibility_indices = local_to_global[
             optimizer_sparse_grad_local_ids
         ].cpu()
-        write_paper_phase1_log(
+        _write_paper_phase1_log(
             f"[TILE MASK] Iter {iteration}: optimizer rows "
             f"{optimizer_sparse_grad_local_ids.numel()}/"
             f"{sparse_grad_local_ids.numel()} projection-union rows\n",
