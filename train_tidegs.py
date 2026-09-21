@@ -674,7 +674,10 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     progress_bar.update(start_from_this_iteration - 1)
     num_trained_batches = 0
 
-    mem_mon = MemMonitor(log_dir=args.log_folder, warn_avail_gb=15.0)
+    # uss_every is pinned rather than left to the default: USS walks /proc/<pid>/smaps,
+    # which costs seconds on a process mapping hundreds of GB.  Passing it explicitly
+    # keeps our sampling rate from moving if the library default is ever changed.
+    mem_mon = MemMonitor(log_dir=args.log_folder, warn_avail_gb=15.0, uss_every=100)
 
     # Random number generator for camera ordering in retention-based offloading
     perm_generator = torch.Generator(device="cuda")
