@@ -2,16 +2,16 @@
 # ============================================================================
 # knn3 SSD base + 多卡「pure SSD」训练 + 上游 200 视角评测
 #
-# 卡数由 NGPU 决定，默认为 2。文件名里的 "4gpu" 说的是配置血缘——这套参数来自
-# 已跑通的 4 卡基线，NGPU 只是把同一份计算摊到不同数量的 rank 上。
+# 卡数由 NGPU 决定，默认 2（与文件名里的 "2gpu" 一致）。这套参数来自已跑通的
+# 4 卡基线，换 NGPU 只是把同一份计算摊到不同数量的 rank 上。
 #
 # 用法：
 #   1) 按需修改下面 CONFIG 段的路径（都有默认值，默认按 DATA_ROOT 推）
 #   2) 在**已经分配到 GPU 的节点上**直接运行：
-#          bash scripts/run_knn3_4gpu_experiment.sh
+#          bash scripts/run_knn3_2gpu_experiment.sh
 #      脚本不自己提交作业——请在调度器分配好的环境里跑（Slurm 用 srun --pty bash、
 #      或 sbatch 提交本脚本）。
-#   3) 想先只检查环境不训练：  bash scripts/run_knn3_4gpu_experiment.sh --check-only
+#   3) 想先只检查环境不训练：  bash scripts/run_knn3_2gpu_experiment.sh --check-only
 #
 # 脚本做三段：预检 -> 训练 -> 评测。预检失败会明确告诉你缺什么、怎么补。
 # ============================================================================

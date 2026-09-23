@@ -12,7 +12,7 @@
 | 训练代码（主体） | `9c7c270` "fix: correct _write_paper_phase1_log call in tile-mask apply path" |
 | 上游评测器（4 个文件） | cherry-pick 自 `ad6bc18` "Port the upstream evaluation pipeline" |
 | USS 采样节流（3 行） | cherry-pick 自 `4ac3a4c` "Throttle USS sampling in the memory monitor" |
-| 运行脚本 | `scripts/run_knn3_4gpu_experiment.sh`（本分支新增） |
+| 运行脚本 | `scripts/run_knn3_2gpu_experiment.sh`（本分支新增） |
 
 `ad6bc18` 的改动是**纯新增**（4 个文件、1357 行，不动任何既有文件），`4ac3a4c` 只改了内存监视器：
 把读 `/proc/<pid>/smaps` 的 USS 采样从每次降到每 100 次。**它不影响任何数值结果**，纯粹是避免
@@ -91,10 +91,10 @@ git clone <repo-url> && cd TideGS
 git checkout handoff/knn3-4gpu
 
 # 只检查环境，不训练
-DATA_ROOT=/path/to/data bash scripts/run_knn3_4gpu_experiment.sh --check-only
+DATA_ROOT=/path/to/data bash scripts/run_knn3_2gpu_experiment.sh --check-only
 
-# 正式跑（在已分配到 4 张卡的节点上）
-DATA_ROOT=/path/to/data bash scripts/run_knn3_4gpu_experiment.sh
+# 正式跑（在已分配到 NGPU 张卡的节点上，默认 2 张）
+DATA_ROOT=/path/to/data bash scripts/run_knn3_2gpu_experiment.sh
 ```
 
 脚本的分段：**预检 → 训练 → 评测**。预检会逐项检查 GPU 可见性、base 的大小与 `scale_mode`、
