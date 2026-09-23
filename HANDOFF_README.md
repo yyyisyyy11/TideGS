@@ -28,7 +28,7 @@
 
 | 项 | 要求 | 依据 |
 |---|---|---|
-| GPU | **4 × 80 GB，必须在同一节点上** | 实测峰值显存 39.1 GiB（全局驻留上限 8192 时）；**40 GB 卡装不下** |
+| GPU | **80 GB 卡，同一节点上 2 或 4 张** | 实测峰值显存 39.1 GiB（每卡驻留 2048 时）；**40 GB 卡装不下** |
 | GPU 架构 | sm_80（A100/A800） | 与已有基线数值可比。换架构需重编 CUDA 扩展，且浮点行为不同 |
 | CPU | ≥ 48 核（每卡 12 核） | 已验证配置按 48 核提交 |
 | 主机内存 | **≥ 512 GiB，建议 1 TB** | 实测每 rank 的进程树 RSS 到 115 GiB；另一次 run 的 cgroup 峰值到过 397 GB |
@@ -101,11 +101,19 @@ DATA_ROOT=/path/to/data bash scripts/run_knn3_4gpu_experiment.sh
 相机数量、解码缓存、评测器文件，缺什么直接告诉你缺什么、怎么补。任何一步不过就停下，不会白跑。
 
 可用环境变量覆盖：`PYTHON` `DATA_ROOT` `SCENE_DIR` `DECODE_DIR` `SSD_BASE_DIR`
-`RUN_ROOT` `SCHED_CACHE` `NGPU` `BSZ` `ITERS` `CHECKPOINTS` `RESIDENT_CAP` `TAG`。
+`RUN_ROOT` `SCHED_CACHE` `NGPU` `BSZ` `ITERS` `CHECKPOINTS` `PER_CARD_CAP` `RESIDENT_CAP` `TAG`。
 
-**改 `NGPU` 时注意**：全局 `BSZ` 与全局 `RESIDENT_CAP` 保持不变，才能与 4 卡基线可比；
-但每 rank 的显存与负载会随 rank 数变少而上升（2 卡时每 rank 的驻留块翻倍）。
+**卡数与驻留上限**：默认 `NGPU=2`；驻留上限按**每张卡**给（`PER_CARD_CAP=6144`），
+全局值自动等于 `每卡 × NGPU`（2 卡 → 12288，4 卡 → 24576）。想直接指定全局值就用 `RESIDENT_CAP`。
 `NGPU` 必须是 51632 的约数（2 / 4 / 8 可以，3 不行）。
+
+⚠️ **驻留上限会改变结果，不只是显存旋钮。** 只有驻留下来的块会被优化
+（`--tide_optimizer_state_mode resident_blocks`），所以改这个值就等于改变了"哪些 Gaussian
+每次会被更新"。已验证的 4 卡基线用的是**每卡 2048 / 全局 8192**；复现它要
+`PER_CARD_CAP=2048 NGPU=4`，不是默认值。想和已有曲线并列比较时，务必先把这一项对齐。
+
+⚠️ 每卡 6144 个驻留块（≈25.2M 个 Gaussian）是基线每卡量的 3 倍，峰值显存会明显高于
+基线在 2048/卡 时的 39.1 GiB。`--check_gpu_memory` 会在日志里打显存，留意别贴上限。
 
 ---
 

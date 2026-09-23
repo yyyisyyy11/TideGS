@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================================
-# knn3 SSD base + 4 卡「pure SSD」训练 + 上游 200 视角评测
+# knn3 SSD base + 多卡「pure SSD」训练 + 上游 200 视角评测
+#
+# 卡数由 NGPU 决定，默认为 2。文件名里的 "4gpu" 说的是配置血缘——这套参数来自
+# 已跑通的 4 卡基线，NGPU 只是把同一份计算摊到不同数量的 rank 上。
 #
 # 用法：
 #   1) 按需修改下面 CONFIG 段的路径（都有默认值，默认按 DATA_ROOT 推）
@@ -13,6 +16,9 @@
 # 脚本做三段：预检 -> 训练 -> 评测。预检失败会明确告诉你缺什么、怎么补。
 # ============================================================================
 set -euo pipefail
+
+say()  { printf '\033[1;34m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
+fail() { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; exit 2; }
 
 # ============================== CONFIG ======================================
 # 仓库根目录（默认取本脚本所在目录的上一级）
@@ -40,11 +46,31 @@ CACHE="$RUN_ROOT/ssd_cache"
 SCHED_CACHE="${SCHED_CACHE:-$REPO/runs/schedule_cache/oneb_bigcity_tsp}"
 
 # 训练规模。NGPU 必须是 51632 的约数（2、4、8 都可以；3 不行，需要裁剪相机）
-NGPU="${NGPU:-4}"
+NGPU="${NGPU:-2}"
 BSZ="${BSZ:-64}"                      # **全局** batch；保持不变才能与 4 卡基线可比
 ITERS="${ITERS:-200000}"              # 相机迭代数（不是优化器步数）
 CHECKPOINTS="${CHECKPOINTS:-50000 100000 150000 200000}"
-RESIDENT_CAP="${RESIDENT_CAP:-8192}"  # **全局**驻留块上限；4 卡时每卡 2048
+
+# 驻留块上限按**每张卡**给，全局值 = 每卡 × NGPU。
+# 6144/卡、2 卡 → 全局 12288。
+PER_CARD_CAP="${PER_CARD_CAP:-6144}"
+
+# 数值参数必须在校验通过之后才能拿去算术运算：非数字在 set -u 下会被当成变量名，
+# 报 "unbound variable" 而不是"你写错了"。
+for _v in NGPU PER_CARD_CAP BSZ ITERS; do
+  _val="${!_v}"
+  if [[ ! "$_val" =~ ^[0-9]+$ ]] || (( _val <= 0 )); then
+    fail "$_v 必须是正整数，实际是 '$_val'（注意别把多个赋值挤进一个环境变量）"
+  fi
+done
+unset _v _val
+
+if [[ -z "${RESIDENT_CAP:-}" ]]; then
+  RESIDENT_CAP=$(( PER_CARD_CAP * NGPU ))
+fi
+if [[ ! "$RESIDENT_CAP" =~ ^[0-9]+$ ]] || (( RESIDENT_CAP <= 0 )); then
+  fail "RESIDENT_CAP 必须是正整数，实际是 '$RESIDENT_CAP'"
+fi
 
 # 训练相机总数（该数据集固定 51632）
 N_TRAIN_CAM_TOTAL=51632
@@ -58,8 +84,11 @@ BASE_EXPECT_SCALE_MODE=knn3
 CHECK_ONLY=0
 if [[ "${1:-}" == "--check-only" ]]; then CHECK_ONLY=1; fi
 
-say()  { printf '\033[1;34m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
-fail() { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; exit 2; }
+# 先把解析出来的配置打出来，便于核对（预检不过也能看到）
+say "配置 NGPU=$NGPU  BSZ=$BSZ(全局)  ITERS=$ITERS  驻留上限=$PER_CARD_CAP/卡 = $RESIDENT_CAP(全局)"
+say "  base=$SSD_BASE_DIR"
+say "  场景=$SCENE_DIR"
+say "  输出=$RUN_ROOT"
 
 # ---------------------------------------------------------------------------
 # 0. 前置：GPU 可见性
@@ -162,7 +191,7 @@ done
   || say "  ⚠️ 没装 lpips——评测的 LPIPS 指标会失败（PSNR/SSIM 不受影响）。可 pip install lpips"
 
 mkdir -p "$MODEL" "$CACHE" "$SCHED_CACHE"
-say "全部预检通过。NGPU=$NGPU BSZ=$BSZ(全局) ITERS=$ITERS CAP=$RESIDENT_CAP(全局)"
+say "全部预检通过。NGPU=$NGPU BSZ=$BSZ(全局) ITERS=$ITERS 驻留上限=$PER_CARD_CAP/卡 = $RESIDENT_CAP(全局)"
 say "输出目录：$RUN_ROOT"
 
 if (( CHECK_ONLY )); then
@@ -171,12 +200,12 @@ if (( CHECK_ONLY )); then
 fi
 
 # ---------------------------------------------------------------------------
-# 5. 训练（配置与已验证的 4 卡基线逐字一致）
+# 5. 训练（除 NGPU 与驻留上限外，其余参数与已验证的 4 卡基线逐字一致）
 # ---------------------------------------------------------------------------
 {
   echo "host=$(hostname)"
   echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
-  echo "ngpu=$NGPU bsz=$BSZ iters=$ITERS resident_cap=$RESIDENT_CAP"
+  echo "ngpu=$NGPU bsz=$BSZ iters=$ITERS per_card_cap=$PER_CARD_CAP resident_cap=$RESIDENT_CAP"
   echo "repo_commit=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
   echo "ssd_base=$SSD_BASE_DIR"
   echo "scene=$SCENE_DIR"
