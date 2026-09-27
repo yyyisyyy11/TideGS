@@ -480,7 +480,6 @@ def write_pure_ssd_incremental_checkpoint(
             "pure_ssd_checkpoint_keep_last": getattr(args, "pure_ssd_checkpoint_keep_last", None),
             "tide_storage_max_patch_files": getattr(args, "tide_storage_max_patch_files", None),
             "tide_storage_max_patch_gb": getattr(args, "tide_storage_max_patch_gb", None),
-            "tide_storage_min_free_gb": getattr(args, "tide_storage_min_free_gb", None),
             "tide_storage_compaction_batch_files": getattr(
                 args,
                 "tide_storage_compaction_batch_files",
@@ -504,11 +503,6 @@ def write_pure_ssd_incremental_checkpoint(
             "tide_storage_compaction_rank_concurrency": getattr(
                 args,
                 "tide_storage_compaction_rank_concurrency",
-                None,
-            ),
-            "tide_storage_compaction_emergency_free_gb": getattr(
-                args,
-                "tide_storage_compaction_emergency_free_gb",
                 None,
             ),
         },

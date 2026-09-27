@@ -677,7 +677,6 @@ class CheckpointIndexReadTest(unittest.TestCase):
                 num_blocks=2,
                 point_dim=59,
                 verbose=False,
-                min_free_gb=0,
             )
             base = torch.arange(4 * 59, dtype=torch.float32).reshape(4, 59)
             (source_dir / "base_file.bin").write_bytes(base.numpy().tobytes())
@@ -694,7 +693,6 @@ class CheckpointIndexReadTest(unittest.TestCase):
                 num_blocks=2,
                 point_dim=59,
                 verbose=False,
-                min_free_gb=0,
             )
             reader.load_index_manifest(index_path)
             loaded = reader.read_blocks([0])[0]

@@ -3,7 +3,6 @@ import unittest
 from storage.compaction_scheduler import (
     _rank_groups,
     crossed_periodic_iteration,
-    resolve_emergency_free_gb,
     run_compaction_maintenance,
 )
 
@@ -23,16 +22,12 @@ class _Context:
 
 
 class _Storage:
-    min_free_bytes = 64 * (1024 ** 3)
-
-    def __init__(self, *, patches=12, free_gb=256):
+    def __init__(self, *, patches=12):
         self.patches = patches
-        self.free_gb = free_gb
 
     def get_stats(self):
         return {
             "num_patches": self.patches,
-            "free_space_gb": self.free_gb,
         }
 
     def estimate_next_compaction_output_bytes(self):
@@ -41,7 +36,6 @@ class _Storage:
     def compact_to_patch_count(self, *, target_patch_files):
         before = self.patches
         self.patches = min(self.patches, target_patch_files)
-        self.free_gb += 32
         return {
             "rounds": 2,
             "before_patches": before,
@@ -111,37 +105,27 @@ class CompactionSchedulerTest(unittest.TestCase):
             )
         )
 
-    def test_rank_groups_use_two_waves_and_fall_back_to_single_rank(self):
-        gib = 1024 ** 3
-        states = [
-            {
-                "free_bytes": 256 * gib,
-                "min_free_bytes": 64 * gib,
-                "num_patches": 12,
-                "estimated_output_bytes": 16 * gib,
-            }
-            for _ in range(4)
-        ]
+    def test_rank_groups_split_into_waves(self):
         self.assertEqual(
-            _rank_groups(
-                states,
-                requested_concurrency=2,
-                target_patch_files=8,
-            ),
+            _rank_groups(4, requested_concurrency=2),
             [[0, 1], [2, 3]],
         )
-        for state in states:
-            state["free_bytes"] = 80 * gib
         self.assertEqual(
-            _rank_groups(
-                states,
-                requested_concurrency=2,
-                target_patch_files=8,
-            ),
+            _rank_groups(4, requested_concurrency=1),
             [[0], [1], [2], [3]],
         )
+        # Concurrency is clamped to the world size.
+        self.assertEqual(
+            _rank_groups(2, requested_concurrency=8),
+            [[0, 1]],
+        )
+        # Requests below one are raised to one rather than producing empty waves.
+        self.assertEqual(
+            _rank_groups(3, requested_concurrency=0),
+            [[0], [1], [2]],
+        )
 
-    def test_periodic_and_emergency_compaction_reach_low_watermark(self):
+    def test_periodic_compaction_reaches_low_watermark(self):
         context = _Context()
         storage = _Storage()
         adapter = _Adapter(storage)
@@ -152,7 +136,6 @@ class CompactionSchedulerTest(unittest.TestCase):
             periodic_iteration=5000,
             target_patch_files=8,
             rank_concurrency=2,
-            emergency_free_gb=128,
         )
         self.assertEqual(result["trigger"], "periodic")
         self.assertEqual(result["iteration"], 5000)
@@ -160,28 +143,42 @@ class CompactionSchedulerTest(unittest.TestCase):
         self.assertEqual(adapter.drains, 1)
         self.assertEqual(adapter.read_waits, 1)
 
-        emergency_storage = _Storage(free_gb=100)
-        emergency_adapter = _Adapter(emergency_storage)
+    def test_no_trigger_returns_none(self):
+        """Without a periodic crossing or a forced trigger there is nothing to do.
+
+        This is the only remaining reason the scheduler can no-op: the
+        free-space emergency trigger was removed because it compared a
+        filesystem-wide reading against a threshold no cluster could reach.
+        """
+        storage = _Storage()
+        adapter = _Adapter(storage)
+        self.assertIsNone(
+            run_compaction_maintenance(
+                context=_Context(),
+                storage_adapter=adapter,
+                iteration=3001,
+                periodic_iteration=None,
+                target_patch_files=8,
+                rank_concurrency=2,
+            )
+        )
+        self.assertEqual(adapter.drains, 0)
+
+    def test_forced_trigger_runs_without_periodic_crossing(self):
+        storage = _Storage()
+        adapter = _Adapter(storage)
         result = run_compaction_maintenance(
             context=_Context(),
-            storage_adapter=emergency_adapter,
+            storage_adapter=adapter,
             iteration=3001,
             periodic_iteration=None,
             target_patch_files=8,
             rank_concurrency=2,
-            emergency_free_gb=128,
+            forced_trigger="shutdown",
+            flush_dirty_cache=True,
         )
-        self.assertEqual(result["trigger"], "emergency")
-        self.assertGreaterEqual(result["free_space_gb_after"], 128)
-
-    def test_emergency_threshold_defaults_to_twice_reserve(self):
-        self.assertEqual(
-            resolve_emergency_free_gb(
-                configured_gb=-1,
-                min_free_gb=64,
-            ),
-            128,
-        )
+        self.assertEqual(result["trigger"], "shutdown")
+        self.assertEqual(result["after_patches"], 8)
 
 
 if __name__ == "__main__":

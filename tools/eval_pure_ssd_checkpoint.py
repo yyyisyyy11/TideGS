@@ -611,7 +611,6 @@ def evaluate_checkpoint(cli_args: argparse.Namespace) -> Dict[str, object]:
             skip_camera_clustering=False,
             use_6plane=bool(getattr(training_args, "use_6plane", True)),
             execution_mode="paper",
-            min_free_gb=0.0,
         )
         block_reader = _checkpoint_block_reader(checkpoint)
         gaussians._block_reader = block_reader

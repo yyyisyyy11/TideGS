@@ -101,7 +101,6 @@ class TideStorageAdapter:
         execution_mode: str = "paper",
         max_patch_files: int = 32,
         max_patch_gb: float = 64.0,
-        min_free_gb: float = 64.0,
         compaction_batch_files: int = 4,
         idle_compaction_seconds: float = 0.0,
         block_cull_backend: str = "cpu",
@@ -118,7 +117,6 @@ class TideStorageAdapter:
         self._batch_cull_metrics = None
         self.max_patch_files = int(max_patch_files)
         self.max_patch_gb = float(max_patch_gb)
-        self.min_free_gb = float(min_free_gb)
         self.compaction_batch_files = int(compaction_batch_files)
         self.idle_compaction_seconds = float(idle_compaction_seconds)
         self.paper_debug_logging = bool(
@@ -702,7 +700,6 @@ class TideStorageAdapter:
             verbose=self.paper_debug_logging,
             max_patch_files=self.max_patch_files,
             max_patch_gb=self.max_patch_gb,
-            min_free_gb=self.min_free_gb,
             compaction_batch_files=self.compaction_batch_files,
             idle_compaction_seconds=self.idle_compaction_seconds,
         )

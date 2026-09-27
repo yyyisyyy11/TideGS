@@ -196,13 +196,11 @@ class AuxiliaryParams(ParamGroup):
         self.tide_trajectory_start_offset = 0  # Canonical TSP position used as the in-memory schedule start
         self.tide_storage_max_patch_files = 32  # Legacy idle-compaction high watermark
         self.tide_storage_max_patch_gb = 64.0  # Compact after this much stale delta data accumulates
-        self.tide_storage_min_free_gb = 64.0  # Refuse writes that consume this reserve
         self.tide_storage_compaction_batch_files = 4  # Oldest patches merged per maintenance pass
         self.tide_storage_idle_compaction_seconds = 0.0  # Legacy idle maintenance; disabled by default
         self.tide_storage_compaction_interval_iterations = 5000
         self.tide_storage_compaction_target_patch_files = 8
         self.tide_storage_compaction_rank_concurrency = 2
-        self.tide_storage_compaction_emergency_free_gb = -1.0
         self.pure_ssd_schedule_cache_dir = ""  # Optional persistent cache for pure SSD camera TSP schedules
         self.pure_ssd_disable_schedule_cache = False  # Disable pure SSD camera schedule cache
         self.enable_hotspot_retention = True  # Enable GPU hotspot retention to reduce RAM→GPU bandwidth
@@ -786,9 +784,6 @@ def init_args(args):
     if hasattr(args, "tide_storage_max_patch_gb"):
         args.tide_storage_max_patch_gb = float(args.tide_storage_max_patch_gb)
         assert args.tide_storage_max_patch_gb >= 0
-    if hasattr(args, "tide_storage_min_free_gb"):
-        args.tide_storage_min_free_gb = float(args.tide_storage_min_free_gb)
-        assert args.tide_storage_min_free_gb >= 0
     if hasattr(args, "tide_storage_compaction_batch_files"):
         args.tide_storage_compaction_batch_files = int(
             args.tide_storage_compaction_batch_files
@@ -814,15 +809,6 @@ def init_args(args):
             args.tide_storage_compaction_rank_concurrency
         )
         assert args.tide_storage_compaction_rank_concurrency >= 1
-    if hasattr(args, "tide_storage_compaction_emergency_free_gb"):
-        args.tide_storage_compaction_emergency_free_gb = float(
-            args.tide_storage_compaction_emergency_free_gb
-        )
-        assert (
-            args.tide_storage_compaction_emergency_free_gb == -1
-            or args.tide_storage_compaction_emergency_free_gb
-            >= args.tide_storage_min_free_gb
-        )
     if (
         getattr(args, "tide_storage_idle_compaction_seconds", 0) > 0
         and getattr(args, "tide_storage_compaction_interval_iterations", 0) > 0
