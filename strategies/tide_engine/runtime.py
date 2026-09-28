@@ -23,6 +23,23 @@ from .sophia_tr_math import should_update_curvature
 from .sophia_tr_sampling import sample_s2_camera_ids
 
 
+_TOPC_RESIDENT_POLICIES = {
+    "topc",
+    "topc_strict",
+    "topc_balanced",
+    "topc_strict_active_first",
+    "topc_balanced_active_first",
+}
+_BALANCED_RESIDENT_POLICIES = {
+    "topc_balanced",
+    "topc_balanced_active_first",
+}
+_ACTIVE_FIRST_RESIDENT_POLICIES = {
+    "topc_strict_active_first",
+    "topc_balanced_active_first",
+}
+
+
 def _require_attr(args: Any, name: str, expected: Any) -> None:
     value = getattr(args, name, None)
     if value != expected:
@@ -378,7 +395,7 @@ def compute_paper_block_sets(
         next_camera_blocks = collect_camera_visible_blocks(storage_adapter, next_camera_ids)
         next_blocks = union_camera_visible_blocks(next_camera_blocks)
 
-    if resident_selection_policy in {"topc", "topc_strict", "topc_balanced"}:
+    if resident_selection_policy in _TOPC_RESIDENT_POLICIES:
         transition = compute_topc_resident_transition(
             current_active_blocks=current_blocks,
             next_active_blocks=next_blocks,
@@ -389,8 +406,11 @@ def compute_paper_block_sets(
             lambda_weight=resident_lambda,
             recency_decay=resident_recency_decay,
             resident_capacity_blocks=resident_capacity_blocks,
-            balanced_camera_seeds=(resident_selection_policy == "topc_balanced"),
+            balanced_camera_seeds=(resident_selection_policy in _BALANCED_RESIDENT_POLICIES),
             balanced_seed_fraction=balanced_seed_fraction,
+            enforce_next_active_coverage=(
+                resident_selection_policy in _ACTIVE_FIRST_RESIDENT_POLICIES
+            ),
         )
     else:
         transition = compute_passthrough_resident_transition(
@@ -639,7 +659,7 @@ def resolve_current_iteration_resident_blocks(
     requested_capacity = int(getattr(args, "paper_resident_capacity_blocks", -1))
     visible_set = set(int(b) for b in visible_block_ids if 0 <= int(b) < num_total_blocks)
 
-    if policy not in {"topc", "topc_strict", "topc_balanced"}:
+    if policy not in _TOPC_RESIDENT_POLICIES:
         return sorted(visible_set), "passthrough_active_set"
 
     expected = [
@@ -659,8 +679,9 @@ def resolve_current_iteration_resident_blocks(
         lambda_weight=float(getattr(args, "paper_resident_lambda", 0.7)),
         recency_decay=float(getattr(args, "paper_resident_recency_decay", 0.95)),
         resident_capacity_blocks=requested_capacity,
-        balanced_camera_seeds=(policy == "topc_balanced"),
+        balanced_camera_seeds=(policy in _BALANCED_RESIDENT_POLICIES),
         balanced_seed_fraction=float(getattr(args, "paper_balanced_seed_fraction", 1.0)),
+        enforce_next_active_coverage=(policy in _ACTIVE_FIRST_RESIDENT_POLICIES),
     )
     return sorted(int(b) for b in transition.next_resident_blocks), "bootstrap_topc_over_k1"
 
@@ -943,7 +964,7 @@ def log_paper_block_sets(
         log_file=log_file,
     )
 
-    if resident_selection_policy in {"topc", "topc_strict", "topc_balanced"}:
+    if resident_selection_policy in _TOPC_RESIDENT_POLICIES:
         coverage_desc = f"{next_active_coverage}/{len(next_blocks)}" if next_blocks else "0/0"
         camera_coverage_desc = (
             f"{next_camera_coverage}/{next_camera_total}"
@@ -1910,7 +1931,7 @@ def load_paper_stage1_working_set(
         r_t_blocks = r_t_blocks_restricted
 
     policy = str(getattr(args, "paper_resident_selection_policy", "passthrough_active_set")).lower()
-    if policy in {"topc", "topc_strict", "topc_balanced"} and r_t_blocks:
+    if policy in _TOPC_RESIDENT_POLICIES and r_t_blocks:
         sync_visible_block_ids = r_t_blocks
         load_source = f"sync_resident_set({r_t_source})"
         if should_log:

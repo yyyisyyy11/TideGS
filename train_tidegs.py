@@ -1079,6 +1079,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     resident_recency_decay=float(args.paper_resident_recency_decay),
                     balanced_seed_fraction=float(args.paper_balanced_seed_fraction),
                     camera_assignment=str(args.tide_camera_assignment),
+                    resident_selection_policy=str(args.paper_resident_selection_policy),
                 )
                 resume_planner_state = _planner_state_from_manifest(
                     None
@@ -1090,7 +1091,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             log_file.write(
                 f"[DISTRIBUTED] rank={distributed_context.rank}/{distributed_context.world_size} "
                 f"local_gpu={distributed_context.local_rank} "
-                f"global_cap={args.paper_resident_capacity_blocks}\n"
+                f"global_cap={args.paper_resident_capacity_blocks} "
+                f"resident_policy={args.paper_resident_selection_policy}\n"
             )
 
         if pure_ssd_resume_manifest is not None:

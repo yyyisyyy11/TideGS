@@ -40,7 +40,7 @@ class TideGaussianModel(BaseGaussianModel):
             self.parameters_buffer = torch.from_numpy(parameters_buffer_array)
             
             if not self.only_for_rendering:
-                parameters_grad_buffer_array = numba.cuda.pinned_array( # TODO: 这里一样，在cpu pinned memory上allocate了sh的grad空间，有必要吗？
+                parameters_grad_buffer_array = numba.cuda.pinned_array( # TODO: This also allocates SH gradient space in pinned CPU memory; verify whether it is necessary.
                     (self.args.prealloc_capacity, 48), dtype=np.float32
                 )
                 self.parameters_grad_buffer = torch.from_numpy(parameters_grad_buffer_array)
@@ -123,7 +123,7 @@ class TideGaussianModel(BaseGaussianModel):
                 )
                 points_gpu = fused_point_cloud.cuda()
                 dist2_gpu = torch.clamp_min(distCUDA2(points_gpu), 0.0000001)
-                scales = torch.log(torch.sqrt(dist2_gpu))[..., None].repeat(1, 3).cpu()  # 立即移回CPU
+                scales = torch.log(torch.sqrt(dist2_gpu))[..., None].repeat(1, 3).cpu()  # Move back to CPU immediately.
                 del points_gpu, dist2_gpu
                 torch.cuda.empty_cache()
                 _log_init_progress("[INIT SCALES] Full distCUDA2 scale initialization complete")
@@ -618,7 +618,7 @@ class TideGaussianModel(BaseGaussianModel):
             ]
 
     def training_setup(self, training_args):
-        self.percent_dense = training_args.percent_dense # for densification，该分裂还是克隆的阈值
+        self.percent_dense = training_args.percent_dense # Threshold for densification splits or clones.
         if getattr(training_args, "disable_auto_densification", False):
             self.xyz_gradient_accum = torch.empty((0, 1), device=self.device)
             self.denom = torch.empty((0, 1), device=self.device)

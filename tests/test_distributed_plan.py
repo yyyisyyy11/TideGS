@@ -381,5 +381,115 @@ class DistributedPlanTest(unittest.TestCase):
         self.assertEqual(transition.next_resident_blocks, [1])
 
 
+    def _two_rank_planner(self, capacity, policy=None):
+        owner = np.asarray([block_id % 2 for block_id in range(16)], dtype=np.int32)
+        kwargs = dict(
+            block_owner=owner,
+            total_points=64,
+            block_size=4,
+            world_size=2,
+            resident_capacity_blocks=capacity,
+            resident_lambda=0.3,
+            resident_recency_decay=0.95,
+            balanced_seed_fraction=0.25,
+            camera_assignment="equal",
+        )
+        if policy is not None:
+            kwargs["resident_selection_policy"] = policy
+        return owner, DistributedBatchPlanner(**kwargs)
+
+    # Batch 1 makes blocks 0-3 recent; batch 2 needs blocks 4-8, which then compete with
+    # the recent-but-stale blocks under the Eq.(5) ranking.
+    _BATCH1 = ([0, 1], {0: [0, 1], 1: [2, 3]})
+    _BATCH2 = ([2, 3], {2: [4, 5, 6], 3: [7, 8]})
+
+    def _run_two_batches(self, planner):
+        planner.plan(iteration=1, epoch=0, camera_ids=self._BATCH1[0], camera_blocks=self._BATCH1[1])
+        return planner.plan(iteration=17, epoch=0, camera_ids=self._BATCH2[0], camera_blocks=self._BATCH2[1])
+
+    def test_active_first_keeps_every_active_block_when_it_fits(self):
+        owner, planner = self._two_rank_planner(6, "topc_balanced_active_first")
+        plan = self._run_two_batches(planner)
+        active = set(plan.global_active_blocks)
+        resident = set(plan.global_resident_blocks)
+        self.assertEqual(active, {4, 5, 6, 7, 8})
+        self.assertTrue(active <= resident)
+        self.assertLessEqual(len(resident), 6)
+        for rank, blocks in enumerate(plan.rank_resident_blocks):
+            self.assertTrue(all(owner[block_id] == rank for block_id in blocks))
+
+    def test_plain_balanced_can_leave_active_blocks_out_where_active_first_does_not(self):
+        _, balanced = self._two_rank_planner(6, "topc_balanced")
+        _, active_first = self._two_rank_planner(6, "topc_balanced_active_first")
+        balanced_plan = self._run_two_batches(balanced)
+        active_first_plan = self._run_two_batches(active_first)
+        active = set(balanced_plan.global_active_blocks)
+        balanced_cover = len(active & set(balanced_plan.global_resident_blocks))
+        active_first_cover = len(active & set(active_first_plan.global_resident_blocks))
+        self.assertEqual(active_first_cover, len(active))
+        self.assertLess(balanced_cover, active_first_cover)
+
+    def test_active_first_selects_only_active_blocks_when_they_exceed_capacity(self):
+        _, planner = self._two_rank_planner(3, "topc_balanced_active_first")
+        plan = self._run_two_batches(planner)
+        resident = set(plan.global_resident_blocks)
+        self.assertEqual(len(resident), 3)
+        self.assertTrue(resident <= set(plan.global_active_blocks))
+
+    def test_default_and_topc_balanced_reproduce_the_previous_planner(self):
+        for policy in (None, "topc_balanced", "topc", "topc_strict"):
+            _, planner = self._two_rank_planner(4, policy)
+            planner.plan(iteration=1, epoch=0, camera_ids=self._BATCH1[0], camera_blocks=self._BATCH1[1])
+            plan = planner.plan(iteration=17, epoch=0, camera_ids=self._BATCH2[0], camera_blocks=self._BATCH2[1])
+            first = compute_topc_resident_transition(
+                current_active_blocks=[],
+                next_active_blocks=[0, 1, 2, 3],
+                current_resident_blocks=[],
+                next_camera_ids=[0, 1],
+                next_camera_blocks={0: [0, 1], 1: [2, 3]},
+                previous_recency_scores={},
+                lambda_weight=0.3,
+                recency_decay=0.95,
+                resident_capacity_blocks=4,
+                balanced_camera_seeds=True,
+                balanced_seed_fraction=0.25,
+            )
+            expected = compute_topc_resident_transition(
+                current_active_blocks=[0, 1, 2, 3],
+                next_active_blocks=[4, 5, 6, 7, 8],
+                current_resident_blocks=first.next_resident_blocks,
+                next_camera_ids=[2, 3],
+                next_camera_blocks={2: [4, 5, 6], 3: [7, 8]},
+                previous_recency_scores=first.updated_recency_scores,
+                lambda_weight=0.3,
+                recency_decay=0.95,
+                resident_capacity_blocks=4,
+                balanced_camera_seeds=True,
+                balanced_seed_fraction=0.25,
+            )
+            self.assertEqual(plan.global_resident_blocks, expected.next_resident_blocks, msg=str(policy))
+
+    def test_strict_active_first_disables_camera_seeds(self):
+        _, planner = self._two_rank_planner(6, "topc_strict_active_first")
+        self.assertFalse(planner.balanced_camera_seeds)
+        self.assertTrue(planner.enforce_next_active_coverage)
+        plan = self._run_two_batches(planner)
+        self.assertTrue(set(plan.global_active_blocks) <= set(plan.global_resident_blocks))
+
+    def test_planner_rejects_unknown_or_non_topc_policy(self):
+        for policy in ("passthrough_active_set", "balanced", ""):
+            with self.assertRaises(ValueError):
+                self._two_rank_planner(4, policy)
+
+    def test_active_first_survives_preview_and_state_round_trip(self):
+        _, planner = self._two_rank_planner(6, "topc_balanced_active_first")
+        planner.plan(iteration=1, epoch=0, camera_ids=self._BATCH1[0], camera_blocks=self._BATCH1[1])
+        preview, predicted = planner.preview(
+            iteration=17, epoch=0, camera_ids=self._BATCH2[0], camera_blocks=self._BATCH2[1]
+        )
+        self.assertTrue(set(preview.global_active_blocks) <= set(preview.global_resident_blocks))
+        planner.restore_state(predicted)
+        self.assertEqual(sorted(planner.snapshot_state().resident), preview.global_resident_blocks)
+
 if __name__ == "__main__":
     unittest.main()

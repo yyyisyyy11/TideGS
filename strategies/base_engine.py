@@ -26,16 +26,16 @@ def debug_visualize_scene(xyz_gpu, batched_cameras, output_file="debug_scene.htm
 
     print(f"[DEBUG] Generating 3D visualization to {output_file}...")
     
-    # 1. 提取高斯球点云。先在 GPU 上做轻量采样，再搬到 CPU，避免把整个 working set 拖回主机。
+    # 1. Extract Gaussian points. Sample lightly on the GPU before moving data to the CPU to avoid copying the full working set.
     sampled_xyz = xyz_gpu
     if sampled_xyz.shape[0] > 10000:
         stride = max(1, sampled_xyz.shape[0] // 10000)
         sampled_xyz = sampled_xyz[::stride][:10000]
     points = sampled_xyz.detach().cpu().numpy()
     
-    # 2. 提取相机位置和朝向
+    # 2. Extract camera positions and orientations.
     cam_centers = []
-    cam_directions = [] # 视线方向 (Look-at)
+    cam_directions = [] # View directions (look-at).
     cam_ids = []
     
     for i, cam in enumerate(batched_cameras):
@@ -221,11 +221,11 @@ def _maybe_log_projection_contract_debug(
 
 def calculate_filters(batched_cameras, xyz_gpu, opacity_gpu, scaling_gpu, rotation_gpu):
     """
-    对于给定的 batch 内的相机，一次性计算出它们分别能看到哪些高斯球
-    得到的filter的信息所有被用来决定：
-    1. 哪些数据需要从 CPU 加载到 GPU；
-    2. 哪些数据需要Retention；
-    3. 哪些梯度需要回传。
+    For the cameras in a batch, compute which Gaussians each camera can see in one pass.
+    The resulting filter information determines:
+    1. Which data must be loaded from CPU to GPU.
+    2. Which data should be retained.
+    3. Which gradients should be propagated back.
     """
     del opacity_gpu  # Opacity is not used by the packed projection kernel but kept for API compatibility.
 
@@ -240,14 +240,14 @@ def calculate_filters(batched_cameras, xyz_gpu, opacity_gpu, scaling_gpu, rotati
         frustum_scene_debug_enabled = bool(getattr(args, "debug_frustum", False))
         projection_verbose_enabled = _projection_verbose_enabled(args)
         if frustum_scene_debug_enabled and not hasattr(calculate_filters, "debug_frustum_culling"):
-            print("\n[DEBUG] 🚀 首次运行，正在生成 3D 可视化 scene.html ...")
+            print("\n[DEBUG] 🚀 First run; generating the 3D visualization scene.html ...")
             debug_output_dir = args.model_path or args.log_folder or "."
             debug_scene_path = os.path.join(debug_output_dir, "debug_scene.html")
             try:
                 os.makedirs(debug_output_dir, exist_ok=True)
                 debug_visualize_scene(xyz_gpu, batched_cameras, output_file=debug_scene_path)
             except Exception as e:
-                print(f"[DEBUG] 生成 3D 可视化 scene.html 失败: {e}")
+                print(f"[DEBUG] Failed to generate the 3D visualization scene.html: {e}")
 
             viewmat = batched_viewmats[0]
             p_world_centroid = xyz_gpu.mean(dim=0)
@@ -281,16 +281,16 @@ def calculate_filters(batched_cameras, xyz_gpu, opacity_gpu, scaling_gpu, rotati
             print(f"  Projection on Down Axis  (Y):   {dot_y:.4f}")
             print(f"  Projection on Forward Axis (Z): {dot_z:.4f}")
             print("-" * 30)
-            print("  [DEBUG] 说明: 这里检查的是整个 working set 的质心，而不是当前相机确认可见的点。")
-            print("  [DEBUG] 如果质心落在画面外，或更靠近 X/Y 轴，这并不等价于相机姿态错误。")
+            print("  [DEBUG] Note: this checks the centroid of the entire working set, not points confirmed visible to the current camera.")
+            print("  [DEBUG] A centroid outside the image or close to the X/Y axes does not imply an incorrect camera pose.")
 
             z_val = p_cam[2].item()
             if z_val < 0:
-                print(f"  [DEBUG] Centroid camera-space Z = {z_val:.4f} < 0，说明 working-set 质心在当前相机后方。")
+                print(f"  [DEBUG] Centroid camera-space Z = {z_val:.4f} < 0; the working-set centroid is behind the current camera.")
             elif z_val < 0.2:
-                print(f"  [DEBUG] Centroid camera-space Z = {z_val:.4f}，质心离当前相机很近。")
+                print(f"  [DEBUG] Centroid camera-space Z = {z_val:.4f}; the centroid is very close to the current camera.")
             else:
-                print(f"  [DEBUG] Centroid camera-space Z = {z_val:.4f}。")
+                print(f"  [DEBUG] Centroid camera-space Z = {z_val:.4f}.")
 
             if z_val != 0:
                 fx = batched_Ks[0, 0, 0].item()
@@ -303,7 +303,7 @@ def calculate_filters(batched_cameras, xyz_gpu, opacity_gpu, scaling_gpu, rotati
                     f"  Projected centroid pixel: ({u:.2f}, {v:.2f}) / "
                     f"({int(utils.get_img_width())}, {int(utils.get_img_height())})"
                 )
-                print("  [DEBUG] 如果这个投影越界，只能说明 working-set 质心不在该相机画面中，不能单独用于判断相机朝向。")
+                print("  [DEBUG] An out-of-bounds projection only means the working-set centroid is outside this camera view; it cannot by itself determine camera orientation.")
 
             calculate_filters.debug_frustum_culling = True
 

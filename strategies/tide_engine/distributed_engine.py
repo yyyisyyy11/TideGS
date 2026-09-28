@@ -1401,6 +1401,9 @@ def train_distributed_tide_batch(
         "local_cameras": len(batched_cameras),
         "global_active_blocks": len(plan.global_active_blocks),
         "global_resident_blocks": len(plan.global_resident_blocks),
+        "global_active_resident_blocks": len(
+            set(plan.global_active_blocks).intersection(plan.global_resident_blocks)
+        ),
         "predicted_stream_in_blocks": int(plan.predicted_stream_in_blocks),
         "prediction_missing_blocks": int(plan.prediction_missing_blocks),
         "prediction_extra_blocks": int(plan.prediction_extra_blocks),

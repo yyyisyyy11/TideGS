@@ -259,7 +259,7 @@ def compute_block_bounding_radius(block_size: int, point_extent: float = 1.0) ->
 
 
 # ==============================================================================
-# 1. CPU 版本 (已优化向量化，比原版 for 循环快 100 倍)
+# 1. CPU version (vectorized and about 100x faster than the original loop)
 # ==============================================================================
 class FrustumCuller:
     """
@@ -280,8 +280,8 @@ class FrustumCuller:
         self.verbose = bool(verbose)
         self._bounds_lock = threading.RLock()
         
-        # 预计算中心点 (N, 3)，避免每帧重复计算
-        # 利用 Numpy 广播机制
+        # Precompute centers (N, 3) to avoid repeating this work for every frame.
+        # Use NumPy broadcasting.
         self.block_centers = (self.block_bounds[:, :3] + self.block_bounds[:, 3:]) / 2.0
         
         # ================================================================
@@ -467,7 +467,7 @@ class FrustumCuller:
             # ================================================================
             # LEGACY: Approximate Cone + Distance Culling
             # ================================================================
-            # 1. 设置阈值
+            # 1. Set the threshold.
             if self.scene_radius is not None:
                 max_view_distance = min(self.scene_radius * 0.5, 100.0)
             else:
@@ -475,23 +475,23 @@ class FrustumCuller:
             
             threshold_dist = max_view_distance * margin
 
-            # 2. 获取相机方向 (-Z)
+            # 2. Get the camera direction (-Z).
             camera_z_axis = view_matrix[2, :3]
             camera_forward = camera_z_axis
             camera_forward = camera_forward / (np.linalg.norm(camera_forward) + 1e-8)
 
             # -----------------------------------------------------------
-            # Vectorized Calculation (不再使用 for 循环)
+            # Vectorized calculation (no explicit loop).
             # -----------------------------------------------------------
             
-            # A. 计算向量 (N, 3)
+            # A. Compute vectors (N, 3).
             to_blocks = self.block_centers - camera_position
 
-            # B. 计算距离 (N,)
+            # B. Compute distances (N,).
             distances = np.linalg.norm(to_blocks, axis=1)
 
-            # C. 计算点积 (N,)
-            # 避免除以零
+            # C. Compute dot products (N,).
+            # Avoid division by zero.
             with np.errstate(divide='ignore', invalid='ignore'):
                 to_blocks_norm = to_blocks / (distances[:, np.newaxis] + 1e-8)
             
@@ -501,11 +501,11 @@ class FrustumCuller:
             # Logic Masking
             # -----------------------------------------------------------
             
-            # 距离剔除 & 角度剔除
-            # dots > -0.3 意味着 FOV 大约 107度 (非常保守)
+            # Distance and angle culling.
+            # dots > -0.3 corresponds to an approximately 107-degree FOV (very conservative).
             mask = (distances <= threshold_dist) & ((dots > -0.3) | (distances < 1e-6))
 
-            # 获取 True 的索引
+            # Get the indices where the mask is true.
             visible_blocks = np.where(mask)[0].tolist()
 
             return visible_blocks
@@ -515,17 +515,17 @@ class FrustumCuller:
         if not visible_blocks:
             return []
             
-        # 向量化排序
-        # 1. 提取可见块的中心点
+        # Vectorized sorting.
+        # 1. Extract centers of visible blocks.
         with self._bounds_lock:
             centers = self.block_centers[visible_blocks].copy()
         
-        # 2. 计算距离平方 (比开根号快，排序结果一样)
+        # 2. Compute squared distances (faster than square roots with the same ordering).
         diff = centers - camera_position
         dist_sq = np.sum(diff**2, axis=1)
         
-        # 3. 获取排序后的索引
-        # argsort 返回的是局部索引，需要映射回 visible_blocks
+        # 3. Get the sorted indices.
+        # argsort returns local indices that must be mapped back to visible_blocks.
         sorted_local_indices = np.argsort(dist_sq)
         
         return [visible_blocks[i] for i in sorted_local_indices]
@@ -570,11 +570,11 @@ def compute_morton_code(position: np.ndarray, bbox_min: np.ndarray, bbox_max: np
 def compute_block_bounds(xyz, block_size: int) -> np.ndarray:
     """
     Compute bounding boxes for each block.
-    兼容 Tensor (GPU/CPU) 和 Numpy Array。
+    Supports tensors (GPU/CPU) and NumPy arrays.
     """
-    # [FIX] 统一转换为 Numpy 数组
-    # 如果是 Tensor，就 .detach().cpu().numpy()
-    # 如果已经是 Numpy，就直接用
+    # [FIX] Convert all inputs to a NumPy array.
+    # For a tensor, use .detach().cpu().numpy().
+    # For a NumPy array, use it directly.
     if isinstance(xyz, torch.Tensor):
         if xyz.is_cuda:
             xyz_cpu = xyz.detach().cpu().numpy()
@@ -594,7 +594,7 @@ def compute_block_bounds(xyz, block_size: int) -> np.ndarray:
         start_idx = block_id * block_size
         end_idx = min(start_idx + block_size, total_points)
 
-        # [FIX] 直接切片 Numpy 数组，不再调用 .cpu()
+        # [FIX] Slice the NumPy array directly; do not call .cpu().
         block_xyz = xyz_cpu[start_idx:end_idx]
 
         bounds[block_id, :3] = block_xyz.min(axis=0)  # min
@@ -606,17 +606,17 @@ def get_morton_code_torch(xyz: torch.Tensor,
                           global_min: Optional[torch.Tensor] = None,
                           global_max: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
-    [GPU Optimized] 计算 3D Morton Code
+    [GPU Optimized] Compute a 3D Morton code.
     
     Args:
-        xyz: 点云坐标 (N, 3)
-        global_min: 全局最小值 (3,), 用于分块计算时保持一致的归一化
-        global_max: 全局最大值 (3,), 用于分块计算时保持一致的归一化
+        xyz: Point-cloud coordinates (N, 3).
+        global_min: Global minimum (3,), used for consistent normalization across blocks.
+        global_max: Global maximum (3,), used for consistent normalization across blocks.
     
     Returns:
         Morton codes (N,)
     """
-    # 1. 归一化到 [0, 1]
+    # 1. Normalize to [0, 1].
     if global_min is None or global_max is None:
         _min = xyz.min(dim=0).values
         _max = xyz.max(dim=0).values
@@ -626,10 +626,10 @@ def get_morton_code_torch(xyz: torch.Tensor,
     
     normalized = (xyz - _min) / (_max - _min + 1e-8)
     
-    # 2. 量化到 10-bit (0-1023)
+    # 2. Quantize to 10 bits (0-1023).
     quantized = (normalized * 1023).long()
     
-    # 3. 位交织 (Bit Interleaving)
+    # 3. Bit interleaving.
     def spread_bits(x):
         x = (x | (x << 16)) & 0x030000FF
         x = (x | (x <<  8)) & 0x0300F00F
@@ -649,27 +649,27 @@ def get_hierarchical_morton_code_torch(xyz: torch.Tensor,
                                        global_max: Optional[torch.Tensor] = None,
                                        grid_resolution: int = 32) -> torch.Tensor:
     """
-    [IMPROVED] 分层 Morton Code - 解决稀疏场景的空间跳跃问题
+    [IMPROVED] Hierarchical Morton code to reduce spatial jumps in sparse scenes.
     
-    策略:
-    1. 将场景划分为粗粒度网格 (如 32x32x32)
-    2. 先按网格的 Morton Code 排序 (粗排序)
-    3. 在每个网格内部再按精细 Morton Code 排序 (细排序)
+    Strategy:
+    1. Divide the scene into a coarse grid (for example, 32x32x32).
+    2. Sort by the grid Morton code (coarse ordering).
+    3. Sort within each grid cell by the fine Morton code (fine ordering).
     
-    效果:
-    - 避免跨越大片空白区域
-    - 同一个 block 的点在空间上更加聚集
+    Effect:
+    - Avoids crossing large empty regions.
+    - Keeps points in the same block more spatially clustered.
     
     Args:
-        xyz: 点云坐标 (N, 3)
-        global_min: 全局最小值 (3,), 用于分块计算时保持一致的归一化
-        global_max: 全局最大值 (3,), 用于分块计算时保持一致的归一化
-        grid_resolution: 粗网格分辨率 (默认 32, 即将场景分成 32x32x32 个格子)
+        xyz: Point-cloud coordinates (N, 3).
+        global_min: Global minimum (3,), used for consistent normalization across blocks.
+        global_max: Global maximum (3,), used for consistent normalization across blocks.
+        grid_resolution: Coarse-grid resolution (default 32, creating 32x32x32 cells).
     
     Returns:
-        分层 Morton Code (N,)
+        Hierarchical Morton codes (N,).
     """
-    # 1. 归一化到 [0, 1]
+    # 1. Normalize to [0, 1].
     if global_min is None or global_max is None:
         _min = xyz.min(dim=0).values
         _max = xyz.max(dim=0).values
@@ -679,45 +679,45 @@ def get_hierarchical_morton_code_torch(xyz: torch.Tensor,
     
     normalized = (xyz - _min) / (_max - _min + 1e-8)
     
-    # 2. 粗网格索引 (grid_resolution bit)
+    # 2. Coarse-grid indices (grid_resolution bits).
     grid_quantized = (normalized * (grid_resolution - 1)).long().clamp(0, grid_resolution - 1)
     
-    # 3. 细网格内的归一化坐标 (10 bit)
+    # 3. Normalized coordinates within each fine grid (10 bits).
     grid_size = 1.0 / grid_resolution
     grid_min = grid_quantized.float() * grid_size
     fine_normalized = ((normalized - grid_min) / grid_size).clamp(0, 1)
     fine_quantized = (fine_normalized * 1023).long()
     
-    # 4. 位交织函数
-    def spread_bits_coarse(x, bits=5):  # 32 = 2^5, 需要 5 bits
-        """粗网格 Morton (5 bits per dimension)"""
-        x = x & 0x1F  # 保留 5 bits
+    # 4. Bit-interleaving functions.
+    def spread_bits_coarse(x, bits=5):  # 32 = 2^5, requiring 5 bits.
+        """Coarse-grid Morton code (5 bits per dimension)."""
+        x = x & 0x1F  # Keep 5 bits.
         x = (x | (x << 8)) & 0x100F
         x = (x | (x << 4)) & 0x10C3
         x = (x | (x << 2)) & 0x1249
         return x
     
-    def spread_bits_fine(x):  # 1024 = 2^10, 需要 10 bits
-        """细网格 Morton (10 bits per dimension)"""
+    def spread_bits_fine(x):  # 1024 = 2^10, requiring 10 bits.
+        """Fine-grid Morton code (10 bits per dimension)."""
         x = (x | (x << 16)) & 0x030000FF
         x = (x | (x <<  8)) & 0x0300F00F
         x = (x | (x <<  4)) & 0x030C30C3
         x = (x | (x <<  2)) & 0x09249249
         return x
     
-    # 5. 计算粗网格 Morton Code (高位)
+    # 5. Compute the coarse-grid Morton code (high bits).
     xx_coarse = spread_bits_coarse(grid_quantized[:, 0])
     yy_coarse = spread_bits_coarse(grid_quantized[:, 1])
     zz_coarse = spread_bits_coarse(grid_quantized[:, 2])
     coarse_morton = xx_coarse | (yy_coarse << 1) | (zz_coarse << 2)
     
-    # 6. 计算细网格 Morton Code (低位)
+    # 6. Compute the fine-grid Morton code (low bits).
     xx_fine = spread_bits_fine(fine_quantized[:, 0])
     yy_fine = spread_bits_fine(fine_quantized[:, 1])
     zz_fine = spread_bits_fine(fine_quantized[:, 2])
     fine_morton = xx_fine | (yy_fine << 1) | (zz_fine << 2)
     
-    # 7. 组合: 高位 = 粗网格, 低位 = 细网格
+    # 7. Combine: high bits = coarse grid, low bits = fine grid.
     # coarse_morton: 15 bits (5*3), fine_morton: 30 bits (10*3)
     hierarchical_morton = (coarse_morton.long() << 30) | fine_morton.long()
     
@@ -725,18 +725,18 @@ def get_hierarchical_morton_code_torch(xyz: torch.Tensor,
 
 def compute_block_bounds_cpu(xyz_cpu: np.ndarray, block_size: int) -> np.ndarray:
     """
-    [CPU Optimized] 基于 CPU 缓存计算 Block Bounds，零 PCIe 开销
+    [CPU Optimized] Compute block bounds from the CPU cache with zero PCIe overhead.
     """
     total_points = xyz_cpu.shape[0]
     num_blocks = (total_points + block_size - 1) // block_size
     bounds = np.zeros((num_blocks, 6), dtype=np.float32)
 
-    # 这里的 xyz_cpu 已经是 Morton 排序过的，所以切片后的点在空间上是紧凑的
+    # xyz_cpu is already Morton-sorted, so each slice is spatially compact.
     for block_id in range(num_blocks):
         start_idx = block_id * block_size
         end_idx = min(start_idx + block_size, total_points)
 
-        # 纯内存操作，极快
+        # Pure memory operation; very fast.
         block_data = xyz_cpu[start_idx:end_idx]
         
         bounds[block_id, :3] = block_data.min(axis=0)

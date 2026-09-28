@@ -101,7 +101,7 @@ class Scene:
 
         utils.log_cpu_memory_usage("before decoding images")
 
-        self.cameras_extent = scene_info.nerf_normalization["radius"] # 是一个全局缩放系数 (Scale Factor), 1)动态缩放空间位置的学习率 2)作为高斯球分裂的尺度参考, 使得能够适应各种尺度的场景
+        self.cameras_extent = scene_info.nerf_normalization["radius"] # Global scale factor used for position learning-rate scaling and Gaussian split-size reference.
         self.scene_info = scene_info  # For torch dataloader, save scene_info
 
         # Set image size to global varaible. In case not all image sizes are identical, choose the minimum.

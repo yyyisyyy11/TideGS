@@ -50,9 +50,9 @@ class TieredCacheManager:
             eviction_threshold: RAM usage ratio to trigger eviction (0-1)
         """
 
-        # 保存底层存储引用
-        # 当 RAM 缓存 Miss时，需要调用它从SSD 中读取
-        # 当 RAM 缓存中有脏数据需要罗盘时，需要调用它写入 SSD
+        # Keep a reference to the backing storage.
+        # RAM-cache misses read from SSD through this object.
+        # Dirty RAM-cache data is written to SSD through this object.
         self.storage = storage_manager
         self.max_ram_bytes = int(max_ram_gb * 1024 * 1024 * 1024)
         self.block_size = block_size
@@ -65,30 +65,30 @@ class TieredCacheManager:
         self.bytes_per_block = block_size * point_dim * 4  # float32
 
         # Cache storage
-        # 核心缓存结构
-        # 用OrderedDict 来实现 Least Recently Used （LRU）
-        # - 最新访问的移动到末尾
-        # - 内存满时，弹出最前面的（最久未使用的）
+        # Core cache structure.
+        # OrderedDict implements Least Recently Used (LRU).
+        # - Move the most recently accessed entry to the end.
+        # - Evict the first entry when the cache is full.
         self.cache_data: OrderedDict[int, torch.Tensor] = OrderedDict()
         self._cache_entry_bytes: Dict[int, int] = {}
         self._resident_ram_bytes = 0
-        # 记录脏块的id，如果id在这个set中，那么说明它在内存中的版本比SSD中的版本更新
-        # 驱逐前必须先flush，写回SSD
+        # Track dirty block IDs. An entry here is newer in RAM than on SSD.
+        # Dirty blocks must be flushed to SSD before eviction.
         self.dirty_set: Set[int] = set()
         self.block_versions: Dict[int, int] = {}
         self.block_origin_iterations: Dict[int, int] = {}
         self.cache_lock = threading.RLock()
         
         # [FIX] Flushing buffer to prevent race condition
-        # 正在写入 SSD 的 dirty blocks 会暂存在这里，防止 prefetch 读到旧数据
-        # Key: block_id, Value: (tensor, timestamp)
+        # Keep dirty blocks being written to SSD here so prefetch cannot read stale data.
+        # Key: block_id, value: (tensor, timestamp).
         self.flushing_buffer: Dict[int, Tuple[torch.Tensor, float, int]] = {}
         self.flushing_lock = threading.RLock()
 
         # Async sync queue: (block_id, gpu_tensor, cuda_stream)
-        # 生产者消费者模式，用于异步将GPU上的更新同步回RAM
-        # 队列元素: (block_id, gpu_tensor, cuda_stream)
-        # maxsize = 100, 限制队列长度，防止GPU跑太快导致内存堆积
+        # Producer-consumer queue for asynchronously syncing GPU updates back to RAM.
+        # Queue elements: (block_id, gpu_tensor, cuda_stream).
+        # maxsize=100 prevents unbounded memory growth when the GPU runs ahead.
         self.sync_queue: Queue = Queue(maxsize=100)
         self.sync_thread = None
         self.sync_running = False
@@ -111,7 +111,7 @@ class TieredCacheManager:
         self.inflight_reads: Dict[int, threading.Event] = {}
         self.inflight_lock = threading.RLock()
 
-        # Prefetch tracking， 防止重复预取同一个block
+        # Prefetch tracking prevents duplicate requests for the same block.
         self.prefetch_history: Set[int] = set()
         self._foreground_iteration: Optional[int] = None
         self.timeline_enabled = False
@@ -238,9 +238,9 @@ class TieredCacheManager:
 
     def _start_sync_thread(self):
         """Start background thread for async GPU->RAM sync."""
-        # 启动后台线程，用于异步将 GPU 数据 同步到 CPU RAM
+        # Start a background thread for asynchronous GPU-to-CPU synchronization.
         self.sync_running = True
-        self.sync_thread = threading.Thread(target=self._sync_worker, daemon=True) # 这里创建了线程，指定目标函数，并且daemon=True表示线程会随着主程序退出而退出
+        self.sync_thread = threading.Thread(target=self._sync_worker, daemon=True) # The daemon thread exits with the main process.
         self.sync_thread.start()
         self._log("[TieredCache] Async sync thread started")
 
@@ -953,8 +953,8 @@ class TieredCacheManager:
         """Background worker for async D2H transfers."""
         while self.sync_running:
             try:
-                # Get sync request (timeout to allow shutdown), 生产者/主线程是sync_from_gpu
-                item = self.sync_queue.get(timeout=0.1) # 这是一个阻塞操作，如果队列空，线程会在这里暂停 (挂起)，不消耗cpu，一旦sync_from_gpu中有数据，线程会被唤醒，继续执行. 每0.1秒检查一次sync_running标志，确保能shutdown
+                # Get a sync request (the timeout allows shutdown); sync_from_gpu is the producer.
+                item = self.sync_queue.get(timeout=0.1) # Block without consuming CPU while the queue is empty, then check sync_running every 0.1 seconds.
                 block_id, gpu_tensor, cuda_stream = item
 
                 # Wait for CUDA stream to finish
@@ -968,7 +968,7 @@ class TieredCacheManager:
                 with self.cache_lock:
                     self._store_cache_block_locked(block_id, cpu_tensor)
                     self.block_versions[block_id] = self.block_versions.get(block_id, 0) + 1
-                    self.dirty_set.add(block_id) # 标记为脏，也就是修改过，未来需要写回SSD
+                    self.dirty_set.add(block_id) # Mark as dirty so it is written back to SSD.
 
                 self.stats['syncs'] += 1
 
@@ -980,7 +980,7 @@ class TieredCacheManager:
             except Exception as e:
                 print(f"[TieredCache] Sync worker error: {e}")
 
-    def sync_from_gpu( # TODO: 这段代码认为 Adam 在GPU上进行，GPU更新完了，把结果传回CPU，但是我们的想法是：如果是 CPU 优化，流程会是：GPU 算梯度 -> 梯度传回 CPU -> CPU 做 Adam 更新
+    def sync_from_gpu( # TODO: This assumes Adam runs on the GPU and updated values return to the CPU; a CPU optimizer would send gradients to the CPU and update them there.
         self,
         block_ids: List[int],
         gpu_tensors: List[torch.Tensor],

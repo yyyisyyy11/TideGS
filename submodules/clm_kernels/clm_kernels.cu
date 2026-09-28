@@ -3,22 +3,22 @@
 #include <cuda_runtime_api.h>
 
 
-// CUDA kernel: 从 cpu 内存并行地收集待定的球谐函数稀疏，并将它们传输并重新排列到 GPU 显存中
-// Thread: 将每个球谐函数的系数 48 个 float 视为一个单位
+// CUDA kernel: gather selected spherical-harmonic coefficients from CPU memory in parallel, then transfer and reorder them in GPU memory.
+// Thread: treat the 48 float coefficients of each spherical-harmonic feature as one unit.
 __global__ void transfer_shs_cpu2gpu_kernel_stream(
     float *d_shs,
     const float *h_shs,
-    const int64_t *rank2id, // rank2id[i]=1024 表示第i个被选中的点在原始数组中的真实id是1024
+    const int64_t *rank2id, // rank2id[i]=1024 means selected point i has original-array ID 1024.
     int64_t num_select
 ) {
     int64_t stride = gridDim.x * blockDim.x;
     int64_t total_elements = num_select * 48;
 
     for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < total_elements; i += stride) {
-        int64_t row = i / 48; // 计算当前的float 属于哪一个高斯点，e.g., i=48, i=95 -> row=1
-        int col = i % 48; // 当前的 float 是高斯点内部的的第几个参数 col=0~47
+        int64_t row = i / 48; // Determine which Gaussian owns this float; e.g. i=48 or i=95 -> row=1.
+        int col = i % 48; // Parameter offset within the Gaussian, col=0~47.
 
-        int64_t offset_srce = rank2id[row] * 48 + col; // 从cpu内存中取对应高斯球的第col个参数(原始数组的真实id+col)，放到gpu内存的第i个位置
+        int64_t offset_srce = rank2id[row] * 48 + col; // Read parameter col of the source Gaussian and place it at GPU offset i.
         int64_t offset_dest = i;
 
         d_shs[offset_dest] = h_shs[offset_srce];
@@ -28,17 +28,17 @@ __global__ void transfer_shs_cpu2gpu_kernel_stream(
 
 // cuda kernel launcher function
 void SendSHS2GpuStreamCUDA(
-    torch::Tensor& d_parameters, // GPU 上的 tensor
-    torch::Tensor& h_parameters, // CPU 上的 tensor
-    torch::Tensor& mask_indices, // CPU 上的映射表 tensor，rank2id
+    torch::Tensor& d_parameters, // GPU tensor.
+    torch::Tensor& h_parameters, // CPU tensor.
+    torch::Tensor& mask_indices, // CPU mapping tensor, equivalent to rank2id.
     int grid_size,
     int block_size)
 {
     int64_t N = h_parameters.size(0);
-    int64_t num_select = mask_indices.size(0); // 这一批次搬运了多少个球
+    int64_t num_select = mask_indices.size(0); // Number of Gaussians transferred in this batch.
 
-    // 获取当前的CUDA 流，由于pytorch 是异步执行的，所以需要获取当前的pytorch正在使用的stream, 把这个kernel放到同一个流里
-    // 否则可能会发生数据竞争，或者不得不强制 cpu 等待 gpu
+    // Use PyTorch's current CUDA stream because PyTorch launches work asynchronously.
+    // Using the same stream avoids data races and unnecessary CPU/GPU synchronization.
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
     // const int grid_size = 32;
@@ -46,7 +46,7 @@ void SendSHS2GpuStreamCUDA(
     // const int grid_size = 8;
     // const int block_size = 256;
     transfer_shs_cpu2gpu_kernel_stream<<<grid_size, block_size, 0, stream>>>(
-        d_parameters.contiguous().data<float>(), // .data<float>() 获取该连续内存块的首地址指针
+        d_parameters.contiguous().data<float>(), // .data<float>() returns the pointer to the contiguous buffer.
         h_parameters.contiguous().data<float>(),
         mask_indices.contiguous().data<int64_t>(),
         num_select
@@ -56,10 +56,10 @@ void SendSHS2GpuStreamCUDA(
 __global__ void transfer_H_shs_cpu2gpu_kernel_stream(
     float *d_shs,
     const float *h_shs,
-    const int *host_indices, // 记录了要从 CPU 的哪个高斯球读取数据
-    const int *param_indices_from_host, // 目前索引，记录了要把数据写到 GPU 的哪个高斯球
-    int num_select_from_host // 本次一共搬运了多少个高斯球
-) { // cpu上进行adam优化后的高斯球又被gpu需要了，应该是在pipelining microbatch的过程
+    const int *host_indices, // Source Gaussian IDs in CPU memory.
+    const int *param_indices_from_host, // Destination Gaussian slots in GPU memory.
+    int num_select_from_host // Number of Gaussians transferred in this operation.
+) { // GPU requests Gaussians updated by CPU Adam during microbatch pipelining.
     int stride = gridDim.x * blockDim.x;
     int total_elements = num_select_from_host * 48;
 
@@ -67,7 +67,7 @@ __global__ void transfer_H_shs_cpu2gpu_kernel_stream(
         int row = i / 48;
         int col = i % 48;
 
-        // size_t 是无符号整数类型，全称是 "size type", 是动态的，在32位系统上是4字节，在64位系统上是8字节
+        // size_t is an unsigned size type; it is 4 bytes on 32-bit systems and 8 bytes on 64-bit systems.
         size_t offset_srce = static_cast<size_t>(host_indices[row]) * 48 + col;
         size_t offset_dest = static_cast<size_t>(param_indices_from_host[row]) * 48 + col;
 
@@ -115,7 +115,7 @@ void SendSHS2GpuStreamRetentionCUDA(
 
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
-    // inter-micro batch 中，哪些高斯球是完全新出现的，需要从 cpu 上搬运过去
+    // Gaussians that are new in this inter-microbatch must be transferred from the CPU.
     transfer_H_shs_cpu2gpu_kernel_stream<<<grid_size_H, block_size_H, 0, stream>>>(
         d_parameters.contiguous().data<float>(),
         h_parameters.contiguous().data<float>(),
@@ -124,7 +124,7 @@ void SendSHS2GpuStreamRetentionCUDA(
         num_select_from_host
     );
 
-    // inter-micro batch 中，哪些高斯球是从 retention buffer 里搬运过去的
+    // Gaussians retained across inter-microbatches are transferred from the retention buffer.
     transfer_D_shs_cpu2gpu_kernel_stream<<<grid_size_D, block_size_D, 0, stream>>>(
         d_parameters.contiguous().data<float>(),
         r_parameters.contiguous().data<float>(),
@@ -277,11 +277,11 @@ void SendSHS2CpuGradBufferStreamRetentionCUDA(
 }
 
 __global__ void set_signal_kernel(
-    int* signal_tensor, // 用于存放信号的数组指针
+    int* signal_tensor, // Pointer to the signal array.
     int microbatch_idx,
     int signal)
 {
-    __threadfence_system(); // 先写数据，后写标志，确保数据可见性
+    __threadfence_system(); // Write data before the flag to ensure visibility.
     signal_tensor[microbatch_idx] = signal;
     __threadfence_system();
 }

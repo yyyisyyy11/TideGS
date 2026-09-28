@@ -621,21 +621,21 @@ def main() -> None:
         handle.write("\n")
 
     report_lines = [
-        "# TideGS TSP场景局部性实验",
+        "# TideGS TSP Scene Locality Experiment",
         "",
-        "## 结论",
+        "## Conclusion",
         "",
     ]
-    for mode, label in (("default", "默认SH"), ("forced_sh3", "强制SH3")):
-        conclusion = "存在有实际意义的场景局部性" if locality_by_mode[mode] else "在8个采样片段内保持稳定"
-        report_lines.append(f"- **{label}：{conclusion}。**")
-    report_lines.extend(["", "## 跨片段汇总", ""])
-    for mode, label in (("default", "默认SH"), ("forced_sh3", "强制SH3")):
+    for mode, label in (("default", "Default SH"), ("forced_sh3", "Forced SH3")):
+        conclusion = "meaningful scene locality is present" if locality_by_mode[mode] else "stable across the eight sampled windows"
+        report_lines.append(f"- **{label}: {conclusion}.**")
+    report_lines.extend(["", "## Cross-window Summary", ""])
+    for mode, label in (("default", "Default SH"), ("forced_sh3", "Forced SH3")):
         report_lines.extend(
             [
                 f"### {label}",
                 "",
-                "| 指标 | 均值±标准差 | 最小–最大 | 极差 | 局部性 |",
+                "| Metric | Mean ± Std. Dev. | Min–Max | Range | Locality |",
                 "|---|---:|---:|---:|---|",
             ]
         )
@@ -646,14 +646,14 @@ def main() -> None:
                 f"| {row['label']} | {row['mean_pct']:.2f}% ± {row['sample_std_pct']:.2f} | "
                 f"{row['min_pct']:.2f}%–{row['max_pct']:.2f}% | "
                 f"{row['range_pp']:.2f} pp | "
-                f"{'**是**' if row['meaningful_locality'] else '否'} |"
+                f"{'**Yes**' if row['meaningful_locality'] else 'No'} |"
             )
         report_lines.append("")
     report_lines.extend(
         [
-            "## 逐片段结果",
+            "## Per-window Results",
             "",
-            "| SH | Offset | Cull / N | 全零行 / Cull | Exact-zero / 59d | abs(g)>1e-8 / 59d |",
+            "| SH | Offset | Cull / N | All-zero rows / Cull | Exact-zero / 59d | abs(g)>1e-8 / 59d |",
             "|---|---:|---:|---:|---:|---:|",
         ]
     )
@@ -669,9 +669,9 @@ def main() -> None:
     report_lines.extend(
         [
             "",
-            "## 参数类型（8个片段 pooled）",
+            "## Parameter Types (8 Windows Pooled)",
             "",
-            "| SH | 参数 | 维度 | Exact-zero | abs(g)>1e-8 |",
+            "| SH | Parameter | Width | Exact-zero | abs(g)>1e-8 |",
             "|---|---|---:|---:|---:|",
         ]
     )
@@ -684,9 +684,9 @@ def main() -> None:
     report_lines.extend(
         [
             "",
-            "## Rank差异",
+            "## Rank Differences",
             "",
-            "| SH | 指标 | 16组中最大rank极差 |",
+            "| SH | Metric | Maximum Rank Range Across 16 Groups |",
             "|---|---|---:|",
         ]
     )
@@ -705,9 +705,9 @@ def main() -> None:
     report_lines.extend(
         [
             "",
-            "## 排除首个冷启动batch",
+            "## Excluding the First Cold-start Batch",
             "",
-            "| SH | 指标 | 均值±标准差 | 最小–最大 | 极差 |",
+            "| SH | Metric | Mean ± Std. Dev. | Min–Max | Range |",
             "|---|---|---:|---:|---:|",
         ]
     )
@@ -728,14 +728,14 @@ def main() -> None:
     report_lines.extend(
         [
             "",
-            "## 覆盖与核验",
+            "## Coverage and Validation",
             "",
-            f"- TSP offsets：`{', '.join(str(value) for value in offsets)}`",
-            f"- 覆盖camera：**{8 * 1024}/{runs[0]['schedule_metadata']['num_cameras']}**",
-            "- 8个窗口无重叠，默认SH与强制SH3的camera对象及顺序完全一致。",
-            "- 比例均由原始计数累计得到，不是逐batch百分比的简单平均。",
-            "- 7档near-zero阈值见`scene_locality_summary.tsv`和参数类型TSV。",
-            "- 冷启动batch排除口径见`scene_locality_summary_exclude_first.tsv`。",
+            f"- TSP offsets: `{', '.join(str(value) for value in offsets)}`",
+            f"- Cameras covered: **{8 * 1024}/{runs[0]['schedule_metadata']['num_cameras']}**",
+            "- The eight windows do not overlap; Default SH and Forced SH3 use identical camera objects and ordering.",
+            "- Ratios are accumulated from raw counts rather than averaged from per-batch percentages.",
+            "- The seven near-zero thresholds are listed in `scene_locality_summary.tsv` and the parameter-type TSV.",
+            "- The cold-start batch exclusion rule is recorded in `scene_locality_summary_exclude_first.tsv`.",
             "",
         ]
     )

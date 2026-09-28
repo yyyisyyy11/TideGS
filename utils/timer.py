@@ -17,7 +17,7 @@ class Timer:
             self.file = None
 
     def start(self, key):
-        """ 开始对指定的 key（代码块）进行计时 """
+        """Start timing the specified code block."""
         if not utils.check_enable_python_timer():
             return
         """Start timer for the given key"""

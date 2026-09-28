@@ -210,7 +210,7 @@ from strategies.tide_engine.runtime import (
     write_paper_phase1_log as _write_paper_phase1_log,
 )
 
-# 全局双缓冲 GPU 管理器
+# Global double-buffer GPU manager.
 _double_buffer_gpu: Optional[DoubleBufferGPUWorkingSet] = None
 
 def get_double_buffer_gpu(
@@ -219,7 +219,7 @@ def get_double_buffer_gpu(
     device: str = 'cuda',
     verbose: bool = False,
 ) -> DoubleBufferGPUWorkingSet:
-    """获取或创建全局双缓冲 GPU 管理器"""
+    """Get or create the global double-buffer GPU manager."""
     global _double_buffer_gpu
     if _double_buffer_gpu is None:
         _double_buffer_gpu = DoubleBufferGPUWorkingSet(
@@ -231,7 +231,7 @@ def get_double_buffer_gpu(
     return _double_buffer_gpu
 
 def shutdown_double_buffer_gpu():
-    """关闭双缓冲 GPU 管理器"""
+    """Shut down the double-buffer GPU manager."""
     global _double_buffer_gpu
     if _double_buffer_gpu is not None:
         _double_buffer_gpu.clear()
@@ -1527,7 +1527,7 @@ def clm_offload_train_one_batch(
             getattr(gaussians, '_paper_resident_recency_scores', {})
         ) if is_paper_ssd_mode else {}
 
-        # Step 2: 获取数据 — execution-mode dependent
+        # Step 2: Load data; behavior depends on the execution mode.
         # fast_ram: read cold blocks directly from _unified_params pinned memory
         # paper: wait for the SSD->RAM async pipeline and consume RAM cache blocks
         if use_fast_ram_ssd_path:
@@ -1887,7 +1887,7 @@ def clm_offload_train_one_batch(
     _ts('stage1_5_ssd_done')
 
     # ============================================================================
-    # STAGE 2: Gaussian-level Culling (精细剔除)
+    # STAGE 2: Gaussian-level culling.
     # ============================================================================
     curvature_filters_local = []
     with torch.no_grad():
@@ -2891,7 +2891,7 @@ def clm_offload_train_one_batch(
         _filtered_rotation_gpu = gaussians._rotation[this_filter_local].clone().requires_grad_(True)
         
         # Retain gradients for cloned non-leaf tensors until scatter-back.
-        filtered_xyz_gpu.retain_grad() # retain_grad(): 虽然不是leaf node，但反向传播结束后, 不要销毁它的梯度，把它留在显存中等待使用
+        filtered_xyz_gpu.retain_grad() # Keep this non-leaf tensor's gradient after backpropagation for scatter-back.
         _filtered_opacity_gpu.retain_grad()
         _filtered_scaling_gpu.retain_grad()
         _filtered_rotation_gpu.retain_grad()

@@ -10,6 +10,17 @@ import numpy as np
 from .resident_policy import compute_topc_resident_transition
 
 
+_PLANNER_ACTIVE_FIRST_POLICIES = {
+    "topc_strict_active_first",
+    "topc_balanced_active_first",
+}
+_PLANNER_RESIDENT_POLICIES = {
+    "topc",
+    "topc_strict",
+    "topc_balanced",
+} | _PLANNER_ACTIVE_FIRST_POLICIES
+
+
 def rows_in_block(block_id: int, total_points: int, block_size: int) -> int:
     start = int(block_id) * int(block_size)
     return max(0, min(int(block_size), int(total_points) - start))
@@ -405,7 +416,21 @@ class DistributedBatchPlanner:
         resident_recency_decay: float,
         balanced_seed_fraction: float,
         camera_assignment: str = "gaussian_balanced",
+        resident_selection_policy: str = "topc_balanced",
     ):
+        policy = str(resident_selection_policy).strip().lower()
+        if policy not in _PLANNER_RESIDENT_POLICIES:
+            raise ValueError(
+                f"Unsupported distributed resident_selection_policy={resident_selection_policy!r}; "
+                f"expected one of {sorted(_PLANNER_RESIDENT_POLICIES)}"
+            )
+        self.resident_selection_policy = policy
+        # topc / topc_strict / topc_balanced keep the historical distributed behaviour
+        # (camera-balanced seeds, no active-coverage guarantee). The active-first variants
+        # additionally guarantee that every globally active block is resident when it fits,
+        # and that only active blocks are selected when it does not.
+        self.balanced_camera_seeds = policy != "topc_strict_active_first"
+        self.enforce_next_active_coverage = policy in _PLANNER_ACTIVE_FIRST_POLICIES
         self.block_owner = np.asarray(block_owner, dtype=np.int32)
         self.total_points = int(total_points)
         self.block_size = int(block_size)
@@ -596,8 +621,9 @@ class DistributedBatchPlanner:
             lambda_weight=self.resident_lambda,
             recency_decay=self.recency_decay,
             resident_capacity_blocks=self.capacity,
-            balanced_camera_seeds=True,
+            balanced_camera_seeds=self.balanced_camera_seeds,
             balanced_seed_fraction=self.balanced_seed_fraction,
+            enforce_next_active_coverage=self.enforce_next_active_coverage,
         )
         global_resident = list(transition.next_resident_blocks)
         self._active = global_active

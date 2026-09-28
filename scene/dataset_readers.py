@@ -544,50 +544,49 @@ def readCamerasFromTransformsCity(
         # c2w = np.array(frame["transform_matrix"])
 
         # # ===============================================================
-        # # [FIX] 重构坐标系 (Coordinate System Re-alignment)
-        # # ===============================================================
-        # # 根据 Debug 观测: 
-        # # 1. 原始数据的 X 轴 (Col 0) 是 Forward (指向物体)
-        # # 2. 原始数据的 Z 轴 (Col 2) 是 Up (指向天空)
+        # # [FIX] Re-align the coordinate system.
+        # # Based on debug observations:
+        # # 1. The original X axis (column 0) is Forward (toward the object).
+        # # 2. The original Z axis (column 2) is Up (toward the sky).
         # #
-        # # 目标 Colmap 格式: X=Right, Y=Down, Z=Forward
+        # # Target COLMAP format: X=Right, Y=Down, Z=Forward.
         # # ---------------------------------------------------------------
-        
-        # # 1. 提取原始轴
-        # raw_x_axis = c2w[:3, 0] # 目前的 Forward
-        # raw_y_axis = c2w[:3, 1] 
-        # raw_z_axis = c2w[:3, 2] # 目前的 Up
 
-        # # 2. 构建新轴
-        # # Step A: 确定 Forward (Z)
-        # # 既然 X 轴对着物体，那它就是我们的新 Z 轴
-        # new_z_axis = raw_x_axis 
-        # new_z_axis = new_z_axis / np.linalg.norm(new_z_axis) # 归一化
+        # # 1. Extract the original axes.
+        # raw_x_axis = c2w[:3, 0] # Current Forward axis.
+        # raw_y_axis = c2w[:3, 1]
+        # raw_z_axis = c2w[:3, 2] # Current Up axis.
 
-        # # Step B: 确定 Down (Y)
-        # # 既然原始 Z 轴朝上 (Up)，那我们的新 Y 轴 (Down) 应该是它的反方向
+        # # 2. Build the new axes.
+        # # Step A: Define Forward (Z).
+        # # Because the original X axis points toward the object, it becomes the new Z axis.
+        # new_z_axis = raw_x_axis
+        # new_z_axis = new_z_axis / np.linalg.norm(new_z_axis) # Normalize.
+
+        # # Step B: Define Down (Y).
+        # # Because the original Z axis points Up, the new Y axis (Down) is its opposite.
         # new_y_axis = -raw_z_axis
         # new_y_axis = new_y_axis / np.linalg.norm(new_y_axis)
 
-        # # Step C: 确定 Right (X)
-        # # 利用右手定则: Right = Down x Forward (或者 Forward x Up)
-        # # Cross(New_Y, New_Z)
+        # # Step C: Define Right (X).
+        # # Use the right-hand rule: Right = Down x Forward (or Forward x Up).
+        # # Cross(New_Y, New_Z).
         # new_x_axis = np.cross(new_y_axis, new_z_axis)
         # new_x_axis = new_x_axis / np.linalg.norm(new_x_axis)
 
-        # # 3. 组装回 c2w
+        # # 3. Assemble c2w again.
         # c2w[:3, 0] = new_x_axis
         # c2w[:3, 1] = new_y_axis
         # c2w[:3, 2] = new_z_axis
         # # ===============================================================
 
-        # # get the world-to-camera transform and set R, T
+        # # Get the world-to-camera transform and set R, T.
         # w2c = np.linalg.inv(c2w)
 
-        # # [CRITICAL] 这里的转置必须保留！
-        # # 此时 w2c 是标准的 Row-Major。
-        # # 我们需要转置 R 部分，以便它在内存中变成 Column-Major 格式
-        # # 这样在后续 viewmat.transpose(0, 1) 时（或者不转置时）才能对上 gsplat
+        # # [CRITICAL] This transpose must be preserved.
+        # # At this point w2c is standard row-major data.
+        # # Transpose the R component so it is laid out in column-major form.
+        # # This keeps it consistent with gsplat when viewmat.transpose(0, 1) is applied later.
         # R = np.transpose(w2c[:3, :3]) 
         # T = w2c[:3, 3]
 

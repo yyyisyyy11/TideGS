@@ -141,20 +141,20 @@ class LogStorageManager:
         self.idle_compaction_seconds = max(0.0, float(idle_compaction_seconds))
 
         # Metadata index: block_id -> BlockLocation
-        # 用于快速查找任意 Block 当前存储在文件的哪个位置
+        # Quickly locate the current file position of any block.
         self.index: Dict[int, BlockLocation] = {}
-        # 线程锁: 防止多线程同时修改索引导致竞争条件
+        # Thread lock: prevent races when multiple threads modify the index.
         self.index_lock = threading.Lock()
 
         # File handles (lazy opened)
-        # file_handles: 缓存已打开的文件对象，避免重复打开关闭
+        # Cache open file objects to avoid repeatedly opening and closing them.
         self.file_handles: Dict[int, object] = {}  # file_id -> open file handle
-        # 维护 file_id 到磁盘物理路径的映射
+        # Map file IDs to physical paths on disk.
         self.file_paths: Dict[int, Path] = {0: self.storage_dir / "base_file.bin"}
 
         # Patch file counter
         self.next_patch_id = 1
-        # 计数器锁：确保多线程并发场景 patch 时ID不会冲突
+        # Counter lock: ensure patch IDs do not collide across concurrent writers.
         self.patch_counter_lock = threading.Lock()
         self._write_lock = threading.RLock()
         self._storage_rwlock = _ReaderPriorityRWLock()
@@ -174,7 +174,7 @@ class LogStorageManager:
             'idle_compaction_failures': 0,
         }
 
-        # 执行初始化逻辑， 建立初始的文件索引映射
+        # Initialize the file index mapping.
         self._initialize_index()
         self._remove_abandoned_temp_files()
         self._last_foreground_read_at = time.monotonic()
@@ -283,12 +283,12 @@ class LogStorageManager:
                 print(f"[LogStorage] Creating new base file at {base_file}")
             with open(base_file, 'wb') as f:
                 # Pre-allocate space
-                # 将文件指针移动到文件最后一个字节的位置
+                # Move the file pointer to the last byte of the file.
                 f.seek(self.num_blocks * self.bytes_per_block - 1)
-                # 写入一个空字节，操作系统会立刻为文件分配这个大的逻辑大小，不需要将中间都填满0
+                # Write one empty byte so the OS allocates the logical file size without filling the gap with zeros.
                 f.write(b'\0')
 
-            # 初始化索引，将所有 block 指向这个新创建的空文件
+            # Initialize the index so every block points to this new empty file.
             for block_id in range(self.num_blocks):
                 self.index[block_id] = BlockLocation(
                     file_id=0,
@@ -333,9 +333,9 @@ class LogStorageManager:
     ):
         """
         Read multiple blocks from storage.
-        从存储中批量读取多个 blocks
+        Read multiple blocks from storage in a batch.
         Groups reads by file to minimize seeking and maximize sequential access.
-        核心优化：按文件分组，按offset排序，最小化seeking时间，最大化顺序访问
+        Core optimization: group by file and sort by offset to minimize seeking and maximize sequential access.
         Args:
             block_ids: List of block IDs to read
 
@@ -349,10 +349,10 @@ class LogStorageManager:
         versions = {}
 
         # Group blocks by file for efficient batched reads
-        # 建立分组字典： k是文件id，v是(block_id, Blocklocation)列表
+        # Build groups: the key is a file ID and the value is a list of (block_id, BlockLocation).
         file_groups: Dict[int, List[Tuple[int, BlockLocation]]] = {}
 
-        # 读取索引时加锁，防止读取过程中索引被后台写线程修改
+        # Lock the index so a background writer cannot modify it during the read.
         with self.index_lock:
             for block_id in block_ids:
                 if block_id not in self.index:
@@ -368,8 +368,8 @@ class LogStorageManager:
         for file_id, blocks in file_groups.items():
             file_path = self.file_paths[file_id]
 
-            # 核心优化: Sort by offset for sequential reading
-            # 这样 f.seek() 总是向后移动，不会来回跳跃，极大提升了SSD 的吞吐量
+            # Core optimization: sort by offset for sequential reading.
+            # This keeps f.seek() moving forward instead of jumping back and forth, improving SSD throughput.
             blocks.sort(key=lambda x: x[1].offset)
 
             with open(file_path, 'rb') as f:
@@ -382,9 +382,9 @@ class LogStorageManager:
                         result[block_id] = self._read_base_block(block_id)
                         continue
 
-                    # 移动指针到block的起始位置
+                    # Move the pointer to the beginning of the block.
                     f.seek(location.offset)
-                    # 读取指定大小的二进制数据
+                    # Read the requested number of binary bytes.
                     data_bytes = f.read(location.size)
 
                     # Convert to tensor (copy to make it writable)
@@ -547,7 +547,7 @@ class LogStorageManager:
             raise
 
         # Update index atomically
-        # 只有文件全部写完落盘后，才会更新内存索引，确保不会读到写了一半的文件
+        # Update the in-memory index only after the complete file is durable, so readers never see a partial file.
         with self.index_lock:
             self.file_paths[patch_id] = patch_file
             for block_id, location in updated_locations.items():
