@@ -627,6 +627,24 @@ def evaluate_checkpoint(cli_args: argparse.Namespace) -> Dict[str, object]:
         log_file.write(schedule_message + "\n")
         if int(cli_args.camera_limit) >= 0:
             schedule = schedule[: int(cli_args.camera_limit)]
+        if cli_args.camera_ids:
+            requested = [int(value) for value in cli_args.camera_ids]
+            camera_count = len(test_camera_infos)
+            out_of_range = [
+                value for value in requested if not 0 <= value < camera_count
+            ]
+            if out_of_range:
+                raise ValueError(
+                    f"--camera-ids out of range [0, {camera_count}): {out_of_range}"
+                )
+            if len(set(requested)) != len(requested):
+                raise ValueError("--camera-ids must not repeat a camera")
+            if int(cli_args.camera_limit) >= 0:
+                print(
+                    "[QUALITY SCHEDULE] --camera-ids overrides the --camera-limit "
+                    f"truncation ({len(requested)} cameras requested)"
+                )
+            schedule = requested
         if not schedule:
             raise ValueError("camera-limit selected zero cameras")
 
@@ -937,6 +955,17 @@ def build_argparser() -> argparse.ArgumentParser:
         type=int,
         default=-1,
         help="Debug limit in deterministic TSP order; -1 evaluates all Test cameras.",
+    )
+    parser.add_argument(
+        "--camera-ids",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Evaluate exactly these Test camera indices, in the given order, instead of "
+            "the TSP schedule; overrides --camera-limit. Pair it with a --preview-count "
+            "equal to the number of ids to preview every one of them."
+        ),
     )
     parser.add_argument("--preview-count", type=int, default=64, help="Uniform preview count.")
     return parser
