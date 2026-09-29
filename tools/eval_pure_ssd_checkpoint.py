@@ -20,6 +20,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tools.pure_ssd_quality_utils import (  # noqa: E402
+    ACTIVE_FIRST_RESIDENT_POLICIES,
     CheckpointShardBlockReader,
     OwnerRoutedBlockReader,
     checkpoint_tree_fingerprint,
@@ -529,6 +530,9 @@ def evaluate_checkpoint(cli_args: argparse.Namespace) -> Dict[str, object]:
                 RESIDENT_POLICY,
             )
         ).lower()
+        # Mirror the training-time resident semantics: active-first runs must
+        # reconstruct residency with the same coverage guarantee.
+        enforce_next_active_coverage = resident_policy in ACTIVE_FIRST_RESIDENT_POLICIES
         resident_capacity = _resolve_evaluation_resident_capacity(
             checkpoint,
             loaded_training_args,
@@ -678,6 +682,7 @@ def evaluate_checkpoint(cli_args: argparse.Namespace) -> Dict[str, object]:
                         resident_lambda=resident_lambda,
                         recency_decay=resident_recency_decay,
                         balanced_seed_fraction=balanced_seed_fraction,
+                        enforce_next_active_coverage=enforce_next_active_coverage,
                     )
                 if len(resident_blocks) > resident_capacity:
                     raise AssertionError(
@@ -802,6 +807,7 @@ def evaluate_checkpoint(cli_args: argparse.Namespace) -> Dict[str, object]:
                         resident_lambda=resident_lambda,
                         recency_decay=resident_recency_decay,
                         balanced_seed_fraction=balanced_seed_fraction,
+                        enforce_next_active_coverage=enforce_next_active_coverage,
                     )
                     resident_blocks = sorted(int(block_id) for block_id in transition.next_resident_blocks)
                     recency_scores = dict(transition.updated_recency_scores)

@@ -431,6 +431,16 @@ class OwnerRoutedBlockReader:
         return 0 <= int(block_id) < self.num_blocks
 
 
+# Resident policies the quality evaluator can reconstruct residency for.
+# The active-first variants mirror the training-time selection (upstream
+# e4a29c0): when the visible set fits the capacity it is fully resident, and
+# when it does not only visible blocks are eligible.
+ACTIVE_FIRST_RESIDENT_POLICIES = frozenset(
+    {"topc_strict_active_first", "topc_balanced_active_first"}
+)
+SUPPORTED_RESIDENT_POLICIES = frozenset({"topc_strict", "topc_balanced"}) | ACTIVE_FIRST_RESIDENT_POLICIES
+
+
 def validate_resident_configuration(
     policy: str,
     capacity: int,
@@ -438,8 +448,10 @@ def validate_resident_configuration(
     recency_decay: float,
     balanced_seed_fraction: float,
 ) -> None:
-    if str(policy).lower() != "topc_balanced":
-        raise ValueError(f"quality evaluation requires topc_balanced, got {policy!r}")
+    if str(policy).lower() not in SUPPORTED_RESIDENT_POLICIES:
+        raise ValueError(
+            f"quality evaluation requires a supported TopC resident policy, got {policy!r}"
+        )
     if int(capacity) <= 0:
         raise ValueError(f"resident capacity must be positive, got {capacity}")
     for name, value in (
@@ -459,6 +471,7 @@ def select_initial_resident_blocks(
     resident_lambda: float,
     recency_decay: float,
     balanced_seed_fraction: float,
+    enforce_next_active_coverage: bool = False,
 ) -> List[int]:
     from strategies.tide_engine.resident_policy import compute_topc_resident_transition
 
@@ -473,6 +486,7 @@ def select_initial_resident_blocks(
         resident_capacity_blocks=int(capacity),
         balanced_camera_seeds=True,
         balanced_seed_fraction=float(balanced_seed_fraction),
+        enforce_next_active_coverage=bool(enforce_next_active_coverage),
     )
     resident = sorted(int(block_id) for block_id in transition.next_resident_blocks)
     if len(resident) > int(capacity):
@@ -492,6 +506,7 @@ def compute_next_resident_transition(
     resident_lambda: float,
     recency_decay: float,
     balanced_seed_fraction: float,
+    enforce_next_active_coverage: bool = False,
 ):
     from strategies.tide_engine.resident_policy import compute_topc_resident_transition
 
@@ -507,6 +522,7 @@ def compute_next_resident_transition(
         resident_capacity_blocks=int(capacity),
         balanced_camera_seeds=True,
         balanced_seed_fraction=float(balanced_seed_fraction),
+        enforce_next_active_coverage=bool(enforce_next_active_coverage),
     )
     if len(transition.next_resident_blocks) > int(capacity):
         raise AssertionError("resident transition exceeded its configured capacity")
@@ -514,7 +530,9 @@ def compute_next_resident_transition(
 
 
 __all__ = [
+    "ACTIVE_FIRST_RESIDENT_POLICIES",
     "METRIC_NAMES",
+    "SUPPORTED_RESIDENT_POLICIES",
     "CheckpointShardBlockReader",
     "OwnerRoutedBlockReader",
     "checkpoint_manifest_fingerprint",
