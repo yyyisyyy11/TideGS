@@ -10,7 +10,7 @@ from unittest import mock
 
 import torch
 
-from storage.log_storage_manager import LogStorageManager, StorageCapacityError
+from storage.log_storage_manager import LogStorageManager
 from storage.pure_ssd_checkpoint import prune_checkpoint_history
 
 
@@ -27,7 +27,6 @@ class LogStorageLifecycleTest(unittest.TestCase):
             verbose=False,
             max_patch_files=32,
             max_patch_gb=0,
-            min_free_gb=0,
             idle_compaction_seconds=0,
         )
         base = torch.arange(24, dtype=torch.float32).reshape(8, 3)
@@ -115,7 +114,6 @@ class LogStorageLifecycleTest(unittest.TestCase):
             num_blocks=4,
             point_dim=3,
             verbose=False,
-            min_free_gb=0,
             idle_compaction_seconds=0,
         )
         try:
@@ -163,7 +161,6 @@ class LogStorageLifecycleTest(unittest.TestCase):
             num_blocks=4,
             point_dim=3,
             verbose=False,
-            min_free_gb=0,
             idle_compaction_seconds=0,
         )
         try:
@@ -306,7 +303,6 @@ class LogStorageLifecycleTest(unittest.TestCase):
             verbose=False,
             max_patch_files=2,
             max_patch_gb=0,
-            min_free_gb=0,
             compaction_batch_files=2,
             idle_compaction_seconds=0.01,
         )
@@ -341,29 +337,54 @@ class LogStorageLifecycleTest(unittest.TestCase):
         self.assertEqual(stats["num_patches"], 2)
         self.assertEqual(stats["stale_patch_size_mb"], 0)
 
-    def test_low_space_defers_maintenance_without_changing_data(self):
+    def test_hot_path_never_reads_the_mount_point(self):
+        """The training hot path must never call statfs.
+
+        `get_stats()` is reached every iteration through
+        `compaction_scheduler.snapshot_state()`, and `compact_to_patch_count()`
+        runs inside the coordinated maintenance window.  On 2026-09-27 this
+        cluster's /XYAIFS00 made `statfs` return EROFS while writes still
+        succeeded, and an unguarded `shutil.disk_usage()` on that path killed
+        three multi-hour runs.  The whole mount-point free-space dependency has
+        been removed; this test fails loudly if a statfs call ever comes back.
+
+        The mount-point reading was useless anyway: it reported ~398 TB free
+        against thresholds of tens to hundreds of GB, so none of the checks it
+        fed could ever fire, and it measured the *neighbours'* space rather
+        than this job's directory quota.
+        """
+        calls = []
+
+        def _refuse(path, *args, **kwargs):
+            calls.append(str(path))
+            raise OSError(30, "Read-only file system", str(path))
+
         self.storage.write_patch({0: self.block(10)})
         self.storage.write_patch({0: self.block(20)})
-        self.storage.min_free_bytes = 1024
+        # Guard the whole statfs family: shutil.disk_usage() goes through
+        # os.statvfs() internally, but a future caller could reach for either.
         with mock.patch(
             "storage.log_storage_manager.shutil.disk_usage",
-            return_value=mock.Mock(total=2048, used=2048, free=0),
-        ):
-            self.assertFalse(self.storage.maybe_compact(force=True))
+            side_effect=_refuse,
+        ), mock.patch("os.statvfs", side_effect=_refuse):
+            try:
+                stats = self.storage.get_stats()
+                self.storage.compact_to_patch_count(target_patch_files=1)
+            except OSError as exc:
+                # Reporting the injected OSError verbatim would read like a broken
+                # environment; name the real problem instead.
+                self.fail(
+                    "statfs was called on the training hot path and raised "
+                    f"{exc!r}; calls={calls}"
+                )
 
-        self.assertEqual(self.storage.stats["compactions_deferred"], 1)
+        self.assertEqual(
+            calls,
+            [],
+            f"statfs was called on the hot path: {calls}",
+        )
+        self.assertIn("num_patches", stats)
         self.assertTrue(torch.equal(self.storage.read_blocks([0])[0], self.block(20)))
-
-    def test_free_space_reserve_rejects_write_before_creating_patch(self):
-        self.storage.min_free_bytes = 1024
-        before = set(self.storage_dir.iterdir())
-        with mock.patch(
-            "storage.log_storage_manager.shutil.disk_usage",
-            return_value=mock.Mock(total=2048, used=2048, free=0),
-        ):
-            with self.assertRaises(StorageCapacityError):
-                self.storage.write_patch({0: self.block(10)})
-        self.assertEqual(set(self.storage_dir.iterdir()), before)
 
     def test_checkpoint_retention_keeps_newest_numeric_directories(self):
         model_path = self.root / "model"

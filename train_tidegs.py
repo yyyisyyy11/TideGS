@@ -47,7 +47,6 @@ from utils.timer import Timer, End2endTimer
 from storage.tide_storage_adapter import TideStorageAdapter
 from storage.compaction_scheduler import (
     crossed_periodic_iteration,
-    resolve_emergency_free_gb,
     run_compaction_maintenance,
 )
 from storage.schedule_utils import (
@@ -910,7 +909,6 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 execution_mode=args.ssd_execution_mode,
                 max_patch_files=args.tide_storage_max_patch_files,
                 max_patch_gb=args.tide_storage_max_patch_gb,
-                min_free_gb=args.tide_storage_min_free_gb,
                 compaction_batch_files=args.tide_storage_compaction_batch_files,
                 idle_compaction_seconds=args.tide_storage_idle_compaction_seconds,
                 block_cull_backend=getattr(args, "tide_block_cull_backend", "cpu") or "cpu",
@@ -1112,10 +1110,6 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         args._tide_global_optimizer_step = int(completed_optimizer_steps)
 
         scene.log_scene_info_to_file(log_file, "Scene Info Before Training")
-    emergency_compaction_free_gb = resolve_emergency_free_gb(
-        configured_gb=args.tide_storage_compaction_emergency_free_gb,
-        min_free_gb=args.tide_storage_min_free_gb,
-    )
     final_storage_maintenance_complete = False
     utils.check_initial_gpu_memory_usage("after init and before training loop")
 
@@ -1796,7 +1790,6 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 args.tide_storage_compaction_target_patch_files
             ),
             rank_concurrency=args.tide_storage_compaction_rank_concurrency,
-            emergency_free_gb=emergency_compaction_free_gb,
             flush_dirty_cache=bool(
                 matched_checkpoint_iterations or is_final_batch
             ),
@@ -2034,7 +2027,6 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 rank_concurrency=(
                     args.tide_storage_compaction_rank_concurrency
                 ),
-                emergency_free_gb=emergency_compaction_free_gb,
                 forced_trigger="shutdown",
                 flush_dirty_cache=True,
             )

@@ -25,40 +25,13 @@ def crossed_periodic_iteration(
     return target if iteration <= target < iteration + batch_size else None
 
 
-def resolve_emergency_free_gb(*, configured_gb: float, min_free_gb: float) -> float:
-    configured_gb = float(configured_gb)
-    return 2.0 * float(min_free_gb) if configured_gb < 0 else configured_gb
-
-
 def _rank_groups(
-    rank_states: List[Dict[str, float]],
+    world_size: int,
     *,
     requested_concurrency: int,
-    target_patch_files: int,
 ) -> List[List[int]]:
-    world_size = len(rank_states)
-    concurrency = max(1, min(int(requested_concurrency), world_size))
-    active_estimates = sorted(
-        (
-            int(state["estimated_output_bytes"])
-            for state in rank_states
-            if int(state["num_patches"]) > int(target_patch_files)
-        ),
-        reverse=True,
-    )
-    shared_free_bytes = min(
-        int(state["free_bytes"]) for state in rank_states
-    )
-    shared_reserve_bytes = max(
-        int(state["min_free_bytes"]) for state in rank_states
-    )
-    if (
-        concurrency > 1
-        and active_estimates
-        and shared_free_bytes
-        < shared_reserve_bytes + sum(active_estimates[:concurrency])
-    ):
-        concurrency = 1
+    """Split ranks into waves of at most ``requested_concurrency``."""
+    concurrency = max(1, min(int(requested_concurrency), int(world_size)))
     return [
         list(range(start, min(start + concurrency, world_size)))
         for start in range(0, world_size, concurrency)
@@ -73,11 +46,10 @@ def run_compaction_maintenance(
     periodic_iteration: Optional[int],
     target_patch_files: int,
     rank_concurrency: int,
-    emergency_free_gb: float,
     forced_trigger: Optional[str] = None,
     flush_dirty_cache: bool = False,
 ) -> Optional[Dict[str, object]]:
-    """Run one globally coordinated periodic or emergency maintenance window."""
+    """Run one globally coordinated periodic maintenance window."""
     storage = storage_adapter.storage
     target_patch_files = max(1, int(target_patch_files))
 
@@ -85,10 +57,6 @@ def run_compaction_maintenance(
         stats = storage.get_stats()
         return {
             "rank": int(context.rank),
-            "free_bytes": int(
-                float(stats["free_space_gb"]) * (1024 ** 3)
-            ),
-            "min_free_bytes": int(storage.min_free_bytes),
             "num_patches": int(stats["num_patches"]),
             "estimated_output_bytes": int(
                 storage.estimate_next_compaction_output_bytes()
@@ -96,17 +64,13 @@ def run_compaction_maintenance(
         }
 
     rank_states = context.all_gather_object(snapshot_state())
-    minimum_free_gb = min(
-        float(state["free_bytes"]) / (1024 ** 3) for state in rank_states
-    )
-    emergency = minimum_free_gb < float(emergency_free_gb)
-    if forced_trigger is None and periodic_iteration is None and not emergency:
+    if forced_trigger is None and periodic_iteration is None:
         return None
 
     trigger = (
         str(forced_trigger)
         if forced_trigger is not None
-        else ("periodic" if periodic_iteration is not None else "emergency")
+        else "periodic"
     )
     trigger_iteration = (
         int(periodic_iteration)
@@ -156,25 +120,10 @@ def run_compaction_maintenance(
 
     local_state = snapshot_state()
     rank_states = context.all_gather_object(local_state)
-    minimum_free_gb = min(
-        float(state["free_bytes"]) / (1024 ** 3) for state in rank_states
-    )
-    if (
-        emergency
-        and all(
-            int(state["num_patches"]) <= target_patch_files
-            for state in rank_states
-        )
-    ):
-        raise RuntimeError(
-            "SSD free space is below the emergency compaction threshold, "
-            "but every rank is already at the patch low watermark"
-        )
 
     groups = _rank_groups(
-        rank_states,
+        len(rank_states),
         requested_concurrency=rank_concurrency,
-        target_patch_files=target_patch_files,
     )
     local_result = {
         "trigger": trigger,
@@ -188,8 +137,6 @@ def run_compaction_maintenance(
         "reclaimed_bytes": 0,
         "duration_ms": 0.0,
         "actual_concurrency": 0,
-        "free_space_gb_before": minimum_free_gb,
-        "free_space_gb_after": minimum_free_gb,
     }
 
     for group in groups:
@@ -222,14 +169,5 @@ def run_compaction_maintenance(
         context.barrier()
 
     final_stats = storage.get_stats()
-    final_free = context.all_gather_object(float(final_stats["free_space_gb"]))
-    final_minimum_free_gb = min(float(value) for value in final_free)
     local_result["after_patches"] = int(final_stats["num_patches"])
-    local_result["free_space_gb_after"] = final_minimum_free_gb
-    if emergency and final_minimum_free_gb < float(emergency_free_gb):
-        raise RuntimeError(
-            "SSD free space remains below the emergency threshold after "
-            f"compaction: free={final_minimum_free_gb:.2f} GiB "
-            f"threshold={float(emergency_free_gb):.2f} GiB"
-        )
     return local_result

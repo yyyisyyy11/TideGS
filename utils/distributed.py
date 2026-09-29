@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any, List
 
 import torch
@@ -69,7 +70,19 @@ class DistributedContext:
 
         torch.cuda.set_device(local_rank)
         if not dist.is_initialized():
-            dist.init_process_group(backend="nccl", init_method="env://")
+            # NCCL's built-in collective timeout is 10 minutes, and a compaction burst can
+            # legitimately exceed it: the compaction barrier is an all-gather that the other
+            # ranks wait on while one rank streams tens of GiB to the SSD.  On 2026-09-25 that
+            # aborted a 200K run at iteration ~70k with
+            # "Watchdog caught collective operation timeout: ... OpType=ALLGATHER ...
+            #  Timeout(ms)=600000".  Raise it so a long maintenance burst cannot kill the job;
+            # TIDE_PG_TIMEOUT_SEC overrides without another code edit.
+            pg_timeout = timedelta(
+                seconds=int(os.environ.get("TIDE_PG_TIMEOUT_SEC", 3600))
+            )
+            dist.init_process_group(
+                backend="nccl", init_method="env://", timeout=pg_timeout
+            )
         if dist.get_rank() != rank or dist.get_world_size() != world_size:
             raise RuntimeError("torch.distributed process-group metadata does not match torchrun")
 

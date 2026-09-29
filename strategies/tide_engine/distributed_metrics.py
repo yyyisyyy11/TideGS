@@ -317,8 +317,6 @@ COMPACTION_FIELDS = [
     "reclaimed_bytes",
     "duration_ms",
     "actual_concurrency",
-    "free_space_gb_before",
-    "free_space_gb_after",
 ]
 COMPACTION_GLOBAL_FIELDS = [
     "trigger",
@@ -333,8 +331,6 @@ COMPACTION_GLOBAL_FIELDS = [
     "duration_ms_max",
     "duration_ms_mean",
     "actual_concurrency",
-    "free_space_gb_before",
-    "free_space_gb_after",
 ]
 
 
@@ -718,14 +714,6 @@ class DistributedMetricsWriter:
             ),
             "actual_concurrency": max(
                 int(value.get("actual_concurrency", 0))
-                for value in rank_rows
-            ),
-            "free_space_gb_before": min(
-                float(value.get("free_space_gb_before", 0.0))
-                for value in rank_rows
-            ),
-            "free_space_gb_after": min(
-                float(value.get("free_space_gb_after", 0.0))
                 for value in rank_rows
             ),
         }

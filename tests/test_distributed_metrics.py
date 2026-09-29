@@ -37,7 +37,6 @@ class _Context:
             peer["output_bytes"] = 200
             peer["reclaimed_bytes"] = 100
             peer["duration_ms"] = 8.0
-            peer["free_space_gb_after"] = 140.0
         peer["optimizer_ms"] = 8.0
         return [value, peer]
 
@@ -496,8 +495,6 @@ class DistributedMetricsTest(unittest.TestCase):
                     "reclaimed_bytes": 80,
                     "duration_ms": 6.0,
                     "actual_concurrency": 2,
-                    "free_space_gb_before": 120.0,
-                    "free_space_gb_after": 150.0,
                 }
             )
 
@@ -516,7 +513,6 @@ class DistributedMetricsTest(unittest.TestCase):
             self.assertEqual(global_row["output_bytes"], "320")
             self.assertEqual(global_row["duration_ms_max"], "8.0")
             self.assertEqual(global_row["duration_ms_mean"], "7.0")
-            self.assertEqual(global_row["free_space_gb_after"], "140.0")
 
 
 if __name__ == "__main__":

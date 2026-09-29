@@ -29,10 +29,6 @@ class BlockLocation:
     version: int  # Version number for tracking updates
 
 
-class StorageCapacityError(RuntimeError):
-    """Raised before a patch write would consume the configured free-space reserve."""
-
-
 class _ReaderPriorityRWLock:
     """Reader-priority lock used to keep foreground storage reads responsive."""
 
@@ -104,7 +100,6 @@ class LogStorageManager:
         verbose: bool = True,
         max_patch_files: int = 32,
         max_patch_gb: float = 64.0,
-        min_free_gb: float = 64.0,
         compaction_batch_files: int = 4,
         idle_compaction_seconds: float = 0.0,
     ):
@@ -120,7 +115,6 @@ class LogStorageManager:
             verbose: Print routine storage lifecycle messages
             max_patch_files: Compact when the active patch count reaches this value
             max_patch_gb: Compact when reclaimable stale patch data reaches this size
-            min_free_gb: Free-space reserve enforced before writes and compaction
             compaction_batch_files: Oldest patch files merged by one maintenance pass
             idle_compaction_seconds: Foreground-read idle time; zero disables background maintenance
         """
@@ -136,7 +130,6 @@ class LogStorageManager:
         self.bytes_per_block = block_size * self.bytes_per_point
         self.max_patch_files = max(2, int(max_patch_files))
         self.max_stale_patch_bytes = max(0, int(float(max_patch_gb) * (1024 ** 3)))
-        self.min_free_bytes = max(0, int(float(min_free_gb) * (1024 ** 3)))
         self.compaction_batch_files = max(2, int(compaction_batch_files))
         self.idle_compaction_seconds = max(0.0, float(idle_compaction_seconds))
 
@@ -168,7 +161,6 @@ class LogStorageManager:
             'compaction_input_bytes': 0,
             'compaction_output_bytes': 0,
             'compaction_reclaimed_bytes': 0,
-            'compactions_deferred': 0,
             'idle_compaction_requests': 0,
             'idle_compaction_runs': 0,
             'idle_compaction_failures': 0,
@@ -251,16 +243,6 @@ class LogStorageManager:
         if thread is not threading.current_thread():
             thread.join()
         self._idle_maintenance_thread = None
-
-    def _check_free_space(self, additional_bytes: int, operation: str) -> None:
-        free_bytes = shutil.disk_usage(self.storage_dir).free
-        required = max(0, int(additional_bytes)) + self.min_free_bytes
-        if free_bytes < required:
-            raise StorageCapacityError(
-                f"Insufficient space for {operation}: free={free_bytes / (1024 ** 3):.2f} GiB, "
-                f"required={required / (1024 ** 3):.2f} GiB including "
-                f"reserve={self.min_free_bytes / (1024 ** 3):.2f} GiB"
-            )
 
     def _initialize_index(self):
         """Initialize metadata index pointing all blocks to base file."""
@@ -451,12 +433,6 @@ class LogStorageManager:
                 }
             if not selected:
                 return -1
-            estimated_bytes = sum(
-                int(tensor.numel()) * int(tensor.element_size())
-                for tensor in selected.values()
-                if tensor is not None and torch.is_tensor(tensor)
-            )
-            self._check_free_space(estimated_bytes, "patch write")
             with self._storage_operation():
                 patch_id = self._write_patch_uncoordinated(
                     selected,
@@ -881,12 +857,7 @@ class LogStorageManager:
                         for block_id, location in index_snapshot.items()
                         if int(location.file_id) in selected_paths
                     )
-                    live_bytes = sum(
-                        int(index_snapshot[block_id].size)
-                        for block_id in live_block_ids
-                    )
 
-                    self._check_free_space(live_bytes, "incremental patch compaction")
                     with self.patch_counter_lock:
                         compacted_file_id = self.next_patch_id
                         self.next_patch_id += 1
@@ -986,12 +957,7 @@ class LogStorageManager:
 
     def maybe_compact(self, min_patches: int = 2, force: bool = False) -> bool:
         """Run one incremental maintenance pass when explicitly scheduled."""
-        try:
-            return self.compact_patches(min_patches=min_patches, force=force)
-        except StorageCapacityError as exc:
-            self.stats["compactions_deferred"] += 1
-            print(f"[LogStorage] Compaction deferred: {exc}")
-            return False
+        return self.compact_patches(min_patches=min_patches, force=force)
 
     def compact_for_checkpoint(self, min_patches: int = 2) -> int:
         """Drain patches through bounded compaction passes at a safe point."""
@@ -1049,7 +1015,6 @@ class LogStorageManager:
         _, file_paths, patch_paths, patch_bytes, live_block_ids, live_bytes = self._patch_state()
         total_files = len(file_paths)
         total_size = sum(p.stat().st_size for p in file_paths.values() if p.exists())
-        free_bytes = shutil.disk_usage(self.storage_dir).free
 
         return {
             **self.stats,
@@ -1060,7 +1025,6 @@ class LogStorageManager:
             'live_patch_blocks': len(live_block_ids),
             'live_patch_size_mb': live_bytes / 1024 / 1024,
             'stale_patch_size_mb': max(0, patch_bytes - live_bytes) / 1024 / 1024,
-            'free_space_gb': free_bytes / (1024 ** 3),
         }
 
     def _close_file_handles(self) -> None:
