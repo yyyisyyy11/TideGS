@@ -17,6 +17,7 @@ Key features:
 """
 
 import torch
+from utils.tide_trace import tide_range
 import numpy as np
 import threading
 import time
@@ -692,7 +693,8 @@ class GPUWorkingSet:
         incoming_blocks = sorted(target_set - retained_set)
 
         # Any evicted slot may still be a source for a queued D2H writeback.
-        torch.cuda.current_stream(self.device).wait_stream(self._writeback_stream)
+        with tide_range("tide.wait.gpu_writeback"):
+            torch.cuda.current_stream(self.device).wait_stream(self._writeback_stream)
         growth_blocks = self._ensure_persistent_slot_capacity(len(target_set))
 
         for block_id in sorted(evicted_set):
@@ -762,10 +764,11 @@ class GPUWorkingSet:
                     dtype=torch.float32,
                 )
             read_start = time.perf_counter()
-            block_batch = block_reader.read_batch(
-                incoming_blocks,
-                out=packed_out,
-            )
+            with tide_range("tide.io.ssd.read.service"):
+                block_batch = block_reader.read_batch(
+                    incoming_blocks,
+                    out=packed_out,
+                )
             foreground_read_ms = (time.perf_counter() - read_start) * 1000.0
             if tuple(block_batch.block_ids) != tuple(incoming_blocks):
                 raise RuntimeError(
@@ -790,10 +793,11 @@ class GPUWorkingSet:
                     f"device={packed_cpu.device}"
                 )
             h2d_bytes = int(packed_cpu.numel()) * int(packed_cpu.element_size())
-            packed_gpu = packed_cpu.to(
-                self.device,
-                non_blocking=bool(packed_cpu.is_pinned()),
-            )
+            with tide_range("tide.gpu.transfer.h2d"):
+                packed_gpu = packed_cpu.to(
+                    self.device,
+                    non_blocking=bool(packed_cpu.is_pinned()),
+                )
             source_starts = []
             target_starts = []
             row_counts = []
@@ -1102,7 +1106,8 @@ class GPUWorkingSet:
                 if not (can_use_gpu_hotspots and bid in old_block_to_gpu_slice)
             ]
             read_start = time.perf_counter()
-            cold_blocks_source = block_reader.read_blocks(cold_ids_for_reader)
+            with tide_range("tide.io.ssd.read.service"):
+                cold_blocks_source = block_reader.read_blocks(cold_ids_for_reader)
             foreground_read_ms = (time.perf_counter() - read_start) * 1000.0
 
         offset = 0
@@ -1132,7 +1137,8 @@ class GPUWorkingSet:
                 # TieredCacheBlockReader    -> xyz | scale   | rot   | opacity | dc | rest
                 # ============================================================
                 block_tensor = cold_blocks_source[block_id][:block_len]
-                src_gpu = block_tensor.to(self.device, non_blocking=True)
+                with tide_range("tide.gpu.transfer.h2d"):
+                    src_gpu = block_tensor.to(self.device, non_blocking=True)
                 from storage.block_reader import BlockLayout  # local import avoids cold-path import cost
                 if cold_source_layout == BlockLayout.UNIFIED:
                     new_xyz[s] = src_gpu[:, 0:3]
@@ -1152,7 +1158,8 @@ class GPUWorkingSet:
                 # [Fallback] Read directly from unified_params (CPU pinned)
                 # Layout: xyz(3)|opacity(1)|scaling(3)|rotation(4)|dc(3)|rest(45)
                 src = unified_params.data[start_idx:end_idx]
-                src_gpu = src.to(self.device, non_blocking=True)
+                with tide_range("tide.gpu.transfer.h2d"):
+                    src_gpu = src.to(self.device, non_blocking=True)
                 new_xyz[s] = src_gpu[:, 0:3]
                 new_opacity[s] = src_gpu[:, 3:4]
                 new_scaling[s] = src_gpu[:, 4:7]
@@ -1162,7 +1169,8 @@ class GPUWorkingSet:
             elif active_blocks_ram is not None and block_id in active_blocks_ram:
                 # [Fallback] From TieredCache-style dict; cache layout.
                 block_tensor = active_blocks_ram[block_id]  # (block_size, 59) CPU
-                block_gpu = block_tensor[:block_len].to(self.device, non_blocking=True)
+                with tide_range("tide.gpu.transfer.h2d"):
+                    block_gpu = block_tensor[:block_len].to(self.device, non_blocking=True)
                 new_xyz[s] = block_gpu[:, 0:3]
                 new_scaling[s] = block_gpu[:, 3:6]
                 new_rotation[s] = block_gpu[:, 6:10]
@@ -1350,7 +1358,8 @@ class GPUWorkingSet:
             slot_idx + 1
         ) % len(self._writeback_staging_slots)
         available = self._writeback_slot_available[slot_idx]
-        available.wait()
+        with tide_range("tide.wait.gpu_writeback"):
+            available.wait()
         available.clear()
 
         staging = self._writeback_staging_slots[slot_idx]

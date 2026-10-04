@@ -17,6 +17,7 @@ from fast_tsp import find_tour as fast_tsp_find_tour
 
 from .tiered_cache_manager import TieredCacheManager
 from .gaussian_block import GaussianBlock, FrustumCuller
+from utils.tide_trace import tide_range
 
 
 class AsyncPipeline:
@@ -162,7 +163,8 @@ class AsyncPipeline:
         current iteration's SSD->RAM fetch.
         """
         try:
-            self.urgent_prefetch_queue.put_nowait((iteration, needed_blocks))
+            with tide_range("tide.io.ssd.read.submit"):
+                self.urgent_prefetch_queue.put_nowait((iteration, needed_blocks))
         except Exception:
             pass
 
@@ -173,27 +175,29 @@ class AsyncPipeline:
                     if future_target_iteration is None
                     else int(future_target_iteration)
                 )
-                self.future_prefetch_queue.put_nowait(
-                    (target_iteration, future_blocks)
-                )
+                with tide_range("tide.io.ssd.read.submit"):
+                    self.future_prefetch_queue.put_nowait(
+                        (target_iteration, future_blocks)
+                    )
             except Exception:
                 pass
 
     def wait_for_prefetch(self, iteration: int, timeout: float = 10.0) -> Dict[int, torch.Tensor]:
-        start_time = time.time()
-        self.stats['urgent_wait_calls'] += 1
+        with tide_range("tide.wait.prefetch"):
+            start_time = time.time()
+            self.stats['urgent_wait_calls'] += 1
 
-        while time.time() - start_time < timeout:
-            try:
-                iter_num, loaded_blocks, load_time = self.completed_queue.get(timeout=0.1)
-                if iter_num == iteration:
-                    self.stats['urgent_wait_time'] += time.time() - start_time
-                    return loaded_blocks
-            except Empty:
-                continue
+            while time.time() - start_time < timeout:
+                try:
+                    iter_num, loaded_blocks, load_time = self.completed_queue.get(timeout=0.1)
+                    if iter_num == iteration:
+                        self.stats['urgent_wait_time'] += time.time() - start_time
+                        return loaded_blocks
+                except Empty:
+                    continue
 
-        self.stats['urgent_wait_timeouts'] += 1
-        raise TimeoutError(f"Prefetch for iteration {iteration} timed out")
+            self.stats['urgent_wait_timeouts'] += 1
+            raise TimeoutError(f"Prefetch for iteration {iteration} timed out")
 
     def load_blocks_to_gpu(
         self,

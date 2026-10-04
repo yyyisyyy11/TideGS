@@ -16,7 +16,6 @@ from pathlib import Path
 
 import torch
 import torch.multiprocessing
-from torch.cuda import nvtx
 from tqdm import tqdm
 
 from utils.mem_monitor import MemMonitor
@@ -43,6 +42,7 @@ from strategies.tide_engine.runtime import (
 from utils.general_utils import safe_state, prepare_output_and_logger
 import utils.general_utils as utils
 from utils.timer import Timer, End2endTimer
+from utils.tide_trace import tide_range
 
 from storage.tide_storage_adapter import TideStorageAdapter
 from storage.compaction_scheduler import (
@@ -365,14 +365,15 @@ def _build_distributed_plan(
             else None
         )
         plan_start = time.perf_counter()
-        plan = planner.plan(
-            iteration=iteration,
-            epoch=schedule_info.epoch,
-            camera_ids=schedule_info.batch_indices,
-            camera_blocks=camera_blocks,
-            curvature_camera_ids=(rank0_curvature_camera_ids or None),
-            curvature_camera_blocks=curvature_camera_blocks,
-        )
+        with tide_range("tide.cpu.plan.initial"):
+            plan = planner.plan(
+                iteration=iteration,
+                epoch=schedule_info.epoch,
+                camera_ids=schedule_info.batch_indices,
+                camera_blocks=camera_blocks,
+                curvature_camera_ids=(rank0_curvature_camera_ids or None),
+                curvature_camera_blocks=curvature_camera_blocks,
+            )
         payload = plan.to_dict()
         payload["block_cull_ms"] = block_cull_ms
         payload["plan_ms"] = (time.perf_counter() - plan_start) * 1000.0
@@ -437,14 +438,15 @@ def _preview_distributed_plan(
             else None
         )
         plan_start = time.perf_counter()
-        plan, predicted_state = planner.preview(
-            iteration=iteration,
-            epoch=schedule_info.epoch,
-            camera_ids=schedule_info.batch_indices,
-            camera_blocks=camera_blocks,
-            curvature_camera_ids=(rank0_curvature_camera_ids or None),
-            curvature_camera_blocks=curvature_camera_blocks,
-        )
+        with tide_range("tide.cpu.plan.preview"):
+            plan, predicted_state = planner.preview(
+                iteration=iteration,
+                epoch=schedule_info.epoch,
+                camera_ids=schedule_info.batch_indices,
+                camera_blocks=camera_blocks,
+                curvature_camera_ids=(rank0_curvature_camera_ids or None),
+                curvature_camera_blocks=curvature_camera_blocks,
+            )
         plan_ms = (time.perf_counter() - plan_start) * 1000.0
         payload = plan.to_dict()
         payload["block_cull_ms"] = block_cull_ms
@@ -544,14 +546,15 @@ def _finalize_distributed_plan(
                 else None
             )
             plan_start = time.perf_counter()
-            exact_plan = planner.plan(
-                iteration=iteration,
-                epoch=schedule_info.epoch,
-                camera_ids=schedule_info.batch_indices,
-                camera_blocks=camera_blocks,
-                curvature_camera_ids=(rank0_curvature_camera_ids or None),
-                curvature_camera_blocks=curvature_camera_blocks,
-            )
+            with tide_range("tide.cpu.plan.finalize"):
+                exact_plan = planner.plan(
+                    iteration=iteration,
+                    epoch=schedule_info.epoch,
+                    camera_ids=schedule_info.batch_indices,
+                    camera_blocks=camera_blocks,
+                    curvature_camera_ids=(rank0_curvature_camera_ids or None),
+                    curvature_camera_blocks=curvature_camera_blocks,
+                )
             exact_plan_ms = (time.perf_counter() - plan_start) * 1000.0
         else:
             planner.restore_state(rank0_preview["predicted_state"])
@@ -1333,403 +1336,209 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     for iteration in range(
         start_from_this_iteration, opt_args.iterations + 1, args.bsz
     ):
-        # # rewrite the checking iterations
-        # ------------------------------------------------------------------------
-        # 2.1: Iteration setup and profiling
-        # ------------------------------------------------------------------------
-        # Optional: trace CUDA memory usage for debugging
-        if args.trace_cuda_mem:
-            if (iteration % args.log_interval) == 1 or (
-                iteration % args.densification_interval
-            ) == 0:
-                torch.cuda.memory._record_memory_history()
-                log_file.write(
-                    "[ITER {}] Tracing cuda memory usage.\n".format(iteration)
-                )
+        with tide_range("tide.batch.step"):
+            # # rewrite the checking iterations
+            # ------------------------------------------------------------------------
+            # 2.1: Iteration setup and profiling
+            # ------------------------------------------------------------------------
+            # Optional: trace CUDA memory usage for debugging
+            if args.trace_cuda_mem:
+                if (iteration % args.log_interval) == 1 or (
+                    iteration % args.densification_interval
+                ) == 0:
+                    torch.cuda.memory._record_memory_history()
+                    log_file.write(
+                        "[ITER {}] Tracing cuda memory usage.\n".format(iteration)
+                    )
 
-        # Update progress bar and iteration state
-        if iteration // args.bsz % 30 == 0:
-            progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
-        progress_bar.update(args.bsz)
-        utils.set_cur_iter(iteration)
-        optimizer_step = optimizer_step_from_iteration(iteration, int(args.bsz))
-        if optimizer_step != completed_optimizer_steps + 1:
-            raise RuntimeError(
-                "Global optimizer clock diverged from the training iteration: "
-                f"iteration={iteration} step={optimizer_step} "
-                f"completed={completed_optimizer_steps}"
-            )
-        gaussians.update_learning_rate(iteration)  # Learning rate scheduling
-        num_trained_batches += 1
-        last_iteration = iteration
-
-        # Optional: reset memory tracking for per-iteration profiling
-        if args.reset_each_iter:
-            torch.cuda.reset_max_memory_cached()
-            torch.cuda.reset_peak_memory_stats()
-            torch.cuda.reset_max_memory_allocated()
-
-        # Start timing this iteration
-        timers.clear()
-        timers.start("[iteration end2end]")
-
-        # Optional: NSight Systems profiling
-        if args.nsys_profile:
-            if iteration == args.nsys_profile_start_iter:
-                torch.cuda.cudart().cudaProfilerStart()
-            if (
-                iteration == args.nsys_profile_end_iter
-                or iteration == opt_args.iterations
-            ):
-                torch.cuda.cudart().cudaProfilerStop()
-            if (
-                iteration >= args.nsys_profile_start_iter
-                and iteration < args.nsys_profile_end_iter
-            ):
-                nvtx.range_push(f"iteration[{iteration},{iteration+args.bsz})")
-
-        # Gradually increase spherical harmonics degree (every 1000 iterations)
-        if forced_active_sh_degree >= 0:
-            gaussians.active_sh_degree = forced_active_sh_degree
-        elif utils.check_update_at_this_iter(iteration, args.bsz, 1000, 0):
-            gaussians.oneupSHdegree()
-
-        # ------------------------------------------------------------------------
-        # 2.2: Load training data (camera images)
-        # ------------------------------------------------------------------------
-        timers.start("dataloader: load the next image from disk and decode")
-
-        if (
-            optimizer_churn_tsv is None
-            and getattr(args, 'pure_ssd_offload', False)
-            and str(getattr(args, 'paper_optimizer_backend', '')).lower() == 'gpu_resident'
-            and str(getattr(args, 'paper_optimizer_state_mode', '')).lower() == 'resident_blocks'
-        ):
-            _enable_optimizer_churn_logging("pure_ssd_gpu_resident")
-
-        nvtx.range_push("Outer: next_camera_load")
-        schedule_info = get_camera_batch_schedule(
-            training_schedule=ssd_training_schedule,
-            iteration=iteration,
-            batch_size=args.bsz,
-            schedule_ordering=getattr(args, "ssd_schedule_ordering", "trajectory"),
-        )
-        global_batch_indices = schedule_info.batch_indices
-        if distributed_context.is_rank0:
-            canonical_batch_start_position = (
-                effective_trajectory_offset + int(schedule_info.batch_start_cam)
-            ) % len(ssd_training_schedule)
-            _append_camera_batch_metrics(
-                args.log_folder,
-                {
-                    "iteration": int(iteration),
-                    "optimizer_step": int(optimizer_step),
-                    "trajectory_start_offset": int(effective_trajectory_offset),
-                    "batch_start_position": int(canonical_batch_start_position),
-                    "camera_count": len(global_batch_indices),
-                    "camera_ids_json": json.dumps(
-                        [int(camera_id) for camera_id in global_batch_indices],
-                        separators=(",", ":"),
-                    ),
-                },
-            )
-        global_curvature_batch_indices = _curvature_camera_ids_for_step(
-            args=args,
-            training_schedule=ssd_training_schedule,
-            s1_camera_ids=global_batch_indices,
-            optimizer_step=optimizer_step,
-        )
-        if distributed_enabled:
-            if (
-                current_distributed_plan is None
-                or current_distributed_plan.iteration != iteration
-                or current_distributed_plan.global_camera_ids != global_batch_indices
-            ):
+            # Update progress bar and iteration state
+            if iteration // args.bsz % 30 == 0:
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+            progress_bar.update(args.bsz)
+            utils.set_cur_iter(iteration)
+            optimizer_step = optimizer_step_from_iteration(iteration, int(args.bsz))
+            if optimizer_step != completed_optimizer_steps + 1:
                 raise RuntimeError(
-                    f"Distributed plan mismatch at iteration {iteration}"
+                    "Global optimizer clock diverged from the training iteration: "
+                    f"iteration={iteration} step={optimizer_step} "
+                    f"completed={completed_optimizer_steps}"
                 )
+            gaussians.update_learning_rate(iteration)  # Learning rate scheduling
+            num_trained_batches += 1
+            last_iteration = iteration
+
+            # Optional: reset memory tracking for per-iteration profiling
+            if args.reset_each_iter:
+                torch.cuda.reset_max_memory_cached()
+                torch.cuda.reset_peak_memory_stats()
+                torch.cuda.reset_max_memory_allocated()
+
+            # Start timing this iteration
+            timers.clear()
+            timers.start("[iteration end2end]")
+
+            # Optional: NSight Systems profiling
+            if args.nsys_profile:
+                if iteration == args.nsys_profile_start_iter:
+                    torch.cuda.cudart().cudaProfilerStart()
+                if (
+                    iteration == args.nsys_profile_end_iter
+                    or iteration == opt_args.iterations
+                ):
+                    torch.cuda.cudart().cudaProfilerStop()
+
+            # Gradually increase spherical harmonics degree (every 1000 iterations)
+            if forced_active_sh_degree >= 0:
+                gaussians.active_sh_degree = forced_active_sh_degree
+            elif utils.check_update_at_this_iter(iteration, args.bsz, 1000, 0):
+                gaussians.oneupSHdegree()
+
+            # ------------------------------------------------------------------------
+            # 2.2: Load training data (camera images)
+            # ------------------------------------------------------------------------
+            timers.start("dataloader: load the next image from disk and decode")
+
             if (
-                current_distributed_plan.global_s2_camera_ids
-                != global_curvature_batch_indices
+                optimizer_churn_tsv is None
+                and getattr(args, 'pure_ssd_offload', False)
+                and str(getattr(args, 'paper_optimizer_backend', '')).lower() == 'gpu_resident'
+                and str(getattr(args, 'paper_optimizer_state_mode', '')).lower() == 'resident_blocks'
             ):
-                raise RuntimeError(
-                    f"Distributed S2 plan mismatch at iteration {iteration}"
+                _enable_optimizer_churn_logging("pure_ssd_gpu_resident")
+
+            with tide_range("tide.cpu.camera.schedule"):
+                schedule_info = get_camera_batch_schedule(
+                    training_schedule=ssd_training_schedule,
+                    iteration=iteration,
+                    batch_size=args.bsz,
+                    schedule_ordering=getattr(args, "ssd_schedule_ordering", "trajectory"),
                 )
-            batch_indices = current_distributed_plan.rank_camera_ids[
-                distributed_context.rank
-            ]
-            curvature_batch_indices = (
-                current_distributed_plan.rank_s2_camera_ids[
-                    distributed_context.rank
-                ]
-            )
-        else:
-            batch_indices = global_batch_indices
-            curvature_batch_indices = global_curvature_batch_indices
-        checkpoint_planner_state = (
-            distributed_planner.snapshot_state()
-            if distributed_enabled and distributed_context.is_rank0
-            else None
-        )
-        epoch = schedule_info.epoch
-        within_epoch_idx = schedule_info.within_epoch_idx
-        n_batches = schedule_info.num_batches
-        epoch_camera_offset = schedule_info.epoch_camera_offset
-
-        if optimizer_churn_tsv is not None:
-            if optimizer_churn_state['current_epoch'] is None:
-                optimizer_churn_state['current_epoch'] = epoch
-            elif epoch != optimizer_churn_state['current_epoch']:
-                _write_optimizer_churn_epoch(
-                    epoch_zero_based=optimizer_churn_state['current_epoch'],
-                    iteration_end=max(start_from_this_iteration, iteration - args.bsz),
+            global_batch_indices = schedule_info.batch_indices
+            if distributed_context.is_rank0:
+                canonical_batch_start_position = (
+                    effective_trajectory_offset + int(schedule_info.batch_start_cam)
+                ) % len(ssd_training_schedule)
+                _append_camera_batch_metrics(
+                    args.log_folder,
+                    {
+                        "iteration": int(iteration),
+                        "optimizer_step": int(optimizer_step),
+                        "trajectory_start_offset": int(effective_trajectory_offset),
+                        "batch_start_position": int(canonical_batch_start_position),
+                        "camera_count": len(global_batch_indices),
+                        "camera_ids_json": json.dumps(
+                            [int(camera_id) for camera_id in global_batch_indices],
+                            separators=(",", ":"),
+                        ),
+                    },
                 )
-                optimizer_churn_state['current_epoch'] = epoch
-
-        batched_cameras = camera_batch_prefetcher.get(batch_indices)
-        curvature_cameras = []
-        if curvature_batch_indices:
-            if curvature_camera_batch_prefetcher is None:
-                raise RuntimeError("3DGS2-TR S2 prefetcher is not initialized")
-            curvature_cameras = curvature_camera_batch_prefetcher.get(
-                curvature_batch_indices
-            )
-        nvtx.range_pop()
-
-        next_iteration = iteration + args.bsz
-        next_optimizer_step = optimizer_step + 1
-        next_curvature_camera_ids = []
-        if next_iteration <= opt_args.iterations:
-            next_schedule = get_camera_batch_schedule(
-                training_schedule=ssd_training_schedule,
-                iteration=next_iteration,
-                batch_size=args.bsz,
-                schedule_ordering=getattr(
-                    args, "ssd_schedule_ordering", "trajectory"
-                ),
-            )
-            next_curvature_camera_ids = _curvature_camera_ids_for_step(
+            global_curvature_batch_indices = _curvature_camera_ids_for_step(
                 args=args,
                 training_schedule=ssd_training_schedule,
-                s1_camera_ids=next_schedule.batch_indices,
-                optimizer_step=next_optimizer_step,
+                s1_camera_ids=global_batch_indices,
+                optimizer_step=optimizer_step,
             )
-        next_distributed_prediction = None
-        next_distributed_rank0_preview = None
-        if distributed_enabled and next_iteration <= opt_args.iterations:
-            nvtx.range_push("Outer: distributed_predictive_prefetch")
-            preview_start_ns = time.perf_counter_ns()
-            (
-                next_distributed_prediction,
-                _,
-                next_distributed_rank0_preview,
-            ) = _preview_distributed_plan(
-                context=distributed_context,
-                planner=distributed_planner,
-                storage_adapter=storage_adapter,
-                training_schedule=ssd_training_schedule,
-                iteration=next_iteration,
-                batch_size=args.bsz,
-                schedule_ordering=getattr(
-                    args, "ssd_schedule_ordering", "trajectory"
-                ),
-                curvature_camera_ids=next_curvature_camera_ids,
-            )
-            preview_end_ns = time.perf_counter_ns()
-            if timeline_writer is not None:
-                timeline_writer.write_timeline_event(
-                    name="preview_plan",
-                    lane="cpu",
-                    start_ns=preview_start_ns,
-                    end_ns=preview_end_ns,
-                    iteration=iteration,
-                    target_iteration=next_iteration,
-                )
-            rank = distributed_context.rank
-            current_resident = set(
-                current_distributed_plan.rank_resident_blocks[rank]
-            )
-            predicted_resident = set(
-                next_distributed_prediction.rank_resident_blocks[rank]
-            )
-            gaussians._block_reader.hint_future(
-                sorted(predicted_resident - current_resident),
-                target_iteration=next_iteration,
-            )
-            nvtx.range_pop()
-
-        if not distributed_enabled and next_iteration <= opt_args.iterations:
-            nvtx.range_push("Outer: next_camera_prefetch_submit")
-            camera_batch_prefetcher.submit(next_schedule.batch_indices)
-            if next_curvature_camera_ids:
-                if curvature_camera_batch_prefetcher is None:
-                    raise RuntimeError("3DGS2-TR S2 prefetcher is not initialized")
-                curvature_camera_batch_prefetcher.submit(
-                    next_curvature_camera_ids
-                )
-            nvtx.range_pop()
-
-        if iteration % 100 == 0:
-            log_file.write(
-                f"[SSD Schedule] Iter {iteration}: epoch={epoch}, "
-                f"within_epoch_batch={within_epoch_idx}/{n_batches}, "
-                f"camera_offset={epoch_camera_offset}, "
-                f"Global camera indices: {global_batch_indices[:3]}..."
-                f"{global_batch_indices[-1]}; local={batch_indices}\n"
-            )
-
-        timers.stop("dataloader: load the next image from disk and decode")
-
-        # ------------------------------------------------------------------------
-        # 2.3: Transfer camera matrices to GPU
-        # ------------------------------------------------------------------------
-        nvtx.range_push("Outer: camera_h2d")
-        timers.start("send cam matrices to gpu")
-        with torch.no_grad():
-            _prepare_camera_batch_on_gpu(batched_cameras, batch_indices)
-            _prepare_camera_batch_on_gpu(
-                curvature_cameras,
-                curvature_batch_indices,
-            )
-        timers.stop("send cam matrices to gpu")
-        nvtx.range_pop()
-        assert args.bsz > 1, "Pipelined offload requires batch size > 1"
-        losses, ordered_cams, sparsity = train_tide_batch(
-            gaussians=gaussians,
-            scene=scene,
-            batched_cameras=batched_cameras,
-            parameters_grad_buffer=gaussians.parameters_grad_buffer,
-            background=background,
-            pipe_args=pipe_args,
-            comm_stream=comm_stream,
-            perm_generator=perm_generator,
-            storage_adapter=storage_adapter,
-            training_schedule=ssd_training_schedule,
-            distributed_plan=current_distributed_plan,
-            distributed_context=distributed_context,
-            curvature_cameras=curvature_cameras,
-            optimizer_step=optimizer_step,
-        )
-
-        completed_optimizer_steps = optimizer_step
-        gaussians._tide_global_optimizer_step = int(completed_optimizer_steps)
-        args._tide_global_optimizer_step = int(completed_optimizer_steps)
-
-        mem_mon.tick(iteration)
-
-        if len(losses) == 0:
             if distributed_enabled:
-                raise RuntimeError(
-                    f"Distributed rank {distributed_context.rank} produced no loss at "
-                    f"iteration {iteration}"
-                )
-            log_file.write(
-                f"[WARNING] Iteration {iteration}: All {len(batched_cameras)} cameras see no Gaussians; "
-                "skipping optimizer step.\n"
-            )
-            for camera in batched_cameras + curvature_cameras:
-                camera.original_image = None
-            continue
-
-        batched_cameras = [batched_cameras[i] for i in ordered_cams]
-
-        nvtx.range_push("Outer: loss_sync")
-        timers.start("sync_loss_and_log")
-        batched_losses = torch.stack(losses)
-        local_loss_cpu = batched_losses.cpu().numpy()
-        if distributed_enabled:
-            local_payload = {
-                "records": [
-                    (
-                        int(camera.global_idx),
-                        float(loss),
-                        str(camera.image_name),
-                    )
-                    for camera, loss in zip(batched_cameras, local_loss_cpu)
-                ],
-                "sparsity": float(sparsity),
-            }
-            rank_payloads = distributed_context.all_gather_object(local_payload)
-            records = [
-                record
-                for payload in rank_payloads
-                for record in payload["records"]
-            ]
-            if len(records) != len(global_batch_indices):
-                raise RuntimeError(
-                    f"Distributed loss count mismatch: got={len(records)} "
-                    f"expected={len(global_batch_indices)}"
-                )
-            by_camera = {camera_id: (loss, image_name) for camera_id, loss, image_name in records}
-            if len(by_camera) != len(global_batch_indices):
-                raise RuntimeError("Distributed camera batch contains duplicate camera IDs")
-            try:
-                ordered_records = [by_camera[camera_id] for camera_id in global_batch_indices]
-            except KeyError as exc:
-                raise RuntimeError(
-                    f"Distributed loss is missing camera {int(exc.args[0])}"
-                ) from exc
-            batched_loss_cpu = np.asarray(
-                [record[0] for record in ordered_records], dtype=np.float32
-            )
-            logged_image_names = [record[1] for record in ordered_records]
-            logged_sparsity = [payload["sparsity"] for payload in rank_payloads]
-        else:
-            batched_loss_cpu = local_loss_cpu
-            logged_image_names = [camera.image_name for camera in batched_cameras]
-            logged_sparsity = sparsity
-        nvtx.range_pop()
-
-        nvtx.range_push("Outer: batch_logging")
-        ema_loss_for_log = (
-            batched_loss_cpu.mean()
-            if ema_loss_for_log is None
-            else 0.6 * ema_loss_for_log + 0.4 * batched_loss_cpu.mean()
-        )
-
-        if not distributed_enabled or distributed_context.is_rank0:
-            train_dataset.update_losses(batched_loss_cpu)
-
-        batched_loss_cpu = [round(loss, 6) for loss in batched_loss_cpu]
-        log_file.write(
-            "iteration[{},{}), loss: {} sparsity: {} image: {}\n".format(
-                iteration,
-                iteration + args.bsz,
-                batched_loss_cpu,
-                logged_sparsity,
-                logged_image_names,
-            )
-        )
-        timers.stop("sync_loss_and_log")
-        nvtx.range_pop()
-
-        if distributed_enabled:
-            next_distributed_plan = None
-            if next_iteration <= opt_args.iterations:
-                if next_distributed_prediction is None:
+                if (
+                    current_distributed_plan is None
+                    or current_distributed_plan.iteration != iteration
+                    or current_distributed_plan.global_camera_ids != global_batch_indices
+                ):
                     raise RuntimeError(
-                        f"Missing distributed prediction for iteration {next_iteration}"
+                        f"Distributed plan mismatch at iteration {iteration}"
                     )
-                finalize_start_ns = time.perf_counter_ns()
-                next_distributed_plan, _ = _finalize_distributed_plan(
+                if (
+                    current_distributed_plan.global_s2_camera_ids
+                    != global_curvature_batch_indices
+                ):
+                    raise RuntimeError(
+                        f"Distributed S2 plan mismatch at iteration {iteration}"
+                    )
+                batch_indices = current_distributed_plan.rank_camera_ids[
+                    distributed_context.rank
+                ]
+                curvature_batch_indices = (
+                    current_distributed_plan.rank_s2_camera_ids[
+                        distributed_context.rank
+                    ]
+                )
+            else:
+                batch_indices = global_batch_indices
+                curvature_batch_indices = global_curvature_batch_indices
+            checkpoint_planner_state = (
+                distributed_planner.snapshot_state()
+                if distributed_enabled and distributed_context.is_rank0
+                else None
+            )
+            epoch = schedule_info.epoch
+            within_epoch_idx = schedule_info.within_epoch_idx
+            n_batches = schedule_info.num_batches
+            epoch_camera_offset = schedule_info.epoch_camera_offset
+
+            if optimizer_churn_tsv is not None:
+                if optimizer_churn_state['current_epoch'] is None:
+                    optimizer_churn_state['current_epoch'] = epoch
+                elif epoch != optimizer_churn_state['current_epoch']:
+                    _write_optimizer_churn_epoch(
+                        epoch_zero_based=optimizer_churn_state['current_epoch'],
+                        iteration_end=max(start_from_this_iteration, iteration - args.bsz),
+                    )
+                    optimizer_churn_state['current_epoch'] = epoch
+
+            with tide_range("tide.wait.camera_prefetch"):
+                batched_cameras = camera_batch_prefetcher.get(batch_indices)
+                curvature_cameras = []
+                if curvature_batch_indices:
+                    if curvature_camera_batch_prefetcher is None:
+                        raise RuntimeError("3DGS2-TR S2 prefetcher is not initialized")
+                    curvature_cameras = curvature_camera_batch_prefetcher.get(
+                        curvature_batch_indices
+                    )
+            next_iteration = iteration + args.bsz
+            next_optimizer_step = optimizer_step + 1
+            next_curvature_camera_ids = []
+            if next_iteration <= opt_args.iterations:
+                next_schedule = get_camera_batch_schedule(
+                    training_schedule=ssd_training_schedule,
+                    iteration=next_iteration,
+                    batch_size=args.bsz,
+                    schedule_ordering=getattr(
+                        args, "ssd_schedule_ordering", "trajectory"
+                    ),
+                )
+                next_curvature_camera_ids = _curvature_camera_ids_for_step(
+                    args=args,
+                    training_schedule=ssd_training_schedule,
+                    s1_camera_ids=next_schedule.batch_indices,
+                    optimizer_step=next_optimizer_step,
+                )
+            next_distributed_prediction = None
+            next_distributed_rank0_preview = None
+            if distributed_enabled and next_iteration <= opt_args.iterations:
+                preview_start_ns = time.perf_counter_ns()
+                (
+                    next_distributed_prediction,
+                    _,
+                    next_distributed_rank0_preview,
+                ) = _preview_distributed_plan(
                     context=distributed_context,
                     planner=distributed_planner,
                     storage_adapter=storage_adapter,
                     training_schedule=ssd_training_schedule,
                     iteration=next_iteration,
                     batch_size=args.bsz,
-                    schedule_ordering=getattr(args, "ssd_schedule_ordering", "trajectory"),
-                    predicted_plan=next_distributed_prediction,
-                    rank0_preview=next_distributed_rank0_preview,
+                    schedule_ordering=getattr(
+                        args, "ssd_schedule_ordering", "trajectory"
+                    ),
                     curvature_camera_ids=next_curvature_camera_ids,
                 )
-                finalize_end_ns = time.perf_counter_ns()
+                preview_end_ns = time.perf_counter_ns()
                 if timeline_writer is not None:
                     timeline_writer.write_timeline_event(
-                        name="finalize_plan",
+                        name="preview_plan",
                         lane="cpu",
-                        start_ns=finalize_start_ns,
-                        end_ns=finalize_end_ns,
+                        start_ns=preview_start_ns,
+                        end_ns=preview_end_ns,
                         iteration=iteration,
                         target_iteration=next_iteration,
                     )
@@ -1737,213 +1546,384 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 current_resident = set(
                     current_distributed_plan.rank_resident_blocks[rank]
                 )
-                next_resident = set(
-                    next_distributed_plan.rank_resident_blocks[rank]
-                )
                 predicted_resident = set(
                     next_distributed_prediction.rank_resident_blocks[rank]
                 )
                 gaussians._block_reader.hint_future(
-                    sorted(
-                        (next_resident - current_resident)
-                        - (predicted_resident - current_resident)
-                    ),
+                    sorted(predicted_resident - current_resident),
                     target_iteration=next_iteration,
                 )
-                camera_batch_prefetcher.submit(
-                    next_distributed_plan.rank_camera_ids[rank]
-                )
-                next_rank_s2 = next_distributed_plan.rank_s2_camera_ids[rank]
-                if next_rank_s2:
+
+            if not distributed_enabled and next_iteration <= opt_args.iterations:
+                camera_batch_prefetcher.submit(next_schedule.batch_indices)
+                if next_curvature_camera_ids:
                     if curvature_camera_batch_prefetcher is None:
-                        raise RuntimeError(
-                            "3DGS2-TR S2 prefetcher is not initialized"
-                        )
-                    curvature_camera_batch_prefetcher.submit(next_rank_s2)
-            current_distributed_plan = next_distributed_plan
+                        raise RuntimeError("3DGS2-TR S2 prefetcher is not initialized")
+                    curvature_camera_batch_prefetcher.submit(
+                        next_curvature_camera_ids
+                    )
 
-        matched_checkpoint_iterations = [
-            checkpoint_iteration
-            for checkpoint_iteration in args.checkpoint_iterations
-            if iteration <= checkpoint_iteration < iteration + args.bsz
-        ]
-        periodic_compaction_iteration = crossed_periodic_iteration(
-            iteration=iteration,
-            batch_size=args.bsz,
-            interval_iterations=(
-                args.tide_storage_compaction_interval_iterations
-            ),
-        )
-        is_final_batch = next_iteration > opt_args.iterations
-        if matched_checkpoint_iterations or is_final_batch:
-            _run_synchronized_training_phase(
-                distributed_context,
-                phase="resident dirty flush",
-                operation=storage_adapter.flush_resident_dirty,
-            )
-        compaction_result = run_compaction_maintenance(
-            context=distributed_context,
-            storage_adapter=storage_adapter,
-            iteration=iteration,
-            periodic_iteration=periodic_compaction_iteration,
-            target_patch_files=(
-                args.tide_storage_compaction_target_patch_files
-            ),
-            rank_concurrency=args.tide_storage_compaction_rank_concurrency,
-            flush_dirty_cache=bool(
-                matched_checkpoint_iterations or is_final_batch
-            ),
-        )
-        if compaction_result is not None:
-            get_distributed_metrics_writer(
-                gaussians,
-                distributed_context,
-            ).write_compaction(compaction_result)
-            utils.print_rank_0(
-                "[SSD COMPACTION] "
-                f"trigger={compaction_result['trigger']} "
-                f"iteration={compaction_result['iteration']} "
-                f"target_patches="
-                f"{args.tide_storage_compaction_target_patch_files}"
-            )
-            if is_final_batch:
-                final_storage_maintenance_complete = True
-
-        with torch.no_grad():
-            if any(
-                [
-                    iteration <= save_iteration < iteration + args.bsz
-                    for save_iteration in args.save_iterations
-                ]
-            ):
-                utils.print_rank_0("\n[ITER {}] Saving End2end".format(iteration))
-                end2end_timers.stop()
-                end2end_timers.print_time(log_file, iteration + args.bsz)
-
-                skip_msg = (
-                    f"[ITER {iteration}] SKIP model save: pure SSD release "
-                    "keeps the full parameter table out-of-core. Use "
-                    "--checkpoint_iterations for resumable state, or "
-                    "tools/export_pure_ssd_checkpoint_to_ply.py for PLY preview/export.\n"
-                )
-                utils.print_rank_0(skip_msg.rstrip())
-                log_file.write(skip_msg)
-
-                end2end_timers.start()
-
-            # ------------------------------------------------------------------------
-            # 2.10: Save training checkpoint (for resuming)
-            # ------------------------------------------------------------------------
-            if matched_checkpoint_iterations:
-                end2end_timers.stop()
-                checkpoint_iteration = matched_checkpoint_iterations[-1]
-                save_folder = os.path.join(
-                    scene.model_path,
-                    "checkpoints",
-                    str(checkpoint_iteration),
-                )
-                utils.print_rank_0(
-                    f"\n[ITER {iteration}] Saving Pure SSD Checkpoint {checkpoint_iteration}"
-                )
+            if iteration % 100 == 0:
                 log_file.write(
-                    f"[ITER {iteration}] Saving Pure SSD Checkpoint {checkpoint_iteration}\n"
+                    f"[SSD Schedule] Iter {iteration}: epoch={epoch}, "
+                    f"within_epoch_batch={within_epoch_idx}/{n_batches}, "
+                    f"camera_offset={epoch_camera_offset}, "
+                    f"Global camera indices: {global_batch_indices[:3]}..."
+                    f"{global_batch_indices[-1]}; local={batch_indices}\n"
                 )
-                _run_synchronized_training_phase(
-                    distributed_context,
-                    phase="checkpoint writeback drain",
-                    operation=storage_adapter.drain_cache_writebacks,
+
+            timers.stop("dataloader: load the next image from disk and decode")
+
+            # ------------------------------------------------------------------------
+            # 2.3: Transfer camera matrices to GPU
+            # ------------------------------------------------------------------------
+            timers.start("send cam matrices to gpu")
+            with tide_range("tide.gpu.transfer.h2d"), torch.no_grad():
+                _prepare_camera_batch_on_gpu(batched_cameras, batch_indices)
+                _prepare_camera_batch_on_gpu(
+                    curvature_cameras,
+                    curvature_batch_indices,
                 )
-                pure_ssd_checkpoint_mode = str(
-                    getattr(args, "pure_ssd_checkpoint_mode", "incremental")
-                ).lower()
+            timers.stop("send cam matrices to gpu")
+            assert args.bsz > 1, "Pipelined offload requires batch size > 1"
+            with tide_range("tide.batch.compute"):
+                losses, ordered_cams, sparsity = train_tide_batch(
+                    gaussians=gaussians,
+                    scene=scene,
+                    batched_cameras=batched_cameras,
+                    parameters_grad_buffer=gaussians.parameters_grad_buffer,
+                    background=background,
+                    pipe_args=pipe_args,
+                    comm_stream=comm_stream,
+                    perm_generator=perm_generator,
+                    storage_adapter=storage_adapter,
+                    training_schedule=ssd_training_schedule,
+                    distributed_plan=current_distributed_plan,
+                    distributed_context=distributed_context,
+                    curvature_cameras=curvature_cameras,
+                    optimizer_step=optimizer_step,
+                )
+
+            completed_optimizer_steps = optimizer_step
+            gaussians._tide_global_optimizer_step = int(completed_optimizer_steps)
+            args._tide_global_optimizer_step = int(completed_optimizer_steps)
+
+            mem_mon.tick(iteration)
+
+            if len(losses) == 0:
                 if distributed_enabled:
-                    write_distributed_incremental_checkpoint(
-                        context=distributed_context,
-                        storage_adapter=storage_adapter,
-                        gaussians=gaussians,
-                        checkpoint_dir=save_folder,
-                        iteration=checkpoint_iteration,
-                        next_iteration=iteration + args.bsz,
-                        args=args,
-                        block_owner=args._tide_block_owner,
-                        planner_state=checkpoint_planner_state,
-                        global_optimizer_step=completed_optimizer_steps,
-                        log_file=log_file,
+                    raise RuntimeError(
+                        f"Distributed rank {distributed_context.rank} produced no loss at "
+                        f"iteration {iteration}"
                     )
-                elif pure_ssd_checkpoint_mode == "snapshot":
-                    write_pure_ssd_snapshot_checkpoint(
-                        storage_adapter=storage_adapter,
-                        gaussians=gaussians,
-                        checkpoint_dir=save_folder,
-                        iteration=checkpoint_iteration,
-                        next_iteration=iteration + args.bsz,
-                        args=args,
-                        chunk_blocks=getattr(args, "pure_ssd_checkpoint_chunk_blocks", 256),
-                        log_file=log_file,
+                log_file.write(
+                    f"[WARNING] Iteration {iteration}: All {len(batched_cameras)} cameras see no Gaussians; "
+                    "skipping optimizer step.\n"
+                )
+                for camera in batched_cameras + curvature_cameras:
+                    camera.original_image = None
+                continue
+
+            batched_cameras = [batched_cameras[i] for i in ordered_cams]
+
+            timers.start("sync_loss_and_log")
+            with tide_range("tide.cpu.loss_sync"):
+                batched_losses = torch.stack(losses)
+                local_loss_cpu = batched_losses.cpu().numpy()
+            if distributed_enabled:
+                local_payload = {
+                    "records": [
+                        (
+                            int(camera.global_idx),
+                            float(loss),
+                            str(camera.image_name),
+                        )
+                        for camera, loss in zip(batched_cameras, local_loss_cpu)
+                    ],
+                    "sparsity": float(sparsity),
+                }
+                rank_payloads = distributed_context.all_gather_object(local_payload)
+                records = [
+                    record
+                    for payload in rank_payloads
+                    for record in payload["records"]
+                ]
+                if len(records) != len(global_batch_indices):
+                    raise RuntimeError(
+                        f"Distributed loss count mismatch: got={len(records)} "
+                        f"expected={len(global_batch_indices)}"
                     )
-                else:
-                    write_pure_ssd_incremental_checkpoint(
-                        storage_adapter=storage_adapter,
-                        gaussians=gaussians,
-                        checkpoint_dir=save_folder,
-                        iteration=checkpoint_iteration,
-                        next_iteration=iteration + args.bsz,
-                        args=args,
-                        log_file=log_file,
-                    )
-                prune_operation = None
+                by_camera = {camera_id: (loss, image_name) for camera_id, loss, image_name in records}
+                if len(by_camera) != len(global_batch_indices):
+                    raise RuntimeError("Distributed camera batch contains duplicate camera IDs")
+                try:
+                    ordered_records = [by_camera[camera_id] for camera_id in global_batch_indices]
+                except KeyError as exc:
+                    raise RuntimeError(
+                        f"Distributed loss is missing camera {int(exc.args[0])}"
+                    ) from exc
+                batched_loss_cpu = np.asarray(
+                    [record[0] for record in ordered_records], dtype=np.float32
+                )
+                logged_image_names = [record[1] for record in ordered_records]
+                logged_sparsity = [payload["sparsity"] for payload in rank_payloads]
+            else:
+                batched_loss_cpu = local_loss_cpu
+                logged_image_names = [camera.image_name for camera in batched_cameras]
+                logged_sparsity = sparsity
+            ema_loss_for_log = (
+                batched_loss_cpu.mean()
+                if ema_loss_for_log is None
+                else 0.6 * ema_loss_for_log + 0.4 * batched_loss_cpu.mean()
+            )
+
+            with tide_range("tide.cpu.logging"):
                 if not distributed_enabled or distributed_context.is_rank0:
-                    prune_operation = lambda: prune_checkpoint_history(
-                        scene.model_path,
-                        keep_last=getattr(args, "pure_ssd_checkpoint_keep_last", 2),
-                        log_file=log_file,
+                    train_dataset.update_losses(batched_loss_cpu)
+
+                batched_loss_cpu = [round(loss, 6) for loss in batched_loss_cpu]
+                log_file.write(
+                    "iteration[{},{}), loss: {} sparsity: {} image: {}\n".format(
+                        iteration,
+                        iteration + args.bsz,
+                        batched_loss_cpu,
+                        logged_sparsity,
+                        logged_image_names,
                     )
+                )
+            timers.stop("sync_loss_and_log")
+
+            if distributed_enabled:
+                next_distributed_plan = None
+                if next_iteration <= opt_args.iterations:
+                    if next_distributed_prediction is None:
+                        raise RuntimeError(
+                            f"Missing distributed prediction for iteration {next_iteration}"
+                        )
+                    finalize_start_ns = time.perf_counter_ns()
+                    next_distributed_plan, _ = _finalize_distributed_plan(
+                        context=distributed_context,
+                        planner=distributed_planner,
+                        storage_adapter=storage_adapter,
+                        training_schedule=ssd_training_schedule,
+                        iteration=next_iteration,
+                        batch_size=args.bsz,
+                        schedule_ordering=getattr(args, "ssd_schedule_ordering", "trajectory"),
+                        predicted_plan=next_distributed_prediction,
+                        rank0_preview=next_distributed_rank0_preview,
+                        curvature_camera_ids=next_curvature_camera_ids,
+                    )
+                    finalize_end_ns = time.perf_counter_ns()
+                    if timeline_writer is not None:
+                        timeline_writer.write_timeline_event(
+                            name="finalize_plan",
+                            lane="cpu",
+                            start_ns=finalize_start_ns,
+                            end_ns=finalize_end_ns,
+                            iteration=iteration,
+                            target_iteration=next_iteration,
+                        )
+                    rank = distributed_context.rank
+                    current_resident = set(
+                        current_distributed_plan.rank_resident_blocks[rank]
+                    )
+                    next_resident = set(
+                        next_distributed_plan.rank_resident_blocks[rank]
+                    )
+                    predicted_resident = set(
+                        next_distributed_prediction.rank_resident_blocks[rank]
+                    )
+                    gaussians._block_reader.hint_future(
+                        sorted(
+                            (next_resident - current_resident)
+                            - (predicted_resident - current_resident)
+                        ),
+                        target_iteration=next_iteration,
+                    )
+                    camera_batch_prefetcher.submit(
+                        next_distributed_plan.rank_camera_ids[rank]
+                    )
+                    next_rank_s2 = next_distributed_plan.rank_s2_camera_ids[rank]
+                    if next_rank_s2:
+                        if curvature_camera_batch_prefetcher is None:
+                            raise RuntimeError(
+                                "3DGS2-TR S2 prefetcher is not initialized"
+                            )
+                        curvature_camera_batch_prefetcher.submit(next_rank_s2)
+                current_distributed_plan = next_distributed_plan
+
+            matched_checkpoint_iterations = [
+                checkpoint_iteration
+                for checkpoint_iteration in args.checkpoint_iterations
+                if iteration <= checkpoint_iteration < iteration + args.bsz
+            ]
+            periodic_compaction_iteration = crossed_periodic_iteration(
+                iteration=iteration,
+                batch_size=args.bsz,
+                interval_iterations=(
+                    args.tide_storage_compaction_interval_iterations
+                ),
+            )
+            is_final_batch = next_iteration > opt_args.iterations
+            if matched_checkpoint_iterations or is_final_batch:
                 _run_synchronized_training_phase(
                     distributed_context,
-                    phase="checkpoint history prune",
-                    operation=prune_operation,
+                    phase="resident dirty flush",
+                    operation=storage_adapter.flush_resident_dirty,
                 )
-                distributed_context.barrier()
-                end2end_timers.start()
+            compaction_result = run_compaction_maintenance(
+                context=distributed_context,
+                storage_adapter=storage_adapter,
+                iteration=iteration,
+                periodic_iteration=periodic_compaction_iteration,
+                target_patch_files=(
+                    args.tide_storage_compaction_target_patch_files
+                ),
+                rank_concurrency=args.tide_storage_compaction_rank_concurrency,
+                flush_dirty_cache=bool(
+                    matched_checkpoint_iterations or is_final_batch
+                ),
+            )
+            if compaction_result is not None:
+                get_distributed_metrics_writer(
+                    gaussians,
+                    distributed_context,
+                ).write_compaction(compaction_result)
+                utils.print_rank_0(
+                    "[SSD COMPACTION] "
+                    f"trigger={compaction_result['trigger']} "
+                    f"iteration={compaction_result['iteration']} "
+                    f"target_patches="
+                    f"{args.tide_storage_compaction_target_patch_files}"
+                )
+                if is_final_batch:
+                    final_storage_maintenance_complete = True
 
-        # ------------------------------------------------------------------------
-        # 2.12: Iteration cleanup
-        # ------------------------------------------------------------------------
-        if storage_adapter is None:
-            torch.cuda.synchronize()
+            with torch.no_grad():
+                if any(
+                    [
+                        iteration <= save_iteration < iteration + args.bsz
+                        for save_iteration in args.save_iterations
+                    ]
+                ):
+                    utils.print_rank_0("\n[ITER {}] Saving End2end".format(iteration))
+                    end2end_timers.stop()
+                    end2end_timers.print_time(log_file, iteration + args.bsz)
 
-        # Release camera image memory
-        nvtx.range_push("Outer: camera_cleanup")
-        for viewpoint_cam in batched_cameras:
-            viewpoint_cam.original_image = None
-        for viewpoint_cam in curvature_cameras:
-            viewpoint_cam.original_image = None
-        nvtx.range_pop()
+                    skip_msg = (
+                        f"[ITER {iteration}] SKIP model save: pure SSD release "
+                        "keeps the full parameter table out-of-core. Use "
+                        "--checkpoint_iterations for resumable state, or "
+                        "tools/export_pure_ssd_checkpoint_to_ply.py for PLY preview/export.\n"
+                    )
+                    utils.print_rank_0(skip_msg.rstrip())
+                    log_file.write(skip_msg)
 
-        # End profiling range if active
-        if args.nsys_profile:
-            if (
-                iteration >= args.nsys_profile_start_iter
-                and iteration < args.nsys_profile_end_iter
-            ):
-                nvtx.range_pop()
+                    end2end_timers.start()
 
-        # Print timing statistics
-        if utils.check_enable_python_timer():
-            timers.stop("[iteration end2end]")
-            timers.printTimers(iteration, mode="sum")
+                # ------------------------------------------------------------------------
+                # 2.10: Save training checkpoint (for resuming)
+                # ------------------------------------------------------------------------
+                if matched_checkpoint_iterations:
+                    end2end_timers.stop()
+                    checkpoint_iteration = matched_checkpoint_iterations[-1]
+                    save_folder = os.path.join(
+                        scene.model_path,
+                        "checkpoints",
+                        str(checkpoint_iteration),
+                    )
+                    utils.print_rank_0(
+                        f"\n[ITER {iteration}] Saving Pure SSD Checkpoint {checkpoint_iteration}"
+                    )
+                    log_file.write(
+                        f"[ITER {iteration}] Saving Pure SSD Checkpoint {checkpoint_iteration}\n"
+                    )
+                    _run_synchronized_training_phase(
+                        distributed_context,
+                        phase="checkpoint writeback drain",
+                        operation=storage_adapter.drain_cache_writebacks,
+                    )
+                    pure_ssd_checkpoint_mode = str(
+                        getattr(args, "pure_ssd_checkpoint_mode", "incremental")
+                    ).lower()
+                    if distributed_enabled:
+                        write_distributed_incremental_checkpoint(
+                            context=distributed_context,
+                            storage_adapter=storage_adapter,
+                            gaussians=gaussians,
+                            checkpoint_dir=save_folder,
+                            iteration=checkpoint_iteration,
+                            next_iteration=iteration + args.bsz,
+                            args=args,
+                            block_owner=args._tide_block_owner,
+                            planner_state=checkpoint_planner_state,
+                            global_optimizer_step=completed_optimizer_steps,
+                            log_file=log_file,
+                        )
+                    elif pure_ssd_checkpoint_mode == "snapshot":
+                        write_pure_ssd_snapshot_checkpoint(
+                            storage_adapter=storage_adapter,
+                            gaussians=gaussians,
+                            checkpoint_dir=save_folder,
+                            iteration=checkpoint_iteration,
+                            next_iteration=iteration + args.bsz,
+                            args=args,
+                            chunk_blocks=getattr(args, "pure_ssd_checkpoint_chunk_blocks", 256),
+                            log_file=log_file,
+                        )
+                    else:
+                        write_pure_ssd_incremental_checkpoint(
+                            storage_adapter=storage_adapter,
+                            gaussians=gaussians,
+                            checkpoint_dir=save_folder,
+                            iteration=checkpoint_iteration,
+                            next_iteration=iteration + args.bsz,
+                            args=args,
+                            log_file=log_file,
+                        )
+                    prune_operation = None
+                    if not distributed_enabled or distributed_context.is_rank0:
+                        prune_operation = lambda: prune_checkpoint_history(
+                            scene.model_path,
+                            keep_last=getattr(args, "pure_ssd_checkpoint_keep_last", 2),
+                            log_file=log_file,
+                        )
+                    _run_synchronized_training_phase(
+                        distributed_context,
+                        phase="checkpoint history prune",
+                        operation=prune_operation,
+                    )
+                    distributed_context.barrier()
+                    end2end_timers.start()
 
-        # Dump CUDA memory trace if enabled
-        if args.trace_cuda_mem:
-            if (iteration % args.log_interval) == 1 or (
-                iteration % args.densification_interval
-            ) == 0:
-                dump_name = args.log_folder + f"/trace_dump/iter={iteration}"
-                torch.cuda.memory._dump_snapshot(filename=dump_name)
-                torch.cuda.memory._record_memory_history(enabled=None)
+            # ------------------------------------------------------------------------
+            # 2.12: Iteration cleanup
+            # ------------------------------------------------------------------------
+            if storage_adapter is None:
+                torch.cuda.synchronize()
 
-        utils.memory_report("at the end of the iteration")
-        log_file.flush()
+            # Release camera image memory
+            for viewpoint_cam in batched_cameras:
+                viewpoint_cam.original_image = None
+            for viewpoint_cam in curvature_cameras:
+                viewpoint_cam.original_image = None
+
+            # Print timing statistics
+            if utils.check_enable_python_timer():
+                timers.stop("[iteration end2end]")
+                timers.printTimers(iteration, mode="sum")
+
+            # Dump CUDA memory trace if enabled
+            if args.trace_cuda_mem:
+                if (iteration % args.log_interval) == 1 or (
+                    iteration % args.densification_interval
+                ) == 0:
+                    dump_name = args.log_folder + f"/trace_dump/iter={iteration}"
+                    torch.cuda.memory._dump_snapshot(filename=dump_name)
+                    torch.cuda.memory._record_memory_history(enabled=None)
+
+            utils.memory_report("at the end of the iteration")
+            log_file.flush()
 
     if optimizer_churn_tsv is not None and optimizer_churn_state['current_epoch'] is not None:
         _write_optimizer_churn_epoch(

@@ -8,6 +8,7 @@ import os
 import torch.nn as nn
 import gc
 from typing import Optional, List, Dict, Tuple
+from utils.tide_trace import tide_range
 
 from strategies.tide_engine.gpu_resident_optimizer import (
     GPUResidentAdam,
@@ -512,19 +513,20 @@ def pipeline_forward_one_step_shs_inplace(
     image_width = int(utils.get_img_width())
     image_height = int(utils.get_img_height())
 
-    batched_radiis, batched_means2D, batched_depths, batched_conics, _ = (
-        fully_fused_projection(
-            means=filtered_xyz_gpu,  # (N, 3)
-            covars=None,
-            quats=filtered_rotation_gpu,
-            scales=filtered_scaling_gpu,
-            viewmats=viewmat.unsqueeze(0),
-            Ks=K.unsqueeze(0),
-            width=image_width,
-            height=image_height,
-            packed=False,
-        )
-    )  # (1, N), (1, N, 2), (1, N), (1, N, 3), (1, N)
+    with tide_range("tide.gpu.forward.projection"):
+        batched_radiis, batched_means2D, batched_depths, batched_conics, _ = (
+            fully_fused_projection(
+                means=filtered_xyz_gpu,  # (N, 3)
+                covars=None,
+                quats=filtered_rotation_gpu,
+                scales=filtered_scaling_gpu,
+                viewmats=viewmat.unsqueeze(0),
+                Ks=K.unsqueeze(0),
+                width=image_width,
+                height=image_height,
+                packed=False,
+            )
+        )  # (1, N), (1, N, 2), (1, N), (1, N, 3), (1, N)
 
     batched_means2D.retain_grad()  # this is only for training.
 
@@ -546,18 +548,19 @@ def pipeline_forward_one_step_shs_inplace(
             (5,), dtype=torch.long, device=batched_means2D.device
         )
     else:
-        tile_keep_mask, candidate_counts, contributing_counts = (
-            clm_kernels.tile_contribution_mask(
-                batched_means2D,
-                batched_conics,
-                batched_opacities,
-                batched_radiis,
-                image_width,
-                image_height,
-                TILE_SIZE,
-                tile_threshold,
+        with tide_range("tide.gpu.forward.tile_mask"):
+            tile_keep_mask, candidate_counts, contributing_counts = (
+                clm_kernels.tile_contribution_mask(
+                    batched_means2D,
+                    batched_conics,
+                    batched_opacities,
+                    batched_radiis,
+                    image_width,
+                    image_height,
+                    TILE_SIZE,
+                    tile_threshold,
+                )
             )
-        )
         tile_counts = torch.stack(
             (
                 projection_mask.sum(dtype=torch.long),
@@ -588,24 +591,26 @@ def pipeline_forward_one_step_shs_inplace(
     if use_autograd_for_sh:
         # GPU-resident path: let PyTorch autograd handle SH gradients.
         # This is cleaner and avoids manual gradient computation
-        batched_colors_origin = spherical_harmonics(
-            degrees_to_use=sh_degree,
-            dirs=dirs,
-            coeffs=filtered_shs,
-            masks=effective_sh_mask,
-        )
-        batched_colors_detached = batched_colors_origin  # No detach needed!
-        batched_colors = torch.clamp_min(batched_colors_origin + 0.5, 0.0)
-    else:
-        # Archived split-feature path: manual gradient computation for host SH features.
-        dirs.retain_grad()  # Need to retain for manual backward
-        with torch.no_grad():
+        with tide_range("tide.gpu.forward.sh"):
             batched_colors_origin = spherical_harmonics(
                 degrees_to_use=sh_degree,
                 dirs=dirs,
                 coeffs=filtered_shs,
                 masks=effective_sh_mask,
             )
+        batched_colors_detached = batched_colors_origin  # No detach needed!
+        batched_colors = torch.clamp_min(batched_colors_origin + 0.5, 0.0)
+    else:
+        # Archived split-feature path: manual gradient computation for host SH features.
+        dirs.retain_grad()  # Need to retain for manual backward
+        with tide_range("tide.gpu.forward.sh"):
+            with torch.no_grad():
+                batched_colors_origin = spherical_harmonics(
+                    degrees_to_use=sh_degree,
+                    dirs=dirs,
+                    coeffs=filtered_shs,
+                    masks=effective_sh_mask,
+                )
         batched_colors_detached = batched_colors_origin.detach().requires_grad_()
         batched_colors = torch.clamp_min(batched_colors_detached + 0.5, 0.0)
     
@@ -617,35 +622,37 @@ def pipeline_forward_one_step_shs_inplace(
     tile_height = math.ceil(image_height / float(TILE_SIZE))
 
     # flatten_ids: (C*N)
-    _, isect_ids, flatten_ids = isect_tiles(
-        means2d=batched_means2D,
-        radii=batched_radiis,
-        depths=batched_depths,
-        tile_size=TILE_SIZE,
-        tile_width=tile_width,
-        tile_height=tile_height,
-        packed=False,
-    )
-    isect_offsets = isect_offset_encode(
-        isect_ids, MICRO_BATCH_SIZE, tile_width, tile_height
-    )  # (MICRO_BATCH_SIZE, tile_height, tile_width)
+    with tide_range("tide.gpu.forward.isect"):
+        _, isect_ids, flatten_ids = isect_tiles(
+            means2d=batched_means2D,
+            radii=batched_radiis,
+            depths=batched_depths,
+            tile_size=TILE_SIZE,
+            tile_width=tile_width,
+            tile_height=tile_height,
+            packed=False,
+        )
+        isect_offsets = isect_offset_encode(
+            isect_ids, MICRO_BATCH_SIZE, tile_width, tile_height
+        )  # (MICRO_BATCH_SIZE, tile_height, tile_width)
 
     # Rasterize to pixels. batched_rendered_image: (B, image_height, image_width, 3)
     backgrounds = (
         background.repeat(MICRO_BATCH_SIZE, 1) if background is not None else None
     )
-    rendered_image, _ = rasterize_to_pixels(
-        means2d=batched_means2D,
-        conics=batched_conics,
-        colors=batched_colors,
-        opacities=batched_opacities,
-        image_width=image_width,
-        image_height=image_height,
-        tile_size=TILE_SIZE,
-        isect_offsets=isect_offsets,
-        flatten_ids=flatten_ids,
-        backgrounds=backgrounds,
-    )
+    with tide_range("tide.gpu.forward.rasterize"):
+        rendered_image, _ = rasterize_to_pixels(
+            means2d=batched_means2D,
+            conics=batched_conics,
+            colors=batched_colors,
+            opacities=batched_opacities,
+            image_width=image_width,
+            image_height=image_height,
+            tile_size=TILE_SIZE,
+            isect_offsets=isect_offsets,
+            flatten_ids=flatten_ids,
+            backgrounds=backgrounds,
+        )
 
     # An all-rejected tile mask can make the rasterizer return a detached
     # background tensor. Keep backward valid and expose explicit zero grads for
@@ -661,7 +668,6 @@ def pipeline_forward_one_step_shs_inplace(
         rendered_image = rendered_image + zero_grad_anchor
 
     rendered_image = rendered_image.squeeze(0).permute(2, 0, 1).contiguous()
-
     return (
         rendered_image,
         batched_means2D,
@@ -995,79 +1001,74 @@ def order_calculation(
         case _:
             raise ValueError("Currently supported bsz: (4, 8, 16, 32, 64).")
 
-    torch.cuda.nvtx.range_push("init bitmap and vecs")
-    gs_bitmap = torch.zeros((n_gaussians), dtype=dtype, device="cuda")
-    # Encode bitmap: MSB->first microbatch; LSB->last microbatch
-    for i, f in enumerate(filters):
-        clm_kernels.scatter_to_bit(gs_bitmap, f, bsz - 1 - i)
+    with tide_range("tide.cpu.order.bitmap"):
+        gs_bitmap = torch.zeros((n_gaussians), dtype=dtype, device="cuda")
+        # Encode bitmap: MSB->first microbatch; LSB->last microbatch
+        for i, f in enumerate(filters):
+            clm_kernels.scatter_to_bit(gs_bitmap, f, bsz - 1 - i)
 
-    torch.cuda.nvtx.range_pop()
+    with tide_range("tide.cpu.order.distance_matrix"):
+        # Downsample.
+        if bsz >= 32:
+            n_sampled = n_gaussians // bsz**2
+        else:
+            n_sampled = n_gaussians // 32
+        n_sampled = max(1, min(n_sampled, n_gaussians))
 
-    torch.cuda.nvtx.range_push("generate distance matrix")
-    # Downsample.
-    if bsz >= 32:
-        n_sampled = n_gaussians // bsz**2
-    else:
-        n_sampled = n_gaussians // 32
-    n_sampled = max(1, min(n_sampled, n_gaussians))
+        debug_sampling_cap = None
+        if getattr(args, "debug_max_train_cameras", -1) > 0 or getattr(args, "debug_fast_init_scales", False):
+            debug_sampling_cap = 1_000_000
+            if n_sampled > debug_sampling_cap:
+                n_sampled = debug_sampling_cap
 
-    debug_sampling_cap = None
-    if getattr(args, "debug_max_train_cameras", -1) > 0 or getattr(args, "debug_fast_init_scales", False):
-        debug_sampling_cap = 1_000_000
-        if n_sampled > debug_sampling_cap:
-            n_sampled = debug_sampling_cap
-
-    if n_gaussians > large_randperm_threshold:
-        if not getattr(order_calculation, "_logged_large_n_sampling", False):
-            extra = (
-                f" Debug cap applied: {debug_sampling_cap:,}."
-                if debug_sampling_cap is not None
-                else ""
+        if n_gaussians > large_randperm_threshold:
+            if not getattr(order_calculation, "_logged_large_n_sampling", False):
+                extra = (
+                    f" Debug cap applied: {debug_sampling_cap:,}."
+                    if debug_sampling_cap is not None
+                    else ""
+                )
+                print(
+                    f"[ORDER_CALC] Large-N sampling fallback: n_gaussians={n_gaussians:,}, "
+                    f"n_sampled={n_sampled:,}. Using torch.randint instead of full randperm "
+                    f"to avoid GPU OOM.{extra}"
+                )
+                order_calculation._logged_large_n_sampling = True
+            sampled_gaussian_ids = torch.randint(
+                n_gaussians,
+                (n_sampled,),
+                generator=perm_generator,
+                device="cuda",
+                dtype=torch.int64,
             )
-            print(
-                f"[ORDER_CALC] Large-N sampling fallback: n_gaussians={n_gaussians:,}, "
-                f"n_sampled={n_sampled:,}. Using torch.randint instead of full randperm "
-                f"to avoid GPU OOM.{extra}"
+        else:
+            sampled_gaussian_ids = torch.randperm(
+                n_gaussians, generator=perm_generator, device="cuda"
+            )[:n_sampled]
+        sampled_bitmap = torch.gather(input=gs_bitmap, dim=0, index=sampled_gaussian_ids)
+        # Unzip the bimap.
+        unziped = torch.empty((bsz, n_sampled), dtype=torch.uint8, device="cuda")
+        for i in range(bsz):
+            unziped[bsz - 1 - i] = (sampled_bitmap & 1).to(torch.uint8)
+            sampled_bitmap = sampled_bitmap >> 1
+        # Compute distance matrix for archived in-batch camera reordering.
+        distance_matrix = (
+            (unziped.unsqueeze(1) ^ unziped.unsqueeze(0)).sum(dim=-1).tolist()
+        )  # intermediate result: (bsz, bsz, n_sampled) = n_gaussians
+
+    with tide_range("tide.cpu.order.tsp"):
+        ordered_cams = fast_tsp.find_tour(distance_matrix, 0.001)
+        # find the minimum sparsity camera
+        if args.reorder_by_min_sparsity_at_end:
+            min_sparsity_i = bsz - 1
+            for k in range(0, bsz - 1):
+                if len(filters[ordered_cams[k]]) < len(
+                    filters[ordered_cams[min_sparsity_i]]
+                ):
+                    min_sparsity_i = k
+            ordered_cams = (
+                ordered_cams[min_sparsity_i + 1 :] + ordered_cams[: min_sparsity_i + 1]
             )
-            order_calculation._logged_large_n_sampling = True
-        sampled_gaussian_ids = torch.randint(
-            n_gaussians,
-            (n_sampled,),
-            generator=perm_generator,
-            device="cuda",
-            dtype=torch.int64,
-        )
-    else:
-        sampled_gaussian_ids = torch.randperm(
-            n_gaussians, generator=perm_generator, device="cuda"
-        )[:n_sampled]
-    sampled_bitmap = torch.gather(input=gs_bitmap, dim=0, index=sampled_gaussian_ids)
-    # Unzip the bimap.
-    unziped = torch.empty((bsz, n_sampled), dtype=torch.uint8, device="cuda")
-    for i in range(bsz):
-        unziped[bsz - 1 - i] = (sampled_bitmap & 1).to(torch.uint8)
-        sampled_bitmap = sampled_bitmap >> 1
-    # Compute distance matrix for archived in-batch camera reordering.
-    distance_matrix = (
-        (unziped.unsqueeze(1) ^ unziped.unsqueeze(0)).sum(dim=-1).tolist()
-    )  # intermediate result: (bsz, bsz, n_sampled) = n_gaussians
-    torch.cuda.nvtx.range_pop()
-
-    torch.cuda.nvtx.range_push("solve order: tsp")
-    ordered_cams = fast_tsp.find_tour(distance_matrix, 0.001)
-    # find the minimum sparsity camera
-    if args.reorder_by_min_sparsity_at_end:
-        min_sparsity_i = bsz - 1
-        for k in range(0, bsz - 1):
-            if len(filters[ordered_cams[k]]) < len(
-                filters[ordered_cams[min_sparsity_i]]
-            ):
-                min_sparsity_i = k
-        ordered_cams = (
-            ordered_cams[min_sparsity_i + 1 :] + ordered_cams[: min_sparsity_i + 1]
-        )
-
-    torch.cuda.nvtx.range_pop()
     batched_cameras = [batched_cameras[i] for i in ordered_cams]
     filters = [filters[i] for i in ordered_cams]
     sparsity = [len(filters[i]) / float(n_gaussians) for i in range(bsz)]
@@ -1085,12 +1086,11 @@ def order_calculation(
             None,
         )
 
-    torch.cuda.nvtx.range_push("generate cpuadam update ls")
-    # Re-encode the bitmap based on given order
-    gs_bitmap.zero_()
-    for i, f in enumerate(filters):
-        clm_kernels.scatter_to_bit(gs_bitmap, f, bsz - 1 - i)
-
+    with tide_range("tide.cpu.order.bitmap"):
+        # Re-encode the bitmap based on given order
+        gs_bitmap.zero_()
+        for i, f in enumerate(filters):
+            clm_kernels.scatter_to_bit(gs_bitmap, f, bsz - 1 - i)
 
     if not build_legacy_update_lists:
         if build_visibility_mask and args.sparse_adam:
@@ -1100,7 +1100,6 @@ def order_calculation(
                 visibility_mask.scatter_(dim=0, index=f, src=src)
         else:
             visibility_mask = None
-        torch.cuda.nvtx.range_pop()
         return (
             None,
             batched_cameras,
@@ -1133,45 +1132,41 @@ def order_calculation(
         ).scatter_(dim=0, index=not_touched_ids, src=src)
     else:
         visibility_mask = None
-    torch.cuda.nvtx.range_pop()
-
     # HACK: Testing bsz=32/64 for now
-    torch.cuda.nvtx.range_push("precompute sums")
-    ps_grid_size, ps_blk_size = (64, 256)
-    tmp_buffer = torch.empty(
-        (bsz - 1, ps_grid_size * ps_blk_size), dtype=torch.int, device="cuda"
-    )  # 31 * #t
-    clm_kernels.compute_cnt_h(gs_bitmap, tmp_buffer, ps_grid_size, ps_blk_size)
-    cnt_d = torch.sum(tmp_buffer, dim=1).flatten()
-    filter_len = torch.tensor([len(f) for f in filters], device="cuda")
-    cnt_h = filter_len[1:] - cnt_d
-    cnt_g = filter_len[:-1] - cnt_d
+    with tide_range("tide.cpu.order.counts"):
+        ps_grid_size, ps_blk_size = (64, 256)
+        tmp_buffer = torch.empty(
+            (bsz - 1, ps_grid_size * ps_blk_size), dtype=torch.int, device="cuda"
+        )  # 31 * #t
+        clm_kernels.compute_cnt_h(gs_bitmap, tmp_buffer, ps_grid_size, ps_blk_size)
+        cnt_d = torch.sum(tmp_buffer, dim=1).flatten()
+        filter_len = torch.tensor([len(f) for f in filters], device="cuda")
+        cnt_h = filter_len[1:] - cnt_d
+        cnt_g = filter_len[:-1] - cnt_d
 
-    torch.cuda.nvtx.range_pop()
     del gs_bitmap, tmp_buffer, filter_len
 
-    torch.cuda.nvtx.range_push("transfer cpuadam update list and sums to cpu")
-    cnt_h, cnt_d, cnt_g = (
-        cnt_h.to(torch.int64),
-        cnt_d.to(torch.int64),
-        cnt_g.to(torch.int64),
-    )  # Then, cnt_h, cnt_d, cnt_g shares the same types with update_ls.
-    data2cpu_ls = update_ls + [
-        cnt_h,
-        cnt_d,
-        cnt_g,
-    ]  # update_ls, cnt_h, cnt_d, cnt_g should all be int64.
-    cat_data2cpu = torch.cat(data2cpu_ls, dim=0).to(torch.int32)
-    cat_data2cpu_h = torch.empty_like(cat_data2cpu, device="cpu", pin_memory=True)
-    data2cpu_dim = [len(d) for d in data2cpu_ls]
-    cat_data2cpu_h.copy_(cat_data2cpu)
-    data2cpu_ls_h = torch.split(cat_data2cpu_h, data2cpu_dim, dim=0)
-    assert len(data2cpu_ls_h) == bsz + 4
-    update_ls_cpu = data2cpu_ls_h[: bsz + 1]
-    cnt_h = data2cpu_ls_h[-3]
-    cnt_d = data2cpu_ls_h[-2]
-    cnt_g = data2cpu_ls_h[-1]
-    torch.cuda.nvtx.range_pop()
+    with tide_range("tide.gpu.writeback.d2h"):
+        cnt_h, cnt_d, cnt_g = (
+            cnt_h.to(torch.int64),
+            cnt_d.to(torch.int64),
+            cnt_g.to(torch.int64),
+        )  # Then, cnt_h, cnt_d, cnt_g shares the same types with update_ls.
+        data2cpu_ls = update_ls + [
+            cnt_h,
+            cnt_d,
+            cnt_g,
+        ]  # update_ls, cnt_h, cnt_d, cnt_g should all be int64.
+        cat_data2cpu = torch.cat(data2cpu_ls, dim=0).to(torch.int32)
+        cat_data2cpu_h = torch.empty_like(cat_data2cpu, device="cpu", pin_memory=True)
+        data2cpu_dim = [len(d) for d in data2cpu_ls]
+        cat_data2cpu_h.copy_(cat_data2cpu)
+        data2cpu_ls_h = torch.split(cat_data2cpu_h, data2cpu_dim, dim=0)
+        assert len(data2cpu_ls_h) == bsz + 4
+        update_ls_cpu = data2cpu_ls_h[: bsz + 1]
+        cnt_h = data2cpu_ls_h[-3]
+        cnt_d = data2cpu_ls_h[-2]
+        cnt_g = data2cpu_ls_h[-1]
 
     finish_indices_filters = update_ls_cpu
 
@@ -1415,8 +1410,6 @@ def clm_offload_train_one_batch(
     # STAGE 1.5: [SSD HOOK] Block-level Culling & Load from SSD
     # ============================================================================
     if storage_adapter is not None:
-        torch.cuda.nvtx.range_push("SSD: block-level culling and loading")
-
         _log_paper_batch_debug(
             enabled=paper_debug_logging,
             iteration=iteration,
@@ -1425,7 +1418,7 @@ def clm_offload_train_one_batch(
         )
 
         # Step 1: collect coarse block visibility for this camera batch.
-        with torch.cuda.nvtx.range("Tide activation: current block culling"):
+        with tide_range("tide.cull.block"):
             legacy_cull_start_ns = time.perf_counter_ns()
             _, current_camera_blocks = storage_adapter.get_visible_blocks_batch(
                 resident_camera_ids
@@ -1468,7 +1461,7 @@ def clm_offload_train_one_batch(
                 for block_id in current_camera_blocks[int(camera_id)]
             }
         )
-        
+
         _log_paper_block_visibility_debug(
             enabled=paper_debug_logging,
             iteration=iteration,
@@ -1490,7 +1483,7 @@ def clm_offload_train_one_batch(
                 f"    2. Cameras are far outside scene bounds\n"
                 f"    3. Block bounds computed incorrectly\n"
             )
-            
+
             # Include camera positions to diagnose dataset/culling mismatches.
             for i, cam in enumerate(batched_cameras):
                 R = np.array(cam.R).reshape(3, 3)
@@ -1616,7 +1609,8 @@ def clm_offload_train_one_batch(
                 # Load the resident working set.
                 # Data flow: SSD → RAM → GPU.
                 # ================================================================
-                torch.cuda.nvtx.range_push("SSD→RAM→GPU: Load resident blocks")
+                # CPU cache lookup, H2D transfer, and GPU slot binding are traced
+                # separately in the loading helpers below.
                 
                 # ============================================================
                 # Archived non-paper retention path. Paper mode uses Tide
@@ -1656,7 +1650,6 @@ def clm_offload_train_one_batch(
                             f"  Blocks in RAM cache: {len(active_blocks_ram)}\n"
                         )
                         log_file.write(f"[SKIP ITERATION] Skipping iteration {iteration} due to missing data\n")
-                        torch.cuda.nvtx.range_pop()
                         return [], list(range(len(batched_cameras))), 0.0
                 
                 legacy_load_start_ns = time.perf_counter_ns()
@@ -1833,9 +1826,6 @@ def clm_offload_train_one_batch(
                             f"  Bandwidth Savings: ~{cumulative_stats['bandwidth_savings_ratio']*100:.1f}%\n\n"
                         )
 
-                torch.cuda.nvtx.range_pop()
-
-                
             else:
                 # ================================================================
                 # Archived fallback: write into full GPU parameter arrays.
@@ -1882,8 +1872,6 @@ def clm_offload_train_one_batch(
 
                     loaded_gaussian_mask[start_idx:end_idx] = True
 
-        torch.cuda.nvtx.range_pop()
-
     _ts('stage1_5_ssd_done')
 
     # ============================================================================
@@ -1892,8 +1880,6 @@ def clm_offload_train_one_batch(
     curvature_filters_local = []
     with torch.no_grad():
         if storage_adapter is not None:
-            torch.cuda.nvtx.range_push("compact_and_calculate_filters")
-
             loaded_gaussian_ids = _resolve_stage2_loaded_gaussian_ids(
                 gaussians=gaussians,
                 loaded_gaussian_mask=loaded_gaussian_mask,
@@ -1916,7 +1902,6 @@ def clm_offload_train_one_batch(
                 log_file=log_file,
             )
             if empty_loaded_result is not None:
-                torch.cuda.nvtx.range_pop()
                 return empty_loaded_result
 
             # ================================================================
@@ -1982,13 +1967,14 @@ def clm_offload_train_one_batch(
                 name="legacy_gaussian_filter",
                 detail="calculate_filters_on_compact_resident_set",
             )
-            filters_compact, projection_camera_ids, projection_gaussian_ids = calculate_filters(
-                projection_cameras,
-                xyz_compact,
-                opacity_compact,
-                scaling_compact,
-                rotation_compact,
-            )
+            with tide_range("tide.cull.gaussian_filter"):
+                filters_compact, projection_camera_ids, projection_gaussian_ids = calculate_filters(
+                    projection_cameras,
+                    xyz_compact,
+                    opacity_compact,
+                    scaling_compact,
+                    rotation_compact,
+                )
             _legacy_cuda_range_end(legacy_filter_range)
 
             if should_log_paper_sets:
@@ -2093,7 +2079,6 @@ def clm_offload_train_one_batch(
             # Cleanup - but keep filters_compact info in filters_local
             del xyz_compact, opacity_compact, scaling_compact, rotation_compact, filters_compact
 
-            torch.cuda.nvtx.range_pop()
         else:
             # Archived split-feature path uses full-tensor Gaussian culling.
             xyz_gpu = gaussians.get_xyz
@@ -2101,23 +2086,22 @@ def clm_offload_train_one_batch(
             scaling_gpu_origin = gaussians.get_scaling
             rotation_gpu_origin = gaussians.get_rotation
 
-            torch.cuda.nvtx.range_push("calculate_filters")
             # Filters: list of indices indicating which gaussians are visible per camera
             legacy_filter_range = _legacy_cuda_range(
                 "gaussian_projection_cull_ms",
                 name="legacy_gaussian_filter",
                 detail="calculate_filters",
             )
-            filters, camera_ids, gaussian_ids = calculate_filters(
-                projection_cameras,
-                xyz_gpu,
-                opacity_gpu_origin,
-                scaling_gpu_origin,
-                rotation_gpu_origin,
-            )
+            with tide_range("tide.cull.gaussian_filter"):
+                filters, camera_ids, gaussian_ids = calculate_filters(
+                    projection_cameras,
+                    xyz_gpu,
+                    opacity_gpu_origin,
+                    scaling_gpu_origin,
+                    rotation_gpu_origin,
+                )
             _legacy_cuda_range_end(legacy_filter_range)
             del opacity_gpu_origin, scaling_gpu_origin, rotation_gpu_origin
-            torch.cuda.nvtx.range_pop()
     
     # ========================================================================
     # [STATISTICS] Block Visibility Analysis (controlled by --log_block_visibility)
@@ -2244,7 +2228,6 @@ def clm_offload_train_one_batch(
     # Prepare archived camera reordering and visibility bookkeeping.
     # ========================================================================
     # Sort cameras to maximize gaussian overlap between consecutive frames (better caching)
-    torch.cuda.nvtx.range_push("sort cameras")
     build_legacy_update_lists = not (is_paper_ssd_mode and gaussians.use_gpu_features)
     build_visibility_mask = not (is_paper_ssd_mode and gaussians.use_gpu_features)
     if is_paper_ssd_mode and gaussians.use_gpu_features:
@@ -2258,6 +2241,17 @@ def clm_offload_train_one_batch(
         if should_log_paper_sets:
             _log_paper_order_calculation_skip(iteration=iteration, log_file=log_file)
     else:
+        with tide_range("tide.cpu.order.camera"):
+            order_result = order_calculation(
+                filters,
+                batched_cameras,
+                total_n_gaussians,
+                bsz,
+                perm_generator,
+                args,
+                build_legacy_update_lists=build_legacy_update_lists,
+                build_visibility_mask=build_visibility_mask,
+            )
         (
             finish_indices_filters,
             batched_cameras,
@@ -2268,21 +2262,10 @@ def clm_offload_train_one_batch(
             cnt_d,
             cnt_g,
             visibility_mask,
-        ) = order_calculation(
-            filters,
-            batched_cameras,
-            total_n_gaussians,
-            bsz,
-            perm_generator,
-            args,
-            build_legacy_update_lists=build_legacy_update_lists,
-            build_visibility_mask=build_visibility_mask,
-        )
+        ) = order_result
     # cnt_h: count of parameters to HOST (load from CPU)
     # cnt_d: count of parameters to DUPLICATE (retain from previous)
     # cnt_g: count of parameters to GARBAGE (offload to CPU)
-    torch.cuda.nvtx.range_pop()
-    
     # ========================================================================
     # Reorder filters_local to match reordered filters.
     # ========================================================================
@@ -2307,8 +2290,6 @@ def clm_offload_train_one_batch(
     # - GPU Compute Stream: Forward/Backward on current batch
     # - GPU Prefetch Stream: Load next batch's data in background
     if storage_adapter is not None and training_schedule is not None and use_fast_ram_ssd_path:
-        torch.cuda.nvtx.range_push("N+1 Prefetch: Start async load")
-
         try:
             if use_fast_ram_ssd_path:
                 next_camera_ids, next_visible_blocks = get_next_iteration_blocks(
@@ -2327,14 +2308,15 @@ def clm_offload_train_one_batch(
                     )
 
                     active_block_reader = getattr(gaussians, '_block_reader', None)
-                    double_buffer.start_prefetch(
-                        iteration=iteration + bsz,
-                        visible_block_ids=next_visible_blocks,
-                        filters_global=filters,
-                        ram_cache={},
-                        unified_params=gaussians._unified_params if active_block_reader is None else None,
-                        block_reader=active_block_reader,
-                    )
+                    with tide_range("tide.io.ssd.read.submit"):
+                        double_buffer.start_prefetch(
+                            iteration=iteration + bsz,
+                            visible_block_ids=next_visible_blocks,
+                            filters_global=filters,
+                            ram_cache={},
+                            unified_params=gaussians._unified_params if active_block_reader is None else None,
+                            block_reader=active_block_reader,
+                        )
 
                     if iteration % 500 == 0:
                         log_file.write(f"[N+1 PREFETCH] Started async prefetch for iter {iteration + bsz}\n")
@@ -2342,8 +2324,6 @@ def clm_offload_train_one_batch(
                         log_file.write(f"  Next blocks: {len(next_visible_blocks)} blocks\n")
         except Exception as e:
             log_file.write(f"[N+1 PREFETCH] Warning: Prefetch failed: {e}\n")
-
-        torch.cuda.nvtx.range_pop()
 
     # ============================================================================
     # STAGE 2: MICRO-BATCH SIGNAL INITIALIZATION
@@ -2498,7 +2478,6 @@ def clm_offload_train_one_batch(
     # STAGE 4: MAIN MICRO-BATCH TRAINING LOOP
     # ============================================================================
     for micro_idx in range(num_micro_batches):
-        torch.cuda.nvtx.range_push("micro_batch_idx: " + str(micro_idx))
         
         # ====================================================================
         # Use correct filter indices based on mode.
@@ -2531,7 +2510,6 @@ def clm_offload_train_one_batch(
             tile_filters_local.append(this_filter_local[:0])
             
             microbatch_idx += 1  # Increment even when skipping
-            torch.cuda.nvtx.range_pop()  # Close micro_batch_idx range
             continue
 
         # ------------------------------------------------------------------------
@@ -2543,16 +2521,14 @@ def clm_offload_train_one_batch(
             # ====================================================================
             if gaussians.use_gpu_features:
                 # SSD-backed path: index SH features from the GPU working set.
-                torch.cuda.nvtx.range_push("gpu_mode_sh_indexing")
-                
                 with torch.no_grad():
                     # Directly gather SH features from GPU tensors
                     # CRITICAL: Use this_filter_local for GPU working set indexing!
-                    shs_dc = gaussians._features_dc[this_filter_local]  # (K, 3)
-                    shs_rest = gaussians._features_rest[this_filter_local]  # (K, 45)
-                    
-                    # Concatenate into single tensor
-                    shs = torch.cat([shs_dc, shs_rest], dim=1)  # (K, 48)
+                    with tide_range("tide.gpu.forward.sh_prepare"):
+                        shs_dc = gaussians._features_dc[this_filter_local]  # (K, 3)
+                        shs_rest = gaussians._features_rest[this_filter_local]  # (K, 45)
+                        # Concatenate into single tensor
+                        shs = torch.cat([shs_dc, shs_rest], dim=1)  # (K, 48)
                     shs.requires_grad_(True)
 
                     if is_paper_ssd_mode:
@@ -2574,8 +2550,6 @@ def clm_offload_train_one_batch(
                     else:
                         log_file.write(f"[GPU RESIDENT] Iter {iteration}: Indexed {this_filter_len} SH features directly from GPU\n")
                 
-                torch.cuda.nvtx.range_pop()
-            
             # ====================================================================
             # Archived split-feature path: use CPU→GPU SH transfer with retention.
             # ====================================================================
@@ -2583,8 +2557,6 @@ def clm_offload_train_one_batch(
                 gaussians.block_cache_state["last_filter"] is not None):
 
                 # WARM START: Reuse cached SH from previous batch's last micro-batch
-                torch.cuda.nvtx.range_push("inter_batch_hotspot_retention")
-
                 with torch.cuda.stream(comm_stream), torch.no_grad():
                     last_shs = gaussians.block_cache_state["last_shs"]  # SH from previous batch (GPU)
                     last_filter = gaussians.block_cache_state["last_filter"]  # Indices from previous batch
@@ -2665,19 +2637,20 @@ def clm_offload_train_one_batch(
                     del bit_d, last_bit_interbatch, this_bit_interbatch
 
                     # Use the archived retention kernel for mixed GPU/CPU SH sources.
-                    send_shs2gpu_stream_retention(
-                        shs,                            # Output: SH for current batch
-                        gaussians._parameters,          # Input: SH on host (CPU)
-                        last_shs,                       # Input: SH retained from previous batch (GPU)
-                        host_indices_to_param,          # Category H: param → current mapping
-                        rtnt_indices_to_param,          # Category D: previous → current mapping
-                        param_indices_from_host,        # Category H: indices for CPU load
-                        param_indices_from_rtnt,        # Category D: indices for GPU retention
-                        grid_size,
-                        block_size,
-                        grid_size_D,
-                        block_size_D,
-                    )
+                    with tide_range("tide.gpu.forward.sh_prepare"):
+                        send_shs2gpu_stream_retention(
+                            shs,                            # Output: SH for current batch
+                            gaussians._parameters,          # Input: SH on host (CPU)
+                            last_shs,                       # Input: SH retained from previous batch (GPU)
+                            host_indices_to_param,          # Category H: param → current mapping
+                            rtnt_indices_to_param,          # Category D: previous → current mapping
+                            param_indices_from_host,        # Category H: indices for CPU load
+                            param_indices_from_rtnt,         # Category D: indices for GPU retention
+                            grid_size,
+                            block_size,
+                            grid_size_D,
+                            block_size_D,
+                        )
 
                     shs_retents[micro_idx] = shs.detach()
                     cpu2gpu_event = torch.cuda.Event(enable_timing=True)
@@ -2690,8 +2663,6 @@ def clm_offload_train_one_batch(
                         f"[ARCHIVED SH CACHE] Iter {iteration}: Reused {cnt_d_interbatch}/{this_filter_len} "
                         f"({hit_rate*100:.1f}%), Loaded {cnt_h_interbatch} from CPU\n"
                     )
-
-                torch.cuda.nvtx.range_pop()
 
             else:
                 # Archived split-feature cold start: no retained SH data is available.
@@ -2873,38 +2844,35 @@ def clm_offload_train_one_batch(
         # ------------------------------------------------------------------------
         # 4.3: Forward pass - Render image with filtered gaussian parameters
         # ------------------------------------------------------------------------
-        torch.cuda.nvtx.range_push("forward_pass")
         legacy_forward_range = _legacy_cuda_range(
             "gsplat_forward_ms",
             name="gaussian_cull_forward",
             detail="legacy_parameter_gather_render_and_loss",
         )
-        torch.cuda.nvtx.range_push("prepare filtered parameters")
-
         # ====================================================================
         # Gather filtered parameters from the compact GPU working set. Local
         # indices address resident tensors; global indices address the full model.
         # Clones create independent tensors whose gradients are scattered back.
-        filtered_xyz_gpu = gaussians._xyz[this_filter_local].clone().requires_grad_(True)
-        _filtered_opacity_gpu = gaussians._opacity[this_filter_local].clone().requires_grad_(True)
-        _filtered_scaling_gpu = gaussians._scaling[this_filter_local].clone().requires_grad_(True)
-        _filtered_rotation_gpu = gaussians._rotation[this_filter_local].clone().requires_grad_(True)
-        
-        # Retain gradients for cloned non-leaf tensors until scatter-back.
-        filtered_xyz_gpu.retain_grad() # Keep this non-leaf tensor's gradient after backpropagation for scatter-back.
-        _filtered_opacity_gpu.retain_grad()
-        _filtered_scaling_gpu.retain_grad()
-        _filtered_rotation_gpu.retain_grad()
-        # Apply activation functions to constrain parameter ranges
-        filtered_opacity_gpu = gaussians.opacity_activation(_filtered_opacity_gpu)
-        filtered_scaling_gpu = gaussians.scaling_activation(_filtered_scaling_gpu)
-        filtered_rotation_gpu = gaussians.rotation_activation(_filtered_rotation_gpu)
-        
-        torch.cuda.nvtx.range_pop()
+        with tide_range("tide.gpu.forward.prepare"):
+            filtered_xyz_gpu = gaussians._xyz[this_filter_local].clone().requires_grad_(True)
+            _filtered_opacity_gpu = gaussians._opacity[this_filter_local].clone().requires_grad_(True)
+            _filtered_scaling_gpu = gaussians._scaling[this_filter_local].clone().requires_grad_(True)
+            _filtered_rotation_gpu = gaussians._rotation[this_filter_local].clone().requires_grad_(True)
+
+            # Retain gradients for cloned non-leaf tensors until scatter-back.
+            filtered_xyz_gpu.retain_grad() # Keep this non-leaf tensor's gradient after backpropagation for scatter-back.
+            _filtered_opacity_gpu.retain_grad()
+            _filtered_scaling_gpu.retain_grad()
+            _filtered_rotation_gpu.retain_grad()
+            # Apply activation functions to constrain parameter ranges
+            filtered_opacity_gpu = gaussians.opacity_activation(_filtered_opacity_gpu)
+            filtered_scaling_gpu = gaussians.scaling_activation(_filtered_scaling_gpu)
+            filtered_rotation_gpu = gaussians.rotation_activation(_filtered_rotation_gpu)
 
         # Wait for SH coefficients. In the GPU-resident path this event has
         # already been recorded after direct GPU indexing.
-        cpu2gpu_event.wait(default_stream)
+        with tide_range("tide.wait.gpu_transfer"):
+            cpu2gpu_event.wait(default_stream)
         
         # ====================================================================
         # Handle SH gradient tracking based on mode.
@@ -2965,17 +2933,15 @@ def clm_offload_train_one_batch(
             tile_mask_counts.add_(tile_meta["counts"])
 
         # Compute loss
-        loss = torch_compiled_loss(
-            rendered_image, batched_cameras[micro_idx].original_image
-        )
+        with tide_range("tide.gpu.forward.loss"):
+            loss = torch_compiled_loss(
+                rendered_image, batched_cameras[micro_idx].original_image
+            )
         _legacy_cuda_range_end(legacy_forward_range)
-        torch.cuda.nvtx.range_pop()
 
         # ------------------------------------------------------------------------
         # 4.4: Backward pass - Compute gradients
         # ------------------------------------------------------------------------
-        torch.cuda.nvtx.range_push("backward_pass")
-        
         # ====================================================================
         # Optional first-iteration gradient sanity log.
         # ====================================================================
@@ -3001,12 +2967,13 @@ def clm_offload_train_one_batch(
             name="backward",
             detail="legacy_loss_backward_and_gradient_scatter",
         )
-        if gaussians.use_gpu_features:
-            # SSD-backed path: simple single backward; autograd handles all gradients.
-            loss.backward()
-        else:
-            # Archived split-feature path: two-step backward for CPU features.
-            loss.backward(retain_graph=True)
+        with tide_range("tide.gpu.backward"):
+            if gaussians.use_gpu_features:
+                # SSD-backed path: simple single backward; autograd handles all gradients.
+                loss.backward()
+            else:
+                # Archived split-feature path: two-step backward for CPU features.
+                loss.backward(retain_graph=True)
 
         # ====================================================================
         # Optional first-iteration gradient sanity log.
@@ -3030,7 +2997,8 @@ def clm_offload_train_one_batch(
         if not gaussians.use_gpu_features:
             # Archived split-feature path: manual backward for spherical harmonics.
             # Wait for shs_grad buffer to be ready
-            shs_grad_init_event.wait(default_stream)
+            with tide_range("tide.wait.gpu_gradient"):
+                shs_grad_init_event.wait(default_stream)
 
             # Manual backward for spherical harmonics (custom gradient computation)
             v_dirs = spherical_harmonics_bwd_inplace(
@@ -3064,14 +3032,10 @@ def clm_offload_train_one_batch(
                 if filtered_xyz_gpu.grad is not None:
                     log_file.write(f"  filtered_xyz_gpu.grad.sum(): {filtered_xyz_gpu.grad.sum().item()}\n")
         
-        torch.cuda.nvtx.range_pop()
-
         # ------------------------------------------------------------------------
         # 4.5: Accumulate gradients back to full parameter tensors
         # ------------------------------------------------------------------------
-        with torch.no_grad():
-            torch.cuda.nvtx.range_push("scatter gpu grads back to origin")
-            
+        with torch.no_grad(), tide_range("tide.gpu.backward.scatter"):
             # ================================================================
             # Optional first-iteration scatter sanity log.
             # ================================================================
@@ -3166,8 +3130,6 @@ def clm_offload_train_one_batch(
                         index=this_filter_local.reshape(-1, 1).expand(-1, 45),
                     )
 
-            torch.cuda.nvtx.range_pop()
-
         # Cleanup temporary tensors
         del rendered_image, batched_colors_detached, dirs
         if not gaussians.use_gpu_features:
@@ -3261,7 +3223,8 @@ def clm_offload_train_one_batch(
                     del idx_g, bit_g
 
                     # Wait for backward pass to complete
-                    gpu2cpu_event.wait(comm_stream)
+                    with tide_range("tide.wait.gpu_writeback"):
+                        gpu2cpu_event.wait(comm_stream)
                     shs_retents[micro_idx] = None
                     shs_grad_next = torch.zeros_like(shs_next, device="cuda")
 
@@ -3293,7 +3256,8 @@ def clm_offload_train_one_batch(
                 # ====================================================================
                 # Final micro-batch: offload all gradients to CPU AND save cache state
                 with torch.cuda.stream(comm_stream), torch.no_grad():
-                    gpu2cpu_event.wait(comm_stream)
+                    with tide_range("tide.wait.gpu_writeback"):
+                        gpu2cpu_event.wait(comm_stream)
 
                     send_shs2cpu_grad_buffer_stream(
                         shs_grad,
@@ -3332,8 +3296,6 @@ def clm_offload_train_one_batch(
         # No need to sync to RAM's parameters_grad_buffer in SSD-backed mode.
         # Gradient sync has been REMOVED - it was redundant
         
-        torch.cuda.nvtx.range_pop()
-
         # ------------------------------------------------------------------------
         # 4.7: Update densification statistics (for adaptive gaussian control)
         # ------------------------------------------------------------------------
@@ -3352,17 +3314,16 @@ def clm_offload_train_one_batch(
 
         # Update visibility mask for sparse Adam optimizer (tracks which parameters received gradients)
         if args.sparse_adam and visibility_mask is not None:
-            torch.cuda.nvtx.range_push("update visibility")
-            visibility_indices = filters[micro_idx]
-            if tile_contribution_mode == "apply":
-                visibility_indices = visibility_indices[
-                    tile_meta["keep_mask"].reshape(-1)
-                ]
-            src = torch.ones(
-                (len(visibility_indices),), dtype=torch.bool, device="cuda"
-            )
-            visibility_mask.scatter_(dim=0, index=visibility_indices, src=src)
-            torch.cuda.nvtx.range_pop()
+            with tide_range("tide.gpu.backward.visibility"):
+                visibility_indices = filters[micro_idx]
+                if tile_contribution_mode == "apply":
+                    visibility_indices = visibility_indices[
+                        tile_meta["keep_mask"].reshape(-1)
+                    ]
+                src = torch.ones(
+                    (len(visibility_indices),), dtype=torch.bool, device="cuda"
+                )
+                visibility_mask.scatter_(dim=0, index=visibility_indices, src=src)
 
     _ts('stage4_train_done')
 
@@ -3470,23 +3431,24 @@ def clm_offload_train_one_batch(
                 else "legacy_gpu_resident_adam"
             ),
         )
-        optimizer_step_stats = _run_gpu_resident_adam_step(
-            gaussians=gaussians,
-            args=args,
-            iteration=iteration,
-            total_n_gaussians=total_n_gaussians,
-            sparse_visibility_indices=optimizer_sparse_visibility_indices,
-            sparse_grad_local_ids=optimizer_sparse_grad_local_ids,
-            sparse_grad_components=optimizer_sparse_grad_components,
-            sparse_curvature_local_ids=sparse_curvature_local_ids,
-            sparse_curvature_components=sparse_curvature_components,
-            curvature_due=curvature_due,
-            optimizer_step=optimizer_step,
-            get_gpu_resident_optimizer_fn=get_gpu_resident_optimizer,
-            ensure_local_to_global_mapping_fn=ensure_local_to_global_mapping,
-            log_prefix="[PAPER SSD MODE]",
-            log_file=log_file,
-        )
+        with tide_range("tide.gpu.optimizer"):
+            optimizer_step_stats = _run_gpu_resident_adam_step(
+                gaussians=gaussians,
+                args=args,
+                iteration=iteration,
+                total_n_gaussians=total_n_gaussians,
+                sparse_visibility_indices=optimizer_sparse_visibility_indices,
+                sparse_grad_local_ids=optimizer_sparse_grad_local_ids,
+                sparse_grad_components=optimizer_sparse_grad_components,
+                sparse_curvature_local_ids=sparse_curvature_local_ids,
+                sparse_curvature_components=sparse_curvature_components,
+                curvature_due=curvature_due,
+                optimizer_step=optimizer_step,
+                get_gpu_resident_optimizer_fn=get_gpu_resident_optimizer,
+                ensure_local_to_global_mapping_fn=ensure_local_to_global_mapping,
+                log_prefix="[PAPER SSD MODE]",
+                log_file=log_file,
+            )
         _legacy_cuda_range_end(legacy_optimizer_range)
         optimizer_updated_block_ids = optimizer_step_stats.get("updated_block_ids")
     else:
@@ -3518,7 +3480,6 @@ def clm_offload_train_one_batch(
             # ================================================================
             # Non-SSD GPU working-set writeback to RAM cache.
             # ================================================================
-            torch.cuda.nvtx.range_push("Writeback: GPU → RAM")
             log_file.write(f"[GPU Working Set] Writing back updated parameters to RAM cache\n")
             
             # Prepare geometry cache references (will be updated in-place)
@@ -3530,13 +3491,13 @@ def clm_offload_train_one_batch(
             }
             
             # Writeback all parameters to RAM
-            gaussians.gpu_working_set_manager.update_ram_cache(
-                geometry_cache=geometry_cache,
-                sh_cache=gaussians.parameters_buffer
-            )
+            with tide_range("tide.gpu.writeback.ram"):
+                gaussians.gpu_working_set_manager.update_ram_cache(
+                    geometry_cache=geometry_cache,
+                    sh_cache=gaussians.parameters_buffer
+                )
             
             log_file.write(f"[GPU Working Set] RAM cache updated successfully\n")
-            torch.cuda.nvtx.range_pop()
 
     utils.memory_report("after optimizer step")
     _ts('stage5_optim_done')
@@ -3604,10 +3565,9 @@ def clm_offload_train_one_batch(
     
     if storage_adapter is not None and (not is_ssd_offload_mode or is_paper_ssd_mode):
         with torch.no_grad():
-            torch.cuda.nvtx.range_push("SSD: writeback updated blocks")
 
             if is_paper_ssd_mode:
-                with torch.cuda.nvtx.range("Tide writeback: updated block selection"):
+                with tide_range("tide.cpu.writeback.plan"):
                     updated_block_ids = _collect_paper_updated_block_ids(
                         iteration=iteration,
                         optimizer_updated_block_ids=optimizer_updated_block_ids,
@@ -3625,13 +3585,13 @@ def clm_offload_train_one_batch(
                     block_size=args.gaussian_block_size,
                     device='cuda',
                 )
-                with torch.cuda.nvtx.range("Tide writeback: mark dirty blocks"):
+                with tide_range("tide.cpu.writeback.mark_dirty"):
                     double_buffer.mark_dirty_blocks(
                         updated_block_ids,
                         iteration=iteration,
                     )
 
-                with torch.cuda.nvtx.range("Tide writeback: stage block bounds"):
+                with tide_range("tide.cpu.bounds.submit"):
                     legacy_bounds_refresh_start_ns = time.perf_counter_ns()
                     pending_bounds = gaussians.gpu_working_set_manager.stage_block_bounds(
                         updated_block_ids
@@ -3657,7 +3617,7 @@ def clm_offload_train_one_batch(
             if is_paper_ssd_mode:
                 if paper_plan_future is None:
                     raise RuntimeError("Tide resident plan was not submitted")
-                with torch.cuda.nvtx.range("Tide writeback: await resident plan"):
+                with tide_range("tide.wait.plan"):
                     legacy_next_plan_wait_start_ns = time.perf_counter_ns()
                     paper_plan_result = paper_plan_future.result()
                     legacy_next_plan_finalize_wait_ms = (
@@ -3691,7 +3651,7 @@ def clm_offload_train_one_batch(
                             target_iteration=target_iteration,
                             timing_source="host_monotonic",
                         )
-                with torch.cuda.nvtx.range("Tide writeback: publish resident plan"):
+                with tide_range("tide.cpu.plan.consume"):
                     paper_block_sets = paper_plan_result["block_sets"]
                     gaussians._paper_expected_resident_blocks = list(
                         paper_block_sets['next_resident_blocks']
@@ -3746,9 +3706,9 @@ def clm_offload_train_one_batch(
                 keep_resident_blocks = list(paper_block_sets['keep_resident_blocks']) if paper_block_sets is not None else []
                 evicted_blocks = list(paper_block_sets['evict_blocks']) if paper_block_sets is not None else []
                 legacy_writeback_submit_start_ns = time.perf_counter_ns()
-                with torch.cuda.nvtx.range("Tide writeback: dirty eviction selection"):
+                with tide_range("tide.cpu.writeback.plan"):
                     writeback_block_ids = double_buffer.dirty_blocks_for_eviction(evicted_blocks)
-                with torch.cuda.nvtx.range("Tide writeback: stage eviction payload"):
+                with tide_range("tide.cpu.writeback.orchestrate"):
                     staged_writeback_blocks, ready_omega, copied_omega, candidate_blocks = _apply_paper_writeback_payload(
                         storage_adapter=storage_adapter,
                         args=args,
@@ -3901,9 +3861,8 @@ def clm_offload_train_one_batch(
                 )
                 log_file.write(writeback_message)
 
-            torch.cuda.nvtx.range_pop()
 
-    with torch.cuda.nvtx.range("Tide engine tail: retain working set"):
+    with tide_range("tide.gpu.materialize"):
         if defer_gpu_working_set_clear and hasattr(gaussians, 'gpu_working_set_manager'):
             gaussians.gpu_working_set_manager.prepare_for_retention()
             if is_paper_ssd_mode:
@@ -3921,7 +3880,7 @@ def clm_offload_train_one_batch(
     # [MEMORY CLEANUP] Periodic cleanup to prevent memory accumulation
     # ============================================================================
     # Clear intermediate variables to help garbage collection
-    with torch.cuda.nvtx.range("Tide engine tail: memory maintenance"):
+    with tide_range("tide.cpu.memory.cleanup"):
         if iteration % 100 == 0:
             # Force Python garbage collection periodically
             gc.collect()
@@ -4118,7 +4077,7 @@ def clm_offload_train_one_batch(
     # ============================================================================
     # [STATS] Log double buffer and prefetch statistics periodically
     # ============================================================================
-    with torch.cuda.nvtx.range("Tide engine tail: metrics and logging"):
+    with tide_range("tide.cpu.logging"):
         if iteration % 1000 == 0:
             global _double_buffer_gpu
             _log_double_buffer_stats(

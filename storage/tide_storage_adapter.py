@@ -29,6 +29,7 @@ from .log_storage_manager import LogStorageManager
 from .schedule_utils import get_current_and_next_camera_batches
 from .streaming_ply_init import read_binary_ply_header, streaming_ply_to_ssd_base
 from .tiered_cache_manager import TieredCacheManager
+from utils.tide_trace import tide_range
 
 
 def _link_resume_base_file(source_base_file: Path, active_storage_dir: Path) -> Path:
@@ -389,9 +390,9 @@ class TideStorageAdapter:
                 self._bounds_refresh_queue.task_done()
                 return
             try:
-                with torch.cuda.nvtx.range("Tide bounds: wait D2H"):
+                with tide_range("tide.wait.bounds_refresh"):
                     block_ids, bounds = job.payload.wait()
-                with torch.cuda.nvtx.range("Tide bounds: publish generation"):
+                with tide_range("tide.cpu.bounds.publish"):
                     job.result = self.update_block_bounds(block_ids, bounds)
             except Exception as exc:
                 job.error = exc
@@ -446,7 +447,8 @@ class TideStorageAdapter:
                 self._pending_cache_commits[block_id] = job
         self.execution_metrics["background_cache_commit_jobs"] += 1
         self.execution_metrics["background_cache_commit_blocks"] += len(job.block_ids)
-        self._cache_commit_queue.put(job)
+        with tide_range("tide.io.ssd.write.submit"):
+            self._cache_commit_queue.put(job)
         return len(job.block_ids)
 
     def bind_resident_writeback(self, resident_state, working_set) -> None:
@@ -554,7 +556,8 @@ class TideStorageAdapter:
                 return
             self.execution_metrics["background_cache_commit_waits"] += 1
             for job in jobs:
-                job.wait()
+                with tide_range("tide.wait.ssd_writeback"):
+                    job.wait()
 
     def filter_cache_prefetch_candidates(self, block_ids: List[int]) -> List[int]:
         with self._cache_commit_lock:
@@ -565,10 +568,12 @@ class TideStorageAdapter:
         with self._cache_commit_lock:
             jobs = set(self._pending_cache_commits.values())
         for job in jobs:
-            job.wait_gpu()
+            with tide_range("tide.wait.gpu_writeback"):
+                job.wait_gpu()
 
     def drain_cache_writebacks(self) -> None:
-        self._cache_commit_queue.join()
+        with tide_range("tide.wait.ssd_writeback"):
+            self._cache_commit_queue.join()
         if self._cache_commit_error is not None:
             raise RuntimeError("background cache commit worker failed") from self._cache_commit_error
 
@@ -576,7 +581,8 @@ class TideStorageAdapter:
         self.drain_cache_writebacks()
         flush_queue = getattr(self.cache, "flush_queue", None)
         if flush_queue is not None:
-            flush_queue.join()
+            with tide_range("tide.wait.ssd_writeback"):
+                flush_queue.join()
 
     def flush_dirty_cache_to_storage(self) -> None:
         self.drain_storage_writebacks()

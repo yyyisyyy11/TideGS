@@ -15,6 +15,7 @@ from queue import Queue, Empty, Full
 from typing import Dict, List, Set, Optional, Tuple
 import torch
 import psutil
+from utils.tide_trace import tide_range
 
 
 class TieredCacheManager:
@@ -434,7 +435,8 @@ class TieredCacheManager:
                 time.perf_counter_ns() if self.timeline_enabled else None
             )
             read_start = time.perf_counter()
-            loaded, loaded_versions = self._read_storage_blocks(pending)
+            with tide_range("tide.io.ssd.read.service"):
+                loaded, loaded_versions = self._read_storage_blocks(pending)
             read_elapsed += time.perf_counter() - read_start
             read_attempts += 1
             if attempt_start_ns is not None:
@@ -553,21 +555,24 @@ class TieredCacheManager:
 
     def _wait_for_inflight_read(self, event: threading.Event) -> None:
         t0 = time.time()
-        event.wait()
+        with tide_range("tide.wait.inflight_read"):
+            event.wait()
         self.stats['inflight_wait_blocks'] += 1
         self.stats['inflight_wait_time'] += time.time() - t0
 
     def wait_for_prefetches(self) -> None:
         """Wait until queued and in-flight future reads have completed."""
-        if hasattr(self, "future_prefetch_queue"):
-            self.future_prefetch_queue.join()
-        while True:
-            with self.inflight_lock:
-                events = list(self.inflight_reads.values())
-            if not events:
-                return
-            for event in events:
-                event.wait()
+        with tide_range("tide.wait.prefetch"):
+            if hasattr(self, "future_prefetch_queue"):
+                self.future_prefetch_queue.join()
+            while True:
+                with self.inflight_lock:
+                    events = list(self.inflight_reads.values())
+                if not events:
+                    return
+                for event in events:
+                    with tide_range("tide.wait.inflight_read"):
+                        event.wait()
 
     def _read_claimed_blocks(
         self,
@@ -646,10 +651,11 @@ class TieredCacheManager:
         )
         t0 = time.time()
         try:
-            self.storage.write_patch(
-                dirty_blocks,
-                block_versions=block_versions or None,
-            )
+            with tide_range("tide.io.ssd.write.service"):
+                self.storage.write_patch(
+                    dirty_blocks,
+                    block_versions=block_versions or None,
+                )
             elapsed = time.time() - t0
 
             with self.flushing_lock:
@@ -739,15 +745,16 @@ class TieredCacheManager:
             return True
 
         try:
-            self.flush_queue.put_nowait(
-                (
-                    reason,
-                    dirty_blocks,
-                    block_versions or {},
-                    None if origin_iteration is None else int(origin_iteration),
-                    block_origin_iterations or {},
+            with tide_range("tide.io.ssd.write.submit"):
+                self.flush_queue.put_nowait(
+                    (
+                        reason,
+                        dirty_blocks,
+                        block_versions or {},
+                        None if origin_iteration is None else int(origin_iteration),
+                        block_origin_iterations or {},
+                    )
                 )
-            )
             self.stats['async_flush_requests'] += 1
             return True
         except Full:
@@ -842,7 +849,10 @@ class TieredCacheManager:
             try:
                 to_load = []
                 for block_id in block_ids:
-                    tensor, _ = self._lookup_cached_or_flushing(block_id, promote_flushing=True)
+                    with tide_range("tide.cpu.cache.lookup"):
+                        tensor, _ = self._lookup_cached_or_flushing(
+                            block_id, promote_flushing=True
+                        )
                     if tensor is None:
                         to_load.append(block_id)
 
@@ -957,12 +967,13 @@ class TieredCacheManager:
                 item = self.sync_queue.get(timeout=0.1) # Block without consuming CPU while the queue is empty, then check sync_running every 0.1 seconds.
                 block_id, gpu_tensor, cuda_stream = item
 
-                # Wait for CUDA stream to finish
                 if cuda_stream is not None:
-                    cuda_stream.synchronize()
+                    with tide_range("tide.wait.gpu_writeback"):
+                        cuda_stream.synchronize()
 
-                # Copy to CPU (pinned memory for faster transfer)
-                cpu_tensor = gpu_tensor.cpu().clone()
+                with tide_range("tide.gpu.writeback.d2h"):
+                    # Copy to CPU (pinned memory for faster transfer)
+                    cpu_tensor = gpu_tensor.cpu().clone()
 
                 # Update cache
                 with self.cache_lock:
@@ -1188,7 +1199,8 @@ class TieredCacheManager:
                 continue
             seen_block_ids.add(block_id)
 
-            tensor, source = self._lookup_cached_or_flushing(block_id)
+            with tide_range("tide.cpu.cache.lookup"):
+                tensor, source = self._lookup_cached_or_flushing(block_id)
             if tensor is not None:
                 result[block_id] = tensor
                 cache_hits.append(block_id)
@@ -1214,7 +1226,8 @@ class TieredCacheManager:
             next_wait_entries = []
             for block_id, event in wait_entries:
                 self._wait_for_inflight_read(event)
-                tensor, source = self._lookup_cached_or_flushing(block_id)
+                with tide_range("tide.cpu.cache.lookup"):
+                    tensor, source = self._lookup_cached_or_flushing(block_id)
                 if tensor is not None:
                     result[block_id] = tensor
                     cache_hits.append(block_id)
@@ -1310,7 +1323,8 @@ class TieredCacheManager:
                 )
             if enqueue_ns is not None:
                 item += (enqueue_ns,)
-            self.future_prefetch_queue.put_nowait(item)
+            with tide_range("tide.io.ssd.read.submit"):
+                self.future_prefetch_queue.put_nowait(item)
             if enqueue_ns is not None:
                 self._record_io_event(
                     operation="prefetch_hint_enqueue",

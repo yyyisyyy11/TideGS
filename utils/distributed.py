@@ -9,6 +9,7 @@ from typing import Any, List
 
 import torch
 import torch.distributed as dist
+from utils.tide_trace import tide_range
 
 
 _DISTRIBUTED_MODES = {"off", "gaussian_sharded"}
@@ -93,20 +94,23 @@ class DistributedContext:
 
     def barrier(self) -> None:
         if self.enabled:
-            dist.barrier()
+            with tide_range("tide.sync.barrier"):
+                dist.barrier()
 
     def broadcast_object(self, value: Any, src: int = 0) -> Any:
         if not self.enabled:
             return value
         payload = [value if self.rank == src else None]
-        dist.broadcast_object_list(payload, src=src, device=torch.device("cuda", self.local_rank))
+        with tide_range("tide.comm.object_collective"):
+            dist.broadcast_object_list(payload, src=src, device=torch.device("cuda", self.local_rank))
         return payload[0]
 
     def all_gather_object(self, value: Any) -> List[Any]:
         if not self.enabled:
             return [value]
         gathered: List[Any] = [None for _ in range(self.world_size)]
-        dist.all_gather_object(gathered, value)
+        with tide_range("tide.comm.object_collective"):
+            dist.all_gather_object(gathered, value)
         return gathered
 
     def close(self) -> None:

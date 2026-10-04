@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from storage.schedule_utils import get_current_and_next_camera_batches
+from utils.tide_trace import tide_range
 
 from .resident_policy import (
     compute_passthrough_resident_transition,
@@ -522,13 +523,13 @@ def plan_and_start_resident_prefetch(
     )
     target_iteration = int(iteration) + int(batch_size)
     cull_start_ns = time.perf_counter_ns()
-    with torch.cuda.nvtx.range("Tide N+1: coarse culling"):
+    with tide_range("tide.cull.block"):
         bounds_generation, next_camera_blocks = storage_adapter.get_visible_blocks_batch(
             next_resident_camera_ids
         )
     cull_end_ns = time.perf_counter_ns()
     selection_start_ns = time.perf_counter_ns()
-    with torch.cuda.nvtx.range("Tide N+1: resident selection"):
+    with tide_range("tide.cpu.resident.select"):
         block_sets = compute_paper_block_sets(
             storage_adapter=storage_adapter,
             training_schedule=training_schedule,
@@ -552,7 +553,7 @@ def plan_and_start_resident_prefetch(
     future_submitted = 0
     hint_start_ns = time.perf_counter_ns()
     if active_block_reader is not None and stream_in_blocks:
-        with torch.cuda.nvtx.range("Tide N+1: cache hint"):
+        with tide_range("tide.cpu.cache.hint"):
             future_submitted = int(
                 active_block_reader.hint_future(
                     stream_in_blocks,
@@ -566,7 +567,7 @@ def plan_and_start_resident_prefetch(
     next_resident_blocks = list(block_sets.get("next_resident_blocks", []))
     buffer_submit_start_ns = time.perf_counter_ns()
     if active_block_reader is not None and next_resident_blocks:
-        with torch.cuda.nvtx.range("Tide N+1: launch materialization"):
+        with tide_range("tide.gpu.materialize"):
             double_buffer.start_prefetch(
                 iteration=target_iteration,
                 visible_block_ids=next_resident_blocks,
@@ -1634,7 +1635,7 @@ def apply_paper_writeback_payload(
     ready_omega = 0
     copied_omega = 0
     if use_direct_gpu_path and len(omega_blocks) > 0:
-        with torch.cuda.nvtx.range("Tide writeback: Omega handoff"):
+        with tide_range("tide.gpu.materialize"):
             double_buffer = get_double_buffer_gpu_fn(
                 num_total=total_n_gaussians,
                 block_size=args.gaussian_block_size,
@@ -1651,7 +1652,7 @@ def apply_paper_writeback_payload(
         return 0, ready_omega, copied_omega, 0
 
     if use_direct_gpu_path:
-        with torch.cuda.nvtx.range("Tide writeback: pack and enqueue D2H"):
+        with tide_range("tide.gpu.writeback.d2h"):
             writeback_payload = build_updated_blocks_dict_from_gpu_fn(
                 updated_block_ids=updated_block_ids,
                 total_n_gaussians=total_n_gaussians,
@@ -1674,7 +1675,7 @@ def apply_paper_writeback_payload(
                 original_features_rest=original_features_rest,
             )
 
-        with torch.cuda.nvtx.range("Tide writeback: materialize CPU payload"):
+        with tide_range("tide.cpu.writeback.pack"):
             writeback_payload = materialize_updated_blocks_from_cpu_views_fn(
                 updated_block_ids=updated_block_ids,
                 total_n_gaussians=total_n_gaussians,
@@ -1703,19 +1704,18 @@ def apply_paper_writeback_payload(
 
     omega_count = len(set(int(block_id) for block_id in omega_blocks))
     if callable(pending_writeback) and ready_omega == omega_count:
-        with torch.cuda.nvtx.range("Tide writeback: submit async cache commit"):
-            staged_writeback_blocks = storage_adapter.submit_cache_writeback(
-                writeback_payload,
-                bounds_managed_externally=True,
-            )
+        staged_writeback_blocks = storage_adapter.submit_cache_writeback(
+            writeback_payload,
+            bounds_managed_externally=True,
+        )
         return staged_writeback_blocks, ready_omega, copied_omega, len(updated_block_ids)
 
-    with torch.cuda.nvtx.range("Tide writeback: wait D2H"):
+    with tide_range("tide.wait.gpu_writeback"):
         updated_blocks_dict = (
             pending_writeback() if callable(pending_writeback) else writeback_payload
         )
     try:
-        with torch.cuda.nvtx.range("Tide writeback: commit CPU cache"):
+        with tide_range("tide.cpu.writeback.commit"):
             staged_writeback_blocks = storage_adapter.sync_cache_from_cpu_views(
                 updated_blocks_dict,
                 refresh_bounds=False,
@@ -1743,7 +1743,7 @@ def apply_paper_writeback_payload(
             block_size=args.gaussian_block_size,
             device="cuda",
         )
-        with torch.cuda.nvtx.range("Tide writeback: fallback Omega refresh"):
+        with tide_range("tide.gpu.materialize"):
             ready_omega = double_buffer.refresh_blocks_from_block_cache(
                 block_cache=omega_refresh_blocks,
                 block_ids=omega_blocks,
@@ -1860,13 +1860,13 @@ def load_paper_stage1_working_set(
             device="cuda",
         )
         prefetch_wait_start_ns = time.perf_counter_ns()
-        with torch.cuda.nvtx.range("Tide activation: wait N+1 preparation"):
+        with tide_range("tide.wait.prefetch"):
             prefetch_ready = double_buffer.wait_for_prefetch(iteration)
         prefetch_wait_ms = (time.perf_counter_ns() - prefetch_wait_start_ns) / 1e6
         if prefetch_ready:
-            with torch.cuda.nvtx.range("Tide activation: persistent slot update"):
+            with tide_range("tide.gpu.materialize"):
                 double_buffer.swap_buffers()
-            with torch.cuda.nvtx.range("Tide activation: bind resident buffer"):
+            with tide_range("tide.gpu.materialize"):
                 gpu_tensors, retention_stats = activate_paper_prefetched_buffer(
                     gaussians,
                     double_buffer,
@@ -1907,7 +1907,7 @@ def load_paper_stage1_working_set(
 
     sync_visible_block_ids = visible_block_ids
     total_blocks_estimate = (total_n_gaussians + args.gaussian_block_size - 1) // args.gaussian_block_size
-    with torch.cuda.nvtx.range("Tide activation: synchronous resident planning"):
+    with tide_range("tide.cpu.resident.select"):
         r_t_blocks, r_t_source = resolve_current_iteration_resident_blocks_fn(
             gaussians=gaussians,
             args=args,
@@ -1951,7 +1951,7 @@ def load_paper_stage1_working_set(
         )
 
     active_block_reader = getattr(gaussians, "_block_reader", None)
-    with torch.cuda.nvtx.range("Tide activation: synchronous materialization"):
+    with tide_range("tide.gpu.materialize"):
         gpu_tensors, retention_stats = gaussians.gpu_working_set_manager.load_visible_blocks_with_retention(
             visible_block_ids=sync_visible_block_ids,
             active_blocks_ram=active_blocks_ram,
@@ -2029,28 +2029,27 @@ def run_gpu_resident_adam_step(
     if args.stop_update_param:
         return {}
 
-    torch.cuda.nvtx.range_push(f"Paper SSD: GPU Resident {optimizer_label}")
-    try:
-        gpu_resident_optimizer = get_gpu_resident_optimizer_fn(gaussians, args.bsz)
-        optimizer_updated_global_indices = sparse_visibility_indices
-        if optimizer_updated_global_indices is None and sparse_grad_local_ids is not None:
-            local_to_global = ensure_local_to_global_mapping_fn(
-                gaussians,
-                total_n_gaussians,
-                log_file=log_file,
-                context=f"gpu_resident_optimizer_iter_{iteration}",
-            )
-            optimizer_updated_global_indices = local_to_global[sparse_grad_local_ids].cpu()
-        _ = optimizer_updated_global_indices
+    gpu_resident_optimizer = get_gpu_resident_optimizer_fn(gaussians, args.bsz)
+    optimizer_updated_global_indices = sparse_visibility_indices
+    if optimizer_updated_global_indices is None and sparse_grad_local_ids is not None:
+        local_to_global = ensure_local_to_global_mapping_fn(
+            gaussians,
+            total_n_gaussians,
+            log_file=log_file,
+            context=f"gpu_resident_optimizer_iter_{iteration}",
+        )
+        optimizer_updated_global_indices = local_to_global[sparse_grad_local_ids].cpu()
+    _ = optimizer_updated_global_indices
 
-        step_kwargs = {}
-        if algorithm == "3dgs2_tr":
-            step_kwargs = {
-                "sparse_curvature_local_ids": sparse_curvature_local_ids,
-                "sparse_curvature_components": sparse_curvature_components,
-                "curvature_due": curvature_due,
-                "optimizer_step": optimizer_step,
-            }
+    step_kwargs = {}
+    if algorithm == "3dgs2_tr":
+        step_kwargs = {
+            "sparse_curvature_local_ids": sparse_curvature_local_ids,
+            "sparse_curvature_components": sparse_curvature_components,
+            "curvature_due": curvature_due,
+            "optimizer_step": optimizer_step,
+        }
+    with tide_range("tide.gpu.optimizer.update"):
         step_stats = gpu_resident_optimizer.step(
             iteration=iteration,
             gaussians=gaussians,
@@ -2058,16 +2057,14 @@ def run_gpu_resident_adam_step(
             sparse_grad_components=sparse_grad_components,
             **step_kwargs,
         )
-        gaussians._paper_last_gpu_optimizer_step = dict(step_stats)
-        write_paper_phase1_log(
-            f"{log_prefix} GPU resident {optimizer_label} updated {step_stats['touched_rows']} rows "
-            f"across {step_stats['updated_blocks']} resident blocks "
-            f"(cold_rows={step_stats['cold_rows']})\n",
-            log_file=log_file,
-        )
-        return dict(step_stats)
-    finally:
-        torch.cuda.nvtx.range_pop()
+    gaussians._paper_last_gpu_optimizer_step = dict(step_stats)
+    write_paper_phase1_log(
+        f"{log_prefix} GPU resident {optimizer_label} updated {step_stats['touched_rows']} rows "
+        f"across {step_stats['updated_blocks']} resident blocks "
+        f"(cold_rows={step_stats['cold_rows']})\n",
+        log_file=log_file,
+    )
+    return dict(step_stats)
 
 
 def train_tide_batch(

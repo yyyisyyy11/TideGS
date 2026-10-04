@@ -17,6 +17,7 @@ from typing import Any, Dict
 
 import numpy as np
 import torch
+from utils.tide_trace import tide_range
 
 
 PARAM_DIM = 59
@@ -142,13 +143,15 @@ def _wait_for_pending_writeback(cache, log_file=None) -> None:
 
     flush_queue = getattr(cache, "flush_queue", None)
     if flush_queue is not None:
-        flush_queue.join()
+        with tide_range("tide.wait.ssd_writeback"):
+            flush_queue.join()
 
     if hasattr(cache, "flush_all_dirty"):
         cache.flush_all_dirty()
 
     if flush_queue is not None:
-        flush_queue.join()
+        with tide_range("tide.wait.ssd_writeback"):
+            flush_queue.join()
 
     # ``flush_all_dirty`` is synchronous, but background eviction may briefly
     # leave entries in flushing_buffer.  Wait a short bounded interval so the

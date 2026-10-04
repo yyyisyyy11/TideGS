@@ -19,6 +19,7 @@ window is long enough to hide that work.
 """
 
 import torch
+from utils.tide_trace import tide_range
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, Dict, List, Optional, Tuple
@@ -781,7 +782,8 @@ class DoubleBufferGPUWorkingSet:
         self._next_host_staging_slot = (slot_idx + 1) % len(self._host_staging_slots)
         previous_copy = self._host_staging_events[slot_idx]
         if previous_copy is not None:
-            previous_copy.synchronize()
+            with tide_range("tide.wait.h2d_staging"):
+                previous_copy.synchronize()
 
         staging = self._host_staging_slots[slot_idx]
         gpu_staging = self._gpu_staging_slots[slot_idx]
@@ -1159,7 +1161,7 @@ class DoubleBufferGPUWorkingSet:
                     self._prefetch_finalized = True
                 return
 
-            with torch.cuda.nvtx.range("Tide N+1: block read and pack"):
+            with tide_range("tide.gpu.materialize"):
                 self._materialize_from_block_reader(
                     target=target_buffer,
                     source=source_buffer,
