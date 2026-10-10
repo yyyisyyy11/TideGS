@@ -177,6 +177,26 @@ GRAD_ZERO_GLOBAL_FIELDS = (
     ["iteration", "world_size"] + GRAD_ZERO_ONCE_FIELDS + GRAD_METRIC_VALUE_FIELDS
 )
 
+PARTIAL_GRAD_FIELDS = [
+    "iteration",
+    "optimizer_step",
+    "rank",
+    "world_size",
+    "partial_records_total",
+    "partial_records_all_zero",
+    "partial_records_nonzero",
+    "partial_exact_zero_ratio",
+]
+PARTIAL_GRAD_GLOBAL_FIELDS = [
+    "iteration",
+    "optimizer_step",
+    "world_size",
+    "partial_records_total",
+    "partial_records_all_zero",
+    "partial_records_nonzero",
+    "partial_exact_zero_ratio",
+]
+
 IO_FIELDS = [
     "operation",
     "tier",
@@ -381,6 +401,9 @@ class DistributedMetricsWriter:
         self.grad_zero_interval = max(
             1, int(getattr(args, "tide_grad_zero_metrics_interval", 1))
         )
+        self.partial_grad_enabled = bool(
+            getattr(args, "tide_partial_grad_metrics", False)
+        )
         self.grad_near_zero_threshold = float(
             getattr(args, "tide_grad_near_zero_threshold", 1e-8)
         )
@@ -411,6 +434,12 @@ class DistributedMetricsWriter:
         self.grad_zero_global_path = (
             Path(args.log_folder) / "metrics_grad_zero_global.tsv"
         )
+        self.partial_grad_rank_path = (
+            Path(args.log_folder) / f"metrics_partial_grad_rank{context.rank}.tsv"
+        )
+        self.partial_grad_global_path = (
+            Path(args.log_folder) / "metrics_partial_grad_global.tsv"
+        )
         self.grad_sample_dir = Path(args.log_folder) / "grad_samples"
         self.async_rank_path = (
             Path(args.log_folder)
@@ -438,6 +467,73 @@ class DistributedMetricsWriter:
         return (
             self.grad_zero_enabled
             and int(optimizer_step) % self.grad_zero_interval == 0
+        )
+
+    def should_write_partial_grad(self, optimizer_step: int) -> bool:
+        """Use the existing gradient-metric sampling interval."""
+
+        return (
+            self.partial_grad_enabled
+            and int(optimizer_step) % self.grad_zero_interval == 0
+        )
+
+    def write_partial_grad(
+        self,
+        *,
+        iteration: int,
+        optimizer_step: int,
+        partial_records_total: int,
+        partial_records_all_zero: int,
+    ) -> None:
+        """Write receive-side record counts independently of owner gradients."""
+
+        if not self.partial_grad_enabled:
+            return
+        total = int(partial_records_total)
+        all_zero = int(partial_records_all_zero)
+        if total < 0 or all_zero < 0 or all_zero > total:
+            raise ValueError(
+                "partial-gradient counters must satisfy "
+                f"0 <= all_zero <= total; got {all_zero}, {total}"
+            )
+        rank_row = {
+            "iteration": int(iteration),
+            "optimizer_step": int(optimizer_step),
+            "rank": int(self.context.rank),
+            "world_size": int(self.context.world_size),
+            "partial_records_total": total,
+            "partial_records_all_zero": all_zero,
+            "partial_records_nonzero": total - all_zero,
+            "partial_exact_zero_ratio": (all_zero / total) if total else 0.0,
+        }
+        _append_tsv(self.partial_grad_rank_path, PARTIAL_GRAD_FIELDS, rank_row)
+        rank_rows = self.context.all_gather_object(rank_row)
+        if not self.context.is_rank0:
+            return
+        global_total = sum(int(row.get("partial_records_total", 0)) for row in rank_rows)
+        global_zero = sum(
+            int(row.get("partial_records_all_zero", 0)) for row in rank_rows
+        )
+        if global_zero > global_total:
+            raise RuntimeError(
+                "global partial-gradient counters violate all_zero <= total: "
+                f"{global_zero} > {global_total}"
+            )
+        global_row = {
+            "iteration": int(iteration),
+            "optimizer_step": int(optimizer_step),
+            "world_size": int(self.context.world_size),
+            "partial_records_total": global_total,
+            "partial_records_all_zero": global_zero,
+            "partial_records_nonzero": global_total - global_zero,
+            "partial_exact_zero_ratio": (
+                global_zero / global_total if global_total else 0.0
+            ),
+        }
+        _append_tsv(
+            self.partial_grad_global_path,
+            PARTIAL_GRAD_GLOBAL_FIELDS,
+            global_row,
         )
 
     def write_grad_zero(self, row: Dict[str, object]) -> None:

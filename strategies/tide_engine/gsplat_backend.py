@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 from functools import lru_cache
-from typing import Iterable, Tuple
+from typing import Dict, Iterable, Tuple
 
 import torch
 
@@ -19,6 +19,8 @@ TILE_CONTRIBUTION_FIXES = (
     "_tide_original_projection_radii",
     "_tide_radius_mask",
 )
+PARTIAL_GRADIENT_FIX = "_tide_begin_partial_gradient_metrics"
+PARTIAL_GRADIENT_CONTEXT = "_tide_partial_gradient_context"
 
 
 def _version_tuple(value: str) -> Tuple[int, ...]:
@@ -91,6 +93,128 @@ def _require_tile_contribution_fix(gsplat) -> None:
         )
 
 
+def _require_partial_gradient_fix(gsplat) -> None:
+    try:
+        source = inspect.getsource(gsplat.rasterization)
+    except (OSError, TypeError) as exc:
+        raise RuntimeError(
+            "Partial-gradient metrics require inspectable gsplat rasterization source"
+        ) from exc
+    if PARTIAL_GRADIENT_FIX not in source or PARTIAL_GRADIENT_CONTEXT not in source:
+        raise RuntimeError(
+            "Partial-gradient metrics require the gsplat receive-side hook patch. "
+            "Run `python tools/patch_gsplat_distributed_packed.py` in the TideGS "
+            "environment before launching training."
+        )
+
+
+def begin_partial_gradient_metrics(
+    *,
+    xyz: torch.Tensor,
+    opacity: torch.Tensor,
+    scaling: torch.Tensor,
+    rotation: torch.Tensor,
+    features: torch.Tensor,
+) -> Dict[str, object]:
+    """Register receive-side row hooks without retaining gradient tensors.
+
+    The tensors passed by the patched gsplat function are the post-all-to-all
+    rendering-side buffers.  A single boolean vector records whether any
+    receive-side field has a non-zero row gradient.  The validity mask removes
+    zero-opacity sentinels and non-finite padding records from the denominator.
+    """
+
+    tensors = {
+        "xyz": xyz,
+        "opacity": opacity,
+        "scaling": scaling,
+        "rotation": rotation,
+        "features": features,
+    }
+    first = next((value for value in tensors.values() if torch.is_tensor(value)), None)
+    if first is None or first.ndim == 0:
+        raise RuntimeError("gsplat receive-side partial-gradient tensors are invalid")
+    rows = int(first.shape[0])
+    for name, value in tensors.items():
+        if not torch.is_tensor(value) or value.ndim == 0 or int(value.shape[0]) != rows:
+            raise RuntimeError(
+                "gsplat receive-side partial-gradient tensor shape mismatch: "
+                f"{name}={getattr(value, 'shape', None)}, rows={rows}"
+            )
+
+    xyz_finite = torch.isfinite(xyz.reshape(rows, -1)).all(dim=1)
+    opacity_flat = opacity.reshape(rows, -1)
+    valid = xyz_finite & torch.isfinite(opacity_flat).all(dim=1)
+    # Zero opacity is the collective-only padding/sentinel used by TideGS.
+    valid &= opacity_flat.abs().sum(dim=1) != 0
+    valid = valid.detach()
+    nonzero_rows = torch.zeros((rows,), dtype=torch.bool, device=first.device)
+    registered = 0
+    context: Dict[str, object] = {
+        "valid_rows": valid,
+        "nonzero_rows": nonzero_rows,
+        "registered": 0,
+        "consumed": False,
+    }
+
+    def hook(gradient):
+        if gradient is None:
+            return gradient
+        dense = gradient.to_dense() if gradient.is_sparse else gradient
+        if dense.ndim == 0 or int(dense.shape[0]) != rows:
+            raise RuntimeError(
+                "gsplat receive-side partial-gradient hook returned an invalid "
+                f"shape: {tuple(dense.shape)} for rows={rows}"
+            )
+        row_nonzero = torch.any(dense.reshape(rows, -1) != 0, dim=1)
+        nonzero_rows.logical_or_(row_nonzero)
+        return gradient
+
+    for value in tensors.values():
+        if value.requires_grad:
+            value.register_hook(hook)
+            registered += 1
+    if registered == 0:
+        raise RuntimeError(
+            "gsplat receive-side partial-gradient tensors do not require gradients"
+        )
+    context["registered"] = registered
+    return context
+
+
+def consume_partial_gradient_metrics(meta) -> Tuple[int, int]:
+    """Read and release one rasterization's receive-side row counters."""
+
+    if not isinstance(meta, dict):
+        raise RuntimeError("gsplat did not return rasterization metadata")
+    context = meta.get(PARTIAL_GRADIENT_CONTEXT)
+    if not isinstance(context, dict):
+        raise RuntimeError(
+            "gsplat did not return the receive-side partial-gradient context"
+        )
+    if bool(context.get("consumed", False)):
+        raise RuntimeError("receive-side partial-gradient context was consumed twice")
+    valid = context.get("valid_rows")
+    nonzero = context.get("nonzero_rows")
+    if (
+        not torch.is_tensor(valid)
+        or valid.dtype != torch.bool
+        or not torch.is_tensor(nonzero)
+        or nonzero.dtype != torch.bool
+        or valid.shape != nonzero.shape
+    ):
+        raise RuntimeError("invalid gsplat partial-gradient counter tensors")
+    # .item() synchronizes the stream after all backward hooks have run.
+    total = int(valid.sum().item())
+    all_zero = int((valid & ~nonzero).sum().item())
+    if all_zero > total:
+        raise RuntimeError(
+            f"invalid partial-gradient counters: all_zero={all_zero} total={total}"
+        )
+    context["consumed"] = True
+    return total, all_zero
+
+
 @lru_cache(maxsize=1)
 def require_distributed_gsplat():
     import gsplat
@@ -125,6 +249,7 @@ def prepare_distributed_gsplat(
     *,
     enable_timing: bool = False,
     enable_grad_zero_metrics: bool = False,
+    enable_partial_grad_metrics: bool = False,
     tile_contribution_mode: str = "off",
     tile_alpha_threshold: float = 1.0 / 255.0,
 ) -> None:
@@ -132,6 +257,9 @@ def prepare_distributed_gsplat(
     gsplat = require_distributed_gsplat()
     torch._tide_gsplat_detailed_metrics = bool(enable_timing)
     torch._tide_gsplat_grad_zero_metrics = bool(enable_grad_zero_metrics)
+    torch._tide_partial_grad_metrics = bool(enable_partial_grad_metrics)
+    torch._tide_partial_grad_metrics_sample = False
+    torch._tide_begin_partial_gradient_metrics = begin_partial_gradient_metrics
     tile_contribution_mode = str(tile_contribution_mode).lower()
     torch._tide_tile_contribution_mode = tile_contribution_mode
     torch._tide_tile_alpha_threshold = float(tile_alpha_threshold)
@@ -143,6 +271,8 @@ def prepare_distributed_gsplat(
         _require_projection_timing_fix(gsplat)
     if enable_grad_zero_metrics:
         _require_owner_projection_survivor_fix(gsplat)
+    if enable_partial_grad_metrics:
+        _require_partial_gradient_fix(gsplat)
     if tile_contribution_mode != "off":
         _require_tile_contribution_fix(gsplat)
     for loader_rank in range(context.world_size):

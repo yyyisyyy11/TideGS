@@ -28,6 +28,7 @@ from .gradient_sparsity import (
 from .gradient_schema import GRADIENT_COMPONENTS as _LEAF_NAMES
 from .engine import get_gpu_resident_optimizer
 from .gsplat_backend import (
+    consume_partial_gradient_metrics,
     PROJECTION_TIMING_FIX,
     distributed_rasterize,
     projection_elapsed_ms,
@@ -676,6 +677,10 @@ def train_distributed_tide_batch(
     curvature_vjp_ranges = []
     probe_device = leaves["xyz"].device
     grad_zero_sample_due = metrics_writer.should_write_grad_zero(optimizer_step)
+    partial_grad_sample_due = metrics_writer.should_write_partial_grad(optimizer_step)
+    torch._tide_partial_grad_metrics_sample = bool(partial_grad_sample_due)
+    partial_records_total = 0
+    partial_records_all_zero = 0
     tile_contribution_mode = str(
         getattr(args, "tide_tile_contribution_mode", "off")
     ).lower()
@@ -1068,6 +1073,10 @@ def train_distributed_tide_batch(
             backward_end = torch.cuda.Event(enable_timing=True)
             backward_start.record()
             torch.stack(micro_losses).sum().backward()
+            if partial_grad_sample_due:
+                partial_total, partial_all_zero = consume_partial_gradient_metrics(meta)
+                partial_records_total += int(partial_total)
+                partial_records_all_zero += int(partial_all_zero)
             backward_end.record()
             backward_ranges.append(
                 (backward_start, backward_end, backward_submit_ns, cameras)
@@ -1177,6 +1186,13 @@ def train_distributed_tide_batch(
     if grad_zero_sample_due:
         metrics_writer.write_grad_zero(grad_zero_record)
         metrics_writer.write_grad_sample(grad_sample_payload)
+    if partial_grad_sample_due:
+        metrics_writer.write_partial_grad(
+            iteration=iteration,
+            optimizer_step=optimizer_step,
+            partial_records_total=partial_records_total,
+            partial_records_all_zero=partial_records_all_zero,
+        )
 
     optimizer_submit_ns = time.perf_counter_ns() if timeline_enabled else None
     optimizer_start = torch.cuda.Event(enable_timing=True)

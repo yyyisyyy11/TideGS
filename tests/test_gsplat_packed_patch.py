@@ -17,6 +17,7 @@ class GsplatPackedPatchTest(unittest.TestCase):
             "    meta = {}\n"
             "    with_ut = False\n"
             "    compensations = None\n"
+            "    means = quats = scales = opacities = colors = None\n"
             "    if True:\n"
             f"        {PATCH_MODULE.BUGGY_IMAGE_IDS}\n"
             "        if True:\n"
@@ -30,6 +31,7 @@ class GsplatPackedPatchTest(unittest.TestCase):
             '            "x": 1,\n'
             "        }\n"
             "    )\n"
+            f"{PATCH_MODULE.PARTIAL_GRADIENT_RETURN_ANCHOR}"
         )
 
     def test_inserts_local_image_ids_once(self):
@@ -77,6 +79,25 @@ class GsplatPackedPatchTest(unittest.TestCase):
             PATCH_MODULE.patch_projection_timing_source(
                 f"# {PATCH_MODULE.PROJECTION_TIMING_MARKER}\n"
             )
+
+    def test_inserts_partial_gradient_hooks_once(self):
+        source = (
+            f"before\n{PATCH_MODULE.PATCHED}"
+            f"{PATCH_MODULE.PARTIAL_GRADIENT_RETURN_ANCHOR}"
+        )
+        patched, changed = PATCH_MODULE.patch_partial_gradient_source(source)
+        self.assertTrue(changed)
+        self.assertIn(PATCH_MODULE.PARTIAL_GRADIENT_CALL_MARKER, patched)
+        self.assertIn(PATCH_MODULE.PARTIAL_GRADIENT_MARKER, patched)
+        patched_again, changed_again = PATCH_MODULE.patch_partial_gradient_source(
+            patched
+        )
+        self.assertFalse(changed_again)
+        self.assertEqual(patched_again, patched)
+
+    def test_partial_gradient_rejects_unknown_source_layout(self):
+        with self.assertRaisesRegex(RuntimeError, "unknown source layout"):
+            PATCH_MODULE.patch_partial_gradient_source("unrelated source")
 
     def test_inserts_owner_projection_survivor_mask_once(self):
         source = f"before\n{PATCH_MODULE.OWNER_SURVIVOR_ANCHOR}after\n"
@@ -141,6 +162,7 @@ class GsplatPackedPatchTest(unittest.TestCase):
             PATCH_MODULE.patch_projection_timing_source,
             PATCH_MODULE.patch_tile_contribution_source,
             PATCH_MODULE.patch_owner_survivor_source,
+            PATCH_MODULE.patch_partial_gradient_source,
         ):
             source, changed = patcher(source)
             self.assertTrue(changed)
@@ -150,6 +172,7 @@ class GsplatPackedPatchTest(unittest.TestCase):
             PATCH_MODULE.patch_projection_timing_source,
             PATCH_MODULE.patch_tile_contribution_source,
             PATCH_MODULE.patch_owner_survivor_source,
+            PATCH_MODULE.patch_partial_gradient_source,
         ):
             source_again, changed = patcher(source)
             self.assertFalse(changed)

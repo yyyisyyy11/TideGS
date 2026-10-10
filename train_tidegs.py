@@ -769,6 +769,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             distributed_context,
             enable_timing=bool(args.tide_detailed_metrics),
             enable_grad_zero_metrics=bool(args.tide_grad_zero_metrics),
+            enable_partial_grad_metrics=bool(
+                getattr(args, "tide_partial_grad_metrics", False)
+            ),
             tile_contribution_mode=str(args.tide_tile_contribution_mode),
             tile_alpha_threshold=float(args.tide_tile_alpha_threshold),
         )
