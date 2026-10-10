@@ -11,11 +11,12 @@ except ImportError:  # pragma: no cover - exercised in the CUDA environment
 class PartialGradientHookTest(unittest.TestCase):
     def _tensors(self):
         return {
-            "xyz": torch.ones((4, 3), requires_grad=True),
+            "means2d": torch.ones((4, 2), requires_grad=True),
+            "depths": torch.ones((4,), requires_grad=True),
+            "conics": torch.ones((4, 3), requires_grad=True),
             "opacity": torch.ones((4, 1), requires_grad=True),
-            "scaling": torch.ones((4, 3), requires_grad=True),
-            "rotation": torch.ones((4, 4), requires_grad=True),
             "features": torch.ones((4, 16, 3), requires_grad=True),
+            "valid_mask": torch.ones((4, 2), dtype=torch.bool),
         }
 
     def test_counts_all_zero_single_field_and_multiple_field_rows(self):
@@ -26,12 +27,12 @@ class PartialGradientHookTest(unittest.TestCase):
         )
 
         tensors = self._tensors()
-        tensors["opacity"].data[3].zero_()
+        tensors["valid_mask"][3].zero_()
         context = begin_partial_gradient_metrics(**tensors)
-        # Row 0 is a valid all-zero-gradient record. Row 1 has only xyz.
-        # Row 2 has multiple non-zero fields. Row 3 is a zero-opacity sentinel.
-        loss = tensors["xyz"][1].sum()
-        loss = loss + tensors["xyz"][2].sum() + tensors["features"][2].sum()
+        # Row 0 is a valid all-zero-gradient record. Row 1 has only means2d.
+        # Row 2 has multiple non-zero fields. Row 3 is a masked sentinel.
+        loss = tensors["means2d"][1].sum()
+        loss = loss + tensors["means2d"][2].sum() + tensors["features"][2].sum()
         loss.backward()
         total, all_zero = consume_partial_gradient_metrics(
             {PARTIAL_GRADIENT_CONTEXT: context}
@@ -46,10 +47,10 @@ class PartialGradientHookTest(unittest.TestCase):
         )
 
         tensors = self._tensors()
-        tensors["xyz"].data[2, 0] = float("nan")
-        tensors["opacity"].data[3, 0] = float("inf")
+        tensors["means2d"].data[2, 0] = float("nan")
+        tensors["depths"].data[3] = float("inf")
         context = begin_partial_gradient_metrics(**tensors)
-        tensors["xyz"][1].sum().backward()
+        tensors["means2d"][1].sum().backward()
         total, all_zero = consume_partial_gradient_metrics(
             {PARTIAL_GRADIENT_CONTEXT: context}
         )
@@ -65,7 +66,7 @@ class PartialGradientHookTest(unittest.TestCase):
 
         tensors = self._tensors()
         context = begin_partial_gradient_metrics(**tensors)
-        tensors["xyz"][1].sum().backward()
+        tensors["means2d"][1].sum().backward()
         meta = {PARTIAL_GRADIENT_CONTEXT: context}
         consume_partial_gradient_metrics(meta)
         with self.assertRaises(RuntimeError):

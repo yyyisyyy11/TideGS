@@ -110,25 +110,27 @@ def _require_partial_gradient_fix(gsplat) -> None:
 
 def begin_partial_gradient_metrics(
     *,
-    xyz: torch.Tensor,
+    means2d: torch.Tensor,
+    depths: torch.Tensor,
+    conics: torch.Tensor,
     opacity: torch.Tensor,
-    scaling: torch.Tensor,
-    rotation: torch.Tensor,
     features: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
 ) -> Dict[str, object]:
     """Register receive-side row hooks without retaining gradient tensors.
 
-    The tensors passed by the patched gsplat function are the post-all-to-all
-    rendering-side buffers.  A single boolean vector records whether any
-    receive-side field has a non-zero row gradient.  The validity mask removes
-    zero-opacity sentinels and non-finite padding records from the denominator.
+    The tensors passed by the patched gsplat function are the five projected
+    record buffers exchanged by distributed packed rendering.  A single
+    boolean vector records whether any receive-side field has a non-zero row
+    gradient.  ``valid_mask`` is derived from post-projection radii and removes
+    padding/sentinel records from the denominator.
     """
 
     tensors = {
-        "xyz": xyz,
+        "means2d": means2d,
+        "depths": depths,
+        "conics": conics,
         "opacity": opacity,
-        "scaling": scaling,
-        "rotation": rotation,
         "features": features,
     }
     first = next((value for value in tensors.values() if torch.is_tensor(value)), None)
@@ -142,11 +144,27 @@ def begin_partial_gradient_metrics(
                 f"{name}={getattr(value, 'shape', None)}, rows={rows}"
             )
 
-    xyz_finite = torch.isfinite(xyz.reshape(rows, -1)).all(dim=1)
-    opacity_flat = opacity.reshape(rows, -1)
-    valid = xyz_finite & torch.isfinite(opacity_flat).all(dim=1)
-    # Zero opacity is the collective-only padding/sentinel used by TideGS.
-    valid &= opacity_flat.abs().sum(dim=1) != 0
+    valid = torch.ones((rows,), dtype=torch.bool, device=first.device)
+    for value in tensors.values():
+        valid &= torch.isfinite(value.reshape(rows, -1)).all(dim=1)
+    if valid_mask is None:
+        # Keep the fallback useful for direct callers that do not have radii.
+        # The patched gsplat path always supplies a radii-derived mask.
+        opacity_flat = opacity.reshape(rows, -1)
+        valid &= opacity_flat.abs().sum(dim=1) != 0
+    else:
+        if (
+            not torch.is_tensor(valid_mask)
+            or valid_mask.ndim == 0
+            or int(valid_mask.shape[0]) != rows
+        ):
+            raise RuntimeError(
+                "gsplat receive-side partial-gradient validity mask shape mismatch: "
+                f"mask={getattr(valid_mask, 'shape', None)}, rows={rows}"
+            )
+        valid &= valid_mask.to(device=first.device, dtype=torch.bool).reshape(
+            rows, -1
+        ).all(dim=1)
     valid = valid.detach()
     nonzero_rows = torch.zeros((rows,), dtype=torch.bool, device=first.device)
     registered = 0

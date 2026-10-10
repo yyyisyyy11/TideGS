@@ -82,6 +82,7 @@ class GsplatPackedPatchTest(unittest.TestCase):
 
     def test_inserts_partial_gradient_hooks_once(self):
         source = (
+            "all_to_all_tensor_list\n"
             f"before\n{PATCH_MODULE.PATCHED}"
             f"{PATCH_MODULE.PARTIAL_GRADIENT_RETURN_ANCHOR}"
         )
@@ -89,6 +90,17 @@ class GsplatPackedPatchTest(unittest.TestCase):
         self.assertTrue(changed)
         self.assertIn(PATCH_MODULE.PARTIAL_GRADIENT_CALL_MARKER, patched)
         self.assertIn(PATCH_MODULE.PARTIAL_GRADIENT_MARKER, patched)
+        self.assertIn("means2d=means2d", patched)
+        self.assertIn("depths=depths", patched)
+        self.assertIn("conics=conics", patched)
+        self.assertIn("valid_mask=(radii > 0)", patched)
+        self.assertNotIn("xyz=means", patched)
+        self.assertNotIn("scaling=scales", patched)
+        self.assertNotIn("rotation=quats", patched)
+        self.assertLess(
+            patched.index("all_to_all_tensor_list"),
+            patched.index("means2d=means2d"),
+        )
         patched_again, changed_again = PATCH_MODULE.patch_partial_gradient_source(
             patched
         )
