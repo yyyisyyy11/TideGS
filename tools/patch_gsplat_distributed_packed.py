@@ -241,18 +241,30 @@ def patch_partial_gradient_source(source: str) -> tuple[str, bool]:
             "Expected exactly one gsplat distributed receive insertion point; "
             f"found {receive_occurrences}. Refusing to modify an unknown source layout."
         )
-    return_occurrences = source.count(PARTIAL_GRADIENT_RETURN_ANCHOR)
-    if return_occurrences != 1:
+    # gsplat 1.5.3 里 `return render_colors, render_alphas, meta` 出现 **两次**：
+    #   一次在 rasterization()（公开入口，分布式相机修正 C_world[world_rank] 就在这里），
+    #   一次在它调用的 _rasterization() 里。
+    # 要挂 meta 的是前者——上下文正是在 rasterization() 里创建、随它的返回值出去的。
+    # 所以从接收插入点之后找第一个 return，并确认它没有越过下一个模块级 def。
+    receive_end = source.index(PATCHED) + len(PATCHED)
+    return_index = source.find(PARTIAL_GRADIENT_RETURN_ANCHOR, receive_end)
+    if return_index < 0:
         raise RuntimeError(
-            "Expected exactly one gsplat rasterization return insertion point; "
-            f"found {return_occurrences}. Refusing to modify an unknown source layout."
+            "Expected a gsplat rasterization return after the distributed receive "
+            "point; found none. Refusing to modify an unknown source layout."
         )
-    patched = source.replace(PATCHED, PARTIAL_GRADIENT_RECEIVE_PATCHED, 1)
-    patched = patched.replace(
-        PARTIAL_GRADIENT_RETURN_ANCHOR,
-        PARTIAL_GRADIENT_RETURN_PATCHED,
-        1,
+    next_def = source.find("\ndef ", receive_end)
+    if next_def != -1 and next_def < return_index:
+        raise RuntimeError(
+            "The rasterization return after the distributed receive point belongs "
+            "to a different function. Refusing to modify an unknown source layout."
+        )
+    patched = (
+        source[:return_index]
+        + PARTIAL_GRADIENT_RETURN_PATCHED
+        + source[return_index + len(PARTIAL_GRADIENT_RETURN_ANCHOR):]
     )
+    patched = patched.replace(PATCHED, PARTIAL_GRADIENT_RECEIVE_PATCHED, 1)
     return patched, True
 
 
