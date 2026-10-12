@@ -76,6 +76,12 @@ BATCH_FIELDS = [
     "h2d_bytes",
     "h2d_ms",
     "gsplat_forward_ms",
+    "pipeline_mode",
+    "projection_c1_overlap_ms",
+    "c1_wait_ms",
+    "c1_metadata_ms",
+    "c1_payload_ms",
+    "pipeline_render_ms",
     "curvature_forward_ms",
     "curvature_vjp_ms",
     "gaussian_projection_cull_ms",
@@ -232,7 +238,11 @@ GLOBAL_ONCE_FIELDS = {
     "prediction_replanned",
     "next_plan_target_iteration",
 }
-GLOBAL_TEXT_ONCE_FIELDS = {"optimizer_algorithm", "block_cull_backend"}
+GLOBAL_TEXT_ONCE_FIELDS = {
+    "optimizer_algorithm",
+    "block_cull_backend",
+    "pipeline_mode",
+}
 
 TIME_FIELDS = [field for field in BATCH_FIELDS if field.endswith("_ms")]
 GLOBAL_FIELDS = (

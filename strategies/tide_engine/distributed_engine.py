@@ -30,6 +30,7 @@ from .engine import get_gpu_resident_optimizer
 from .gsplat_backend import (
     PROJECTION_TIMING_FIX,
     distributed_rasterize,
+    distributed_rasterization_pipeline,
     projection_elapsed_ms,
 )
 from .sophia_tr_curvature import (
@@ -675,6 +676,22 @@ def train_distributed_tide_batch(
     curvature_forward_ranges = []
     curvature_vjp_ranges = []
     probe_device = leaves["xyz"].device
+    pipeline_mode = str(getattr(args, "tide_forward_pipeline", "off")).lower()
+    if pipeline_mode not in {"off", "pc1"}:
+        raise ValueError("tide_forward_pipeline must be 'off' or 'pc1'")
+    pc1_pipeline = None
+    pc1_nccl_stream = None
+    pc1_records = []
+    if pipeline_mode == "pc1":
+        pc1_nccl_stream = torch.cuda.Stream(
+            device=probe_device,
+            priority=int(getattr(args, "tide_nccl_stream_priority", -1)),
+        )
+        pc1_pipeline = distributed_rasterization_pipeline(
+            compute_stream=torch.cuda.current_stream(leaves["xyz"].device),
+            comm_stream=pc1_nccl_stream,
+            buffer_count=int(getattr(args, "tide_pipeline_buffer_count", 2)),
+        )
     grad_zero_sample_due = metrics_writer.should_write_grad_zero(optimizer_step)
     tile_contribution_mode = str(
         getattr(args, "tide_tile_contribution_mode", "off")
@@ -963,9 +980,203 @@ def train_distributed_tide_batch(
                 sh_coefficients,
             )
 
+    if pipeline_mode == "pc1":
+        def _pc1_submit(microbatch_index: int, cameras):
+            render_inputs = _transformed_leaves(gaussians, leaves)
+            scales, rotations, opacities, sh_coefficients = render_inputs
+            debug_projection_input(
+                phase="gradient",
+                microbatch_index=microbatch_index,
+                cameras=cameras,
+                scales=scales,
+                opacities=opacities,
+            )
+            backgrounds = background.reshape(1, 3).expand(len(cameras), 3).contiguous()
+            handle = pc1_pipeline.submit_projection(
+                microbatch_index=microbatch_index,
+                means=leaves["xyz"],
+                quats=rotations,
+                scales=scales,
+                opacities=opacities,
+                colors=sh_coefficients,
+                viewmats=torch.stack(
+                    [camera.world_view_transform.transpose(0, 1) for camera in cameras],
+                    dim=0,
+                ),
+                Ks=torch.stack([camera.K for camera in cameras], dim=0),
+                width=image_width,
+                height=image_height,
+                sh_degree=int(gaussians.active_sh_degree),
+                backgrounds=backgrounds,
+                near_plane=0.01,
+                far_plane=1e10,
+                radius_clip=float(getattr(args, "radius_clip", 0.0)),
+                eps2d=0.3,
+                tile_size=16,
+                rasterize_mode="classic",
+            )
+            return handle, render_inputs
+
+        pc1_current = None
+        pc1_current_inputs = None
+        pc1_error = None
+        try:
+            first_cameras = batched_cameras[:microbatch]
+            pc1_current, pc1_current_inputs = _pc1_submit(0, first_cameras)
+        except BaseException as error:
+            pc1_error = error
+            pc1_pipeline.abort()
+        _synchronize_rank_errors(
+            context,
+            phase="S1 pc1 initial projection",
+            error=pc1_error,
+        )
+
+        for microbatch_index, start in enumerate(
+            range(0, len(batched_cameras), microbatch)
+        ):
+            cameras = batched_cameras[start:start + microbatch]
+            local_error = None
+            next_handle = None
+            next_inputs = None
+            submit_error = None
+            try:
+                pc1_current.start_forward_exchange()
+                next_start = start + microbatch
+                if next_start < len(batched_cameras):
+                    next_cameras = batched_cameras[next_start:next_start + microbatch]
+                    next_handle, next_inputs = _pc1_submit(
+                        microbatch_index + 1, next_cameras
+                    )
+            except BaseException as error:
+                submit_error = error
+                pc1_pipeline.abort()
+
+            render_inputs = pc1_current_inputs
+            scales, rotations, opacities, sh_coefficients = render_inputs
+            forward_submit_ns = time.perf_counter_ns() if timeline_enabled else None
+            try:
+                write_memory_point(
+                    phase="before_forward",
+                    microbatch_index=microbatch_index,
+                    cameras=cameras,
+                )
+                forward_start = pc1_current.state["projection_start"]
+                rendered, _, meta = pc1_current.wait_and_render()
+                forward_end = pc1_current.render_done
+                forward_ranges.append(
+                    (forward_start, forward_end, forward_submit_ns, cameras)
+                )
+                projection_events = meta.get(PROJECTION_TIMING_FIX)
+                if projection_events is not None:
+                    projection_event_pairs.append(projection_events)
+                if grad_zero_sample_due:
+                    _mark_projection_cull_survivors(
+                        projection_cull_survivor_mask,
+                        meta,
+                        owner_active_rows,
+                    )
+                    if tile_contribution_mode == "off":
+                        tile_survivor_mask.copy_(projection_cull_survivor_mask)
+                    else:
+                        _merge_owner_tile_survivors(
+                            tile_survivor_mask,
+                            tile_mask_counts,
+                            meta,
+                            owner_active_rows=owner_active_rows,
+                            participation_rows=participation_rows,
+                            uses_sentinel=uses_sentinel,
+                        )
+                micro_losses = []
+                for local_index, camera in enumerate(cameras):
+                    image = rendered[local_index].permute(2, 0, 1).contiguous()
+                    micro_losses.append(torch_compiled_loss(image, camera.original_image))
+                detached_losses.extend(loss.detach() for loss in micro_losses)
+                write_memory_point(
+                    phase="after_forward",
+                    microbatch_index=microbatch_index,
+                    cameras=cameras,
+                )
+            except BaseException as error:
+                local_error = error
+                if isinstance(error, torch.OutOfMemoryError):
+                    write_memory_point(
+                        phase="oom",
+                        microbatch_index=microbatch_index,
+                        cameras=cameras,
+                        error=error,
+                    )
+            if local_error is None and submit_error is not None:
+                local_error = submit_error
+            if local_error is not None:
+                pc1_pipeline.abort()
+            _synchronize_rank_errors(
+                context,
+                phase=f"S1 microbatch {microbatch_index} forward",
+                error=local_error,
+            )
+
+            local_error = None
+            try:
+                backward_submit_ns = time.perf_counter_ns() if timeline_enabled else None
+                backward_start = torch.cuda.Event(enable_timing=True)
+                backward_end = torch.cuda.Event(enable_timing=True)
+                backward_start.record()
+                if torch.cuda.is_available():
+                    torch.cuda.nvtx.range_push(
+                        f"Tide:S1:MB{microbatch_index}:Backward"
+                    )
+                torch.stack(micro_losses).sum().backward()
+                if torch.cuda.is_available():
+                    torch.cuda.nvtx.range_pop()
+                backward_end.record()
+                backward_ranges.append(
+                    (backward_start, backward_end, backward_submit_ns, cameras)
+                )
+                write_memory_point(
+                    phase="after_backward",
+                    microbatch_index=microbatch_index,
+                    cameras=cameras,
+                )
+            except BaseException as error:
+                local_error = error
+                if isinstance(error, torch.OutOfMemoryError):
+                    write_memory_point(
+                        phase="oom",
+                        microbatch_index=microbatch_index,
+                        cameras=cameras,
+                        error=error,
+                    )
+                pc1_pipeline.abort()
+            _synchronize_rank_errors(
+                context,
+                phase=f"S1 microbatch {microbatch_index} backward",
+                error=local_error,
+            )
+            # Keep only CUDA events and host timestamps.  Retaining the full
+            # handle here would retain every packed projection/render tensor
+            # until the end of the batch and can exhaust GPU memory.
+            pc1_records.append((pc1_current.snapshot(), cameras, microbatch_index))
+            pc1_current = next_handle
+            pc1_current_inputs = next_inputs
+            del (
+                rendered,
+                meta,
+                image,
+                micro_losses,
+                scales,
+                rotations,
+                opacities,
+                sh_coefficients,
+            )
+
+        pc1_pipeline.close()
+
     for microbatch_index, start in enumerate(
         range(0, len(batched_cameras), microbatch)
     ):
+        if pipeline_mode == "pc1":
+            continue
         cameras = batched_cameras[start:start + microbatch]
         render_inputs = None
         local_error = None
@@ -1304,6 +1515,32 @@ def train_distributed_tide_batch(
     curvature_forward_ms = sum(curvature_forward_range_ms)
     curvature_vjp_ms = sum(curvature_vjp_range_ms)
     optimizer_ms = float(optimizer_start.elapsed_time(optimizer_end))
+    pc1_overlap_ms = 0.0
+    pc1_wait_ms = 0.0
+    pc1_metadata_ms = 0.0
+    pc1_payload_ms = 0.0
+    pc1_render_ms = 0.0
+    if pipeline_mode == "pc1":
+        for record_index, (record, _, _) in enumerate(pc1_records):
+            timing = pc1_pipeline.timing_from_snapshot(record)
+            pc1_wait_ms += timing.get("c1_wait_ms", 0.0)
+            pc1_metadata_ms += timing.get("c1_metadata_ms", 0.0)
+            pc1_payload_ms += timing.get("c1_payload_ms", 0.0)
+            pc1_render_ms += timing.get("render_ms", 0.0)
+            if record_index + 1 < len(pc1_records):
+                next_record = pc1_records[record_index + 1][0]
+                c1_start = record.get("metadata_start")
+                c1_end = record.get("payload_end")
+                p_start = next_record.get("projection_start")
+                p_end = next_record.get("projection_end")
+                if None not in (c1_start, c1_end, p_start, p_end):
+                    c1_ms = float(c1_start.elapsed_time(c1_end))
+                    p_ms = float(p_start.elapsed_time(p_end))
+                    p_offset = float(c1_start.elapsed_time(p_start))
+                    pc1_overlap_ms += max(
+                        0.0,
+                        min(c1_ms, p_offset + p_ms) - max(0.0, p_offset),
+                    )
     h2d_submit_ns = retention_stats.get("h2d_submit_ns")
     if timeline_enabled and h2d_submit_ns is not None:
         metrics_writer.write_timeline_event(
@@ -1317,6 +1554,74 @@ def train_distributed_tide_batch(
             detail="h2d_plus_gpu_unpack",
         )
     if timeline_enabled:
+        if pipeline_mode == "pc1":
+            for record_index, (record, cameras, microbatch_index) in enumerate(
+                pc1_records
+            ):
+                timing = pc1_pipeline.timing_from_snapshot(record)
+                projection_start_ns = int(record.get("projection_submit_ns", 0))
+                c1_start_ns = int(record.get("c1_submit_ns", projection_start_ns))
+                render_start_ns = int(record.get("render_submit_ns", c1_start_ns))
+                wait_ns = round(timing.get("c1_wait_ms", 0.0) * 1e6)
+                metadata_ns = round(timing.get("c1_metadata_ms", 0.0) * 1e6)
+                payload_ns = round(timing.get("c1_payload_ms", 0.0) * 1e6)
+                metrics_writer.write_timeline_event(
+                    name=f"Tide:S1:MB{microbatch_index}:Projection",
+                    lane="gpu",
+                    start_ns=projection_start_ns,
+                    end_ns=projection_start_ns + round(timing.get("projection_ms", 0.0) * 1e6),
+                    iteration=iteration,
+                    timing_source="host_submit_plus_cuda_event",
+                    microbatch_index=microbatch_index,
+                    microbatch_count=microbatch_count,
+                    pipeline_buffer_slot=int(record["pipeline_buffer_slot"]),
+                    pipeline_mode=pipeline_mode,
+                    camera_uids=camera_uids(cameras),
+                )
+                metrics_writer.write_timeline_event(
+                    name=f"Tide:S1:MB{microbatch_index}:C1:Wait",
+                    lane="nccl",
+                    start_ns=c1_start_ns,
+                    end_ns=c1_start_ns + wait_ns,
+                    iteration=iteration,
+                    timing_source="host_submit_plus_cuda_event",
+                    microbatch_index=microbatch_index,
+                    pipeline_buffer_slot=int(record["pipeline_buffer_slot"]),
+                    pipeline_mode=pipeline_mode,
+                )
+                metrics_writer.write_timeline_event(
+                    name=f"Tide:S1:MB{microbatch_index}:C1:Metadata",
+                    lane="nccl",
+                    start_ns=c1_start_ns + wait_ns,
+                    end_ns=c1_start_ns + wait_ns + metadata_ns,
+                    iteration=iteration,
+                    timing_source="host_submit_plus_cuda_event",
+                    microbatch_index=microbatch_index,
+                    pipeline_buffer_slot=int(record["pipeline_buffer_slot"]),
+                    pipeline_mode=pipeline_mode,
+                )
+                metrics_writer.write_timeline_event(
+                    name=f"Tide:S1:MB{microbatch_index}:C1:Payload",
+                    lane="nccl",
+                    start_ns=c1_start_ns + wait_ns + metadata_ns,
+                    end_ns=c1_start_ns + wait_ns + metadata_ns + payload_ns,
+                    iteration=iteration,
+                    timing_source="host_submit_plus_cuda_event",
+                    microbatch_index=microbatch_index,
+                    pipeline_buffer_slot=int(record["pipeline_buffer_slot"]),
+                    pipeline_mode=pipeline_mode,
+                )
+                metrics_writer.write_timeline_event(
+                    name=f"Tide:S1:MB{microbatch_index}:Render",
+                    lane="gpu",
+                    start_ns=render_start_ns,
+                    end_ns=render_start_ns + round(timing.get("render_ms", 0.0) * 1e6),
+                    iteration=iteration,
+                    timing_source="host_submit_plus_cuda_event",
+                    microbatch_index=microbatch_index,
+                    pipeline_buffer_slot=int(record["pipeline_buffer_slot"]),
+                    pipeline_mode=pipeline_mode,
+                )
         for microbatch_index, (
             (_, _, submit_ns, cameras),
             duration_ms,
@@ -1465,6 +1770,12 @@ def train_distributed_tide_batch(
         "h2d_bytes": int(retention_stats.get("h2d_bytes", 0)),
         "h2d_ms": h2d_ms,
         "gsplat_forward_ms": forward_ms,
+        "pipeline_mode": pipeline_mode,
+        "projection_c1_overlap_ms": pc1_overlap_ms,
+        "c1_wait_ms": pc1_wait_ms,
+        "c1_metadata_ms": pc1_metadata_ms,
+        "c1_payload_ms": pc1_payload_ms,
+        "pipeline_render_ms": pc1_render_ms,
         "curvature_forward_ms": curvature_forward_ms,
         "curvature_vjp_ms": curvature_vjp_ms,
         "gaussian_projection_cull_ms": projection_ms,

@@ -243,6 +243,12 @@ class AuxiliaryParams(ParamGroup):
         self.tide_force_active_sh_degree = -1  # Diagnostic override in [-1, sh_degree]; -1 keeps the normal schedule
         self.tide_block_cull_backend = "cpu"  # {cpu, gpu}; frustum block cull backend
         self.tide_block_cull_camera_chunk = 8  # GPU cull cameras per chunk
+        # Experimental forward pipeline.  ``off`` preserves the synchronous
+        # distributed rasterizer; ``pc1`` overlaps the next projection with
+        # the current microbatch's first packed-Gaussian exchange.
+        self.tide_forward_pipeline = "off"  # {off, pc1}
+        self.tide_pipeline_buffer_count = 2
+        self.tide_nccl_stream_priority = -1
         # Public TideGS aliases. These map onto the internal paper_* names for
         # checkpoint and args.json compatibility.
         self.tide_optimizer_deferred_mode = ""

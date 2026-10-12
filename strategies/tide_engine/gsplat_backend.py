@@ -222,3 +222,24 @@ def distributed_rasterize(
         sparse_grad=False,
         distributed=True,
     )
+
+
+def distributed_rasterization_pipeline(
+    *,
+    compute_stream=None,
+    comm_stream=None,
+    buffer_count: int = 2,
+):
+    """Return the optional TideGS P/C1 pipeline from the pinned gsplat tree."""
+
+    gsplat = require_distributed_gsplat()
+    factory = getattr(gsplat, "distributed_rasterization_pipeline", None)
+    if factory is None:
+        raise RuntimeError(
+            "The pinned gsplat tree does not provide the TideGS P/C1 pipeline"
+        )
+    return factory(
+        compute_stream=compute_stream,
+        comm_stream=comm_stream,
+        buffer_count=int(buffer_count),
+    )
