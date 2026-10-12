@@ -33,8 +33,112 @@ def _nvtx_pop() -> None:
         torch.cuda.nvtx.range_pop()
 
 
+def _record_stream_recursive(value, stream, seen=None) -> None:
+    """Tell the CUDA allocator that tensors cross into ``stream``."""
+
+    if seen is None:
+        seen = set()
+    if torch.is_tensor(value):
+        identity = id(value)
+        if identity not in seen:
+            value.record_stream(stream)
+            seen.add(identity)
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            _record_stream_recursive(item, stream, seen)
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            _record_stream_recursive(item, stream, seen)
+
+
 def _cuda_event() -> torch.cuda.Event:
     return torch.cuda.Event(enable_timing=True)
+
+
+@dataclass
+class BatchCameraLayout:
+    """Rank-major camera metadata gathered once for one training batch."""
+
+    N_world: list[int]
+    C_world: list[int]
+    viewmats_global: Tensor
+    Ks_global: Tensor
+    local_camera_count: int
+    microbatch: int
+
+    @property
+    def world_size(self) -> int:
+        return len(self.N_world)
+
+    @property
+    def global_camera_count(self) -> int:
+        return int(sum(self.C_world))
+
+    def microbatch_cameras(self, microbatch_index: int) -> tuple[Tensor, Tensor]:
+        start = int(microbatch_index) * int(self.microbatch)
+        end = start + int(self.microbatch)
+        if start < 0 or end > self.local_camera_count:
+            raise IndexError(
+                f"microbatch {microbatch_index} is outside local camera layout"
+            )
+        # all_gather_tensor_list concatenates rank-major.  Reshaping before
+        # slicing preserves the same local microbatch on every rank.
+        viewmats = self.viewmats_global.reshape(
+            self.world_size, self.local_camera_count, 4, 4
+        )[:, start:end].reshape(-1, 4, 4)
+        Ks = self.Ks_global.reshape(
+            self.world_size, self.local_camera_count, 3, 3
+        )[:, start:end].reshape(-1, 3, 3)
+        return viewmats, Ks
+
+
+def prepare_batch_camera_layout(
+    *, means: Tensor, viewmats: Tensor, Ks: Tensor, microbatch: int
+) -> BatchCameraLayout:
+    """Gather all static projection metadata before the PC1 loop starts."""
+
+    if means.device.type != "cuda":
+        raise ValueError("pc1 requires CUDA tensors")
+    if not torch.distributed.is_initialized():
+        raise RuntimeError(
+            "pc1 requires an initialized torch.distributed process group"
+        )
+    if viewmats.ndim != 3 or viewmats.shape[-2:] != (4, 4):
+        raise ValueError("pc1 requires batch viewmats with shape [C,4,4]")
+    if Ks.ndim != 3 or Ks.shape[-2:] != (3, 3):
+        raise ValueError("pc1 requires batch intrinsics with shape [C,3,3]")
+    local_camera_count = int(viewmats.shape[0])
+    microbatch = int(microbatch)
+    if local_camera_count <= 0 or microbatch <= 0:
+        raise ValueError("pc1 requires positive camera and microbatch counts")
+    if local_camera_count % microbatch:
+        raise ValueError("pc1 local camera count must be divisible by microbatch")
+
+    world_size = torch.distributed.get_world_size()
+    device = means.device
+    N_world = [int(value) for value in all_gather_int32(
+        world_size, int(means.shape[0]), device=device
+    )]
+    C_world = [int(value) for value in all_gather_int32(
+        world_size, local_camera_count, device=device
+    )]
+    if any(count != local_camera_count for count in C_world):
+        raise ValueError(
+            "pc1 requires the same number of local cameras on every rank; "
+            f"got {C_world}"
+        )
+    viewmats_global, Ks_global = all_gather_tensor_list(
+        world_size, [viewmats, Ks]
+    )
+    return BatchCameraLayout(
+        N_world=N_world,
+        C_world=C_world,
+        viewmats_global=viewmats_global,
+        Ks_global=Ks_global,
+        local_camera_count=local_camera_count,
+        microbatch=microbatch,
+    )
 
 
 def _projection_prepare(
@@ -46,6 +150,8 @@ def _projection_prepare(
     colors: Tensor,
     viewmats: Tensor,
     Ks: Tensor,
+    viewmats_global: Tensor,
+    Ks_global: Tensor,
     width: int,
     height: int,
     near_plane: float,
@@ -56,6 +162,8 @@ def _projection_prepare(
     backgrounds: Optional[Tensor],
     tile_size: int,
     rasterize_mode: str,
+    N_world: list[int],
+    C_world: list[int],
 ) -> Dict[str, object]:
     """Run P(i) and return tensors immediately before C1(i)."""
 
@@ -75,22 +183,28 @@ def _projection_prepare(
         raise ValueError("pc1 currently supports rasterize_mode='classic' only")
 
     device = means.device
-    world_size = torch.distributed.get_world_size()
     N = int(means.shape[0])
     C_local = int(viewmats.shape[0])
     if C_local <= 0:
         raise ValueError("pc1 requires at least one local camera")
-    N_world = all_gather_int32(world_size, N, device=device)
-    # The packed exchange assumes a rectangular camera layout.  Collect the
-    # counts before the tensor gather so every rank makes the same decision and
-    # an invalid job cannot leave the next collective waiting forever.
-    C_world = all_gather_int32(world_size, C_local, device=device)
-    if any(int(count) != C_local for count in C_world):
+    world_size = len(N_world)
+    if len(C_world) != world_size or any(int(count) <= 0 for count in C_world):
+        raise ValueError("pc1 received an invalid batch camera layout")
+    if world_size != torch.distributed.get_world_size():
+        raise ValueError("pc1 batch camera layout world size changed during the batch")
+    world_rank = torch.distributed.get_rank()
+    if int(N_world[world_rank]) != N:
         raise ValueError(
-            "pc1 requires the same number of local cameras on every rank; "
-            f"got {C_world}"
+            "pc1 local Gaussian count changed after batch layout preparation"
         )
-    viewmats_global, Ks_global = all_gather_tensor_list(world_size, [viewmats, Ks])
+    if int(C_world[world_rank]) != C_local:
+        raise ValueError(
+            "pc1 local camera count changed after batch layout preparation"
+        )
+    if int(sum(C_world)) != int(viewmats_global.shape[0]):
+        raise ValueError("pc1 batch camera layout does not match gathered tensors")
+    if int(sum(C_world)) != int(Ks_global.shape[0]):
+        raise ValueError("pc1 batch intrinsics layout does not match gathered tensors")
     C_global = int(viewmats_global.shape[0])
 
     projection_start = _cuda_event()
@@ -399,6 +513,7 @@ class DistributedRasterizationHandle:
     projection_done: Optional[torch.cuda.Event] = None
     exchange_done: Optional[torch.cuda.Event] = None
     render_done: Optional[torch.cuda.Event] = None
+    backward_done: Optional[torch.cuda.Event] = None
     c1_wait_start: Optional[torch.cuda.Event] = None
     c1_wait_end: Optional[torch.cuda.Event] = None
     rendered: Optional[Tensor] = None
@@ -414,6 +529,7 @@ class DistributedRasterizationHandle:
         name = f"Tide:S1:MB{self.microbatch_index}:C1"
         self.state["c1_submit_ns"] = time.perf_counter_ns()
         with torch.cuda.stream(stream):
+            _record_stream_recursive(self.state, stream)
             _nvtx_push(name + ":Wait")
             self.c1_wait_start = _cuda_event()
             self.c1_wait_end = _cuda_event()
@@ -436,6 +552,7 @@ class DistributedRasterizationHandle:
         self.state["render_submit_ns"] = time.perf_counter_ns()
         with torch.cuda.stream(compute_stream):
             compute_stream.wait_event(self.exchange_done)
+            _record_stream_recursive(self.state, compute_stream)
             _nvtx_push(f"Tide:S1:MB{self.microbatch_index}:Render")
             self.rendered, self.alphas, self.meta = _render_prepared(self.state)
             _nvtx_pop()
@@ -443,6 +560,13 @@ class DistributedRasterizationHandle:
             self.render_done.record(compute_stream)
         self._rendered = True
         return self.rendered, self.alphas, self.meta
+
+    def mark_backward_done(self, event: torch.cuda.Event) -> None:
+        if not self._rendered:
+            raise RuntimeError("backward cannot finish before render is submitted")
+        if self.backward_done is not None:
+            raise RuntimeError("backward completion was already recorded")
+        self.backward_done = event
 
     def snapshot(self) -> Dict[str, object]:
         """Return timing-only state so completed tensors can be released."""
@@ -466,6 +590,7 @@ class DistributedRasterizationHandle:
             "payload_end": state.get("payload_end"),
             "exchange_done": self.exchange_done,
             "render_done": self.render_done,
+            "backward_done": self.backward_done,
         }
 
     @staticmethod
@@ -529,17 +654,24 @@ class DistributedRasterizationPipeline:
         self.comm_stream = comm_stream or torch.cuda.Stream(device=self.compute_stream.device)
         self.buffer_count = max(2, int(buffer_count))
         self._active = {}
+        self._drained = False
+        self._closed = False
 
     def submit_projection(self, *, microbatch_index: int = 0, **kwargs) -> DistributedRasterizationHandle:
+        if self._closed or self._drained:
+            raise RuntimeError("cannot submit projection after pipeline shutdown")
         slot = int(microbatch_index) % self.buffer_count
         if slot in self._active:
             previous = self._active[slot]
-            if previous.render_done is None:
-                raise RuntimeError(f"pipeline buffer slot {slot} is still in use")
-            # The render was queued on this same compute stream.  Enqueueing
-            # the dependency before reusing the slot preserves the lifetime
-            # rule without a host-side synchronize.
-            self.compute_stream.wait_event(previous.render_done)
+            if previous.render_done is None or previous.backward_done is None:
+                raise RuntimeError(
+                    f"pipeline buffer slot {slot} is still in use; "
+                    "render and backward must be complete before reuse"
+                )
+            # Keep the explicit dependency even though the normal path uses
+            # one compute stream.  It protects the slot if autograd later
+            # introduces work on another stream.
+            self.compute_stream.wait_event(previous.backward_done)
             self._active.pop(slot, None)
         handle = DistributedRasterizationHandle(self, slot, int(microbatch_index))
         with torch.cuda.stream(self.compute_stream):
@@ -553,10 +685,28 @@ class DistributedRasterizationPipeline:
         self._active[slot] = handle
         return handle
 
-    def close(self) -> None:
-        """Drop Python references after all queued work has been submitted."""
+    def drain(self) -> None:
+        """Wait for all active GPU work before another NCCL collective."""
 
+        if self._drained:
+            return
+        for handle in list(self._active.values()):
+            for event in (
+                handle.exchange_done,
+                handle.render_done,
+                handle.backward_done,
+            ):
+                if event is not None:
+                    event.synchronize()
+        self._drained = True
+
+    def close(self) -> None:
+        """Drop Python references after :meth:`drain` has completed."""
+
+        if not self._drained:
+            raise RuntimeError("pipeline.close() requires pipeline.drain() first")
         self._active.clear()
+        self._closed = True
 
     def abort(self) -> None:
         """Release all Python-side handles after a stage raises.
@@ -567,6 +717,7 @@ class DistributedRasterizationPipeline:
         """
 
         self._active.clear()
+        self._drained = True
 
     @staticmethod
     def timing_from_snapshot(snapshot: Dict[str, object]) -> Dict[str, float]:

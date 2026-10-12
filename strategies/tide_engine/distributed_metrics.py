@@ -76,6 +76,7 @@ BATCH_FIELDS = [
     "h2d_bytes",
     "h2d_ms",
     "gsplat_forward_ms",
+    "loss_ms",
     "pipeline_mode",
     "projection_c1_overlap_ms",
     "c1_wait_ms",
@@ -523,10 +524,9 @@ class DistributedMetricsWriter:
         temporal guarantee; consumers must sort events by ``start_ns``.
 
         ``host_monotonic`` events use ``time.perf_counter_ns()`` from the
-        shared host clock.  GPU events deliberately use
-        ``host_submit_plus_cuda_event`` instead: their location is an
-        approximate host submission point while their duration comes from a
-        CUDA event.
+        shared host clock.  GPU stage events use
+        ``cuda_event_relative_to_batch_anchor`` when a batch anchor is
+        available; the host timestamp is then only the anchor origin.
         """
         if not self.enabled:
             return
@@ -864,6 +864,7 @@ class LegacyCudaMetricsCollector:
 
         row["train_ms"] = (
             float(row.get("gsplat_forward_ms", 0.0))
+            + float(row.get("loss_ms", 0.0))
             + float(row.get("backward_ms", 0.0))
             + float(row.get("optimizer_ms", 0.0))
         )

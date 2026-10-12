@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any, List
 
@@ -29,6 +29,7 @@ class DistributedContext:
     rank: int = 0
     local_rank: int = 0
     world_size: int = 1
+    error_group: Any = field(default=None, repr=False, compare=False)
 
     @property
     def enabled(self) -> bool:
@@ -85,10 +86,23 @@ class DistributedContext:
                 backend="nccl", init_method="env://", timeout=pg_timeout
             )
         if dist.get_rank() != rank or dist.get_world_size() != world_size:
-            raise RuntimeError("torch.distributed process-group metadata does not match torchrun")
+            raise RuntimeError(
+                "torch.distributed process-group metadata does not match torchrun"
+            )
+
+        # Error reporting must not share the NCCL communicator used by the
+        # asynchronous PC1 exchange.  A CPU Gloo group remains usable when a
+        # rank has failed before submitting the matching NCCL collective.
+        error_group = dist.new_group(backend="gloo")
 
         args.gpu = local_rank
-        context = cls(mode=mode, rank=rank, local_rank=local_rank, world_size=world_size)
+        context = cls(
+            mode=mode,
+            rank=rank,
+            local_rank=local_rank,
+            world_size=world_size,
+            error_group=error_group,
+        )
         setattr(args, "_tide_distributed_context", context)
         return context
 
@@ -105,16 +119,18 @@ class DistributedContext:
             dist.broadcast_object_list(payload, src=src, device=torch.device("cuda", self.local_rank))
         return payload[0]
 
-    def all_gather_object(self, value: Any) -> List[Any]:
+    def all_gather_object(self, value: Any, *, group=None) -> List[Any]:
         if not self.enabled:
             return [value]
         gathered: List[Any] = [None for _ in range(self.world_size)]
         with tide_range("tide.comm.object_collective"):
-            dist.all_gather_object(gathered, value)
+            dist.all_gather_object(gathered, value, group=group)
         return gathered
 
     def close(self) -> None:
         if self.enabled and dist.is_initialized():
+            if self.error_group is not None:
+                dist.destroy_process_group(self.error_group)
             dist.destroy_process_group()
 
 
