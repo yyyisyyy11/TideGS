@@ -1044,7 +1044,9 @@ def train_distributed_tide_batch(
                 scales=scales,
                 opacities=opacities,
             )
-            backgrounds = background.reshape(1, 3).expand(len(cameras), 3).contiguous()
+            backgrounds = None
+            if background is not None:
+                backgrounds = background.reshape(1, 3).expand(len(cameras), 3).contiguous()
             global_viewmats, global_Ks = pc1_layout.microbatch_cameras(
                 microbatch_index
             )

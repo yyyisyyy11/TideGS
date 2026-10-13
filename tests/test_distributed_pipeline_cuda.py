@@ -89,7 +89,7 @@ class DistributedPipelineCudaSmokeTest(unittest.TestCase):
     def _loss(images, targets):
         return ((images - targets) ** 2).mean()
 
-    def _baseline(self, values):
+    def _baseline(self, values, background=None):
         import gsplat
 
         means, quats, scales, opacities, colors, viewmats, Ks, targets = values
@@ -109,7 +109,7 @@ class DistributedPipelineCudaSmokeTest(unittest.TestCase):
                 sh_degree=0,
                 packed=True,
                 distributed=True,
-                backgrounds=torch.zeros((1, 3), device=means.device),
+                backgrounds=None if background is None else background.reshape(1, 3),
             )
             outputs.append(rendered.detach())
             total = total + self._loss(rendered, targets[index:index + 1])
@@ -120,7 +120,7 @@ class DistributedPipelineCudaSmokeTest(unittest.TestCase):
         )
         return torch.cat(outputs, dim=0), total.detach(), gradients
 
-    def _pc1(self, values):
+    def _pc1(self, values, background=None):
         from gsplat.distributed_pipeline import (
             distributed_rasterization_pipeline,
             prepare_batch_camera_layout,
@@ -156,7 +156,7 @@ class DistributedPipelineCudaSmokeTest(unittest.TestCase):
                     width=8,
                     height=8,
                     sh_degree=0,
-                    backgrounds=torch.zeros((1, 3), device=means.device),
+                    backgrounds=None if background is None else background.reshape(1, 3),
                     near_plane=0.01,
                     far_plane=1e10,
                     radius_clip=0.0,
@@ -183,7 +183,7 @@ class DistributedPipelineCudaSmokeTest(unittest.TestCase):
                     width=8,
                     height=8,
                     sh_degree=0,
-                    backgrounds=torch.zeros((1, 3), device=means.device),
+                    backgrounds=None if background is None else background.reshape(1, 3),
                     near_plane=0.01,
                     far_plane=1e10,
                     radius_clip=0.0,
@@ -214,9 +214,21 @@ class DistributedPipelineCudaSmokeTest(unittest.TestCase):
         return torch.cat(outputs, dim=0), total.detach(), gradients, snapshots
 
     def test_off_and_pc1_match_and_overlap_events_exist(self):
+        for label, color in (
+            ("default", None),
+            ("white", (1.0, 1.0, 1.0)),
+            ("custom", (0.1, 0.2, 0.3)),
+        ):
+            with self.subTest(background=label):
+                background = None if color is None else torch.tensor(
+                    color, device=torch.device("cuda", self.local_rank)
+                )
+                self._assert_off_and_pc1_match(background, label)
+
+    def _assert_off_and_pc1_match(self, background, label):
         baseline_values = self._inputs()
         baseline_images, baseline_loss, baseline_gradients = self._baseline(
-            baseline_values
+            baseline_values, background
         )
         pc1_values = tuple(
             value.detach().clone().requires_grad_(True)
@@ -225,7 +237,7 @@ class DistributedPipelineCudaSmokeTest(unittest.TestCase):
             else value.detach().clone() if torch.is_tensor(value) else value
             for value in self._inputs()
         )
-        pc1_images, pc1_loss, pc1_gradients, snapshots = self._pc1(pc1_values)
+        pc1_images, pc1_loss, pc1_gradients, snapshots = self._pc1(pc1_values, background)
         torch.testing.assert_close(pc1_images, baseline_images, rtol=1e-4, atol=1e-4)
         torch.testing.assert_close(pc1_loss, baseline_loss, rtol=1e-4, atol=1e-5)
         for pc1_gradient, baseline_gradient in zip(pc1_gradients, baseline_gradients):
@@ -246,7 +258,7 @@ class DistributedPipelineCudaSmokeTest(unittest.TestCase):
         next_start_ms = float(c1_start.elapsed_time(next_start))
         next_end_ms = float(c1_start.elapsed_time(next_end))
         overlap_ms = max(0.0, min(c1_ms, next_end_ms) - max(0.0, next_start_ms))
-        print(f"rank={self.rank} measured P(1)/C1(0) overlap_ms={overlap_ms:.3f}")
+        print(f"rank={self.rank} background={label} measured P(1)/C1(0) overlap_ms={overlap_ms:.3f}")
         if os.environ.get("TIDE_REQUIRE_PC1_OVERLAP") == "1":
             self.assertGreater(overlap_ms, 0.0)
 
