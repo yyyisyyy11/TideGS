@@ -1073,7 +1073,7 @@ def train_distributed_tide_batch(
                 tile_size=16,
                 rasterize_mode="classic",
                 N_world=pc1_layout.N_world,
-                C_world=pc1_layout.C_world,
+                C_world=pc1_layout.microbatch_C_world,
             )
             return handle, render_inputs
 

@@ -75,6 +75,12 @@ class BatchCameraLayout:
     def global_camera_count(self) -> int:
         return int(sum(self.C_world))
 
+    @property
+    def microbatch_C_world(self) -> list[int]:
+        """Camera counts matching one rank-major microbatch camera slice."""
+
+        return [int(self.microbatch)] * self.world_size
+
     def microbatch_cameras(self, microbatch_index: int) -> tuple[Tensor, Tensor]:
         start = int(microbatch_index) * int(self.microbatch)
         end = start + int(self.microbatch)
@@ -189,7 +195,7 @@ def _projection_prepare(
         raise ValueError("pc1 requires at least one local camera")
     world_size = len(N_world)
     if len(C_world) != world_size or any(int(count) <= 0 for count in C_world):
-        raise ValueError("pc1 received an invalid batch camera layout")
+        raise ValueError("pc1 received an invalid microbatch camera layout")
     if world_size != torch.distributed.get_world_size():
         raise ValueError("pc1 batch camera layout world size changed during the batch")
     world_rank = torch.distributed.get_rank()
@@ -199,12 +205,12 @@ def _projection_prepare(
         )
     if int(C_world[world_rank]) != C_local:
         raise ValueError(
-            "pc1 local camera count changed after batch layout preparation"
+            "pc1 local camera count does not match microbatch camera layout"
         )
     if int(sum(C_world)) != int(viewmats_global.shape[0]):
-        raise ValueError("pc1 batch camera layout does not match gathered tensors")
+        raise ValueError("pc1 microbatch camera layout does not match gathered tensors")
     if int(sum(C_world)) != int(Ks_global.shape[0]):
-        raise ValueError("pc1 batch intrinsics layout does not match gathered tensors")
+        raise ValueError("pc1 microbatch intrinsics layout does not match gathered tensors")
     C_global = int(viewmats_global.shape[0])
 
     projection_start = _cuda_event()

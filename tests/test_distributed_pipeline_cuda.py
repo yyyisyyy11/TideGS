@@ -164,7 +164,7 @@ class DistributedPipelineCudaSmokeTest(unittest.TestCase):
                     tile_size=16,
                     rasterize_mode="classic",
                     N_world=layout.N_world,
-                    C_world=layout.C_world,
+                    C_world=layout.microbatch_C_world,
                 )
             current.start_forward_exchange()
             next_handle = None
@@ -191,7 +191,7 @@ class DistributedPipelineCudaSmokeTest(unittest.TestCase):
                     tile_size=16,
                     rasterize_mode="classic",
                     N_world=layout.N_world,
-                    C_world=layout.C_world,
+                    C_world=layout.microbatch_C_world,
                 )
             rendered, _, _ = current.wait_and_render()
             outputs.append(rendered.detach())
@@ -292,7 +292,7 @@ class DistributedPipelineCudaSmokeTest(unittest.TestCase):
             tile_size=16,
             rasterize_mode="classic",
             N_world=layout.N_world,
-            C_world=layout.C_world,
+            C_world=layout.microbatch_C_world,
         )
         handle.start_forward_exchange()
         local_error = None
