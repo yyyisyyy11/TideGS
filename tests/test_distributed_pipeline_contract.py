@@ -63,7 +63,7 @@ class DistributedPipelineContractTest(unittest.TestCase):
         source = ENGINE.read_text(encoding="utf-8")
         self.assertIn("pc1_current.snapshot()", source)
         self.assertIn("pc1_current.mark_backward_done(backward_end)", source)
-        self.assertIn("pc1_pipeline.drain()", source)
+        self.assertIn('"PC1 pipeline drain", pc1_pipeline.drain', source)
         self.assertIn("pc1_pipeline.close()", source)
         self.assertIn('phase="S1 pc1 pipeline drain"', source)
 
@@ -80,7 +80,7 @@ class DistributedPipelineContractTest(unittest.TestCase):
         self.assertIn("S1 pc1 local camera layout preparation", source)
         self.assertIn("S1 pc1 batch camera layout collective", source)
         self.assertIn('f"Tide:S1:MB{index}:Loss"', source)
-        self.assertIn('f"Tide:S1:MB{index}:Backward"', source)
+        self.assertIn('pc1_current.trace_backward(loss)', source)
         timeline_source = source.split(
             "    if timeline_enabled:\n        anchor_event", 1
         )[1]

@@ -172,6 +172,8 @@ def all_to_all_tensor_list(
     tensor_list: List[Tensor],
     splits: List[Union[int, Tensor]],
     output_splits: Optional[List[Union[int, Tensor]]] = None,
+    *,
+    trace: Optional[Any] = None,
 ) -> List[Tensor]:
     """Split and exchange tensors between all ranks in a many-to-many fashion.
 
@@ -187,6 +189,8 @@ def all_to_all_tensor_list(
         output_splits: Splits of the output tensors. Could be pre-calculated via
             `all_to_all_int32(world_size, splits)`. If not provided, it will
             be calculated internally.
+        trace: Optional microbatch CUDA trace. Observes the existing all-to-all
+            autograd node's backward; does not replace the collective or gradients.
 
     Returns:
         A list of tensors exchanged between all ranks, where the i-th element is
@@ -242,7 +246,11 @@ def all_to_all_tensor_list(
     splits = [s.item() if isinstance(s, Tensor) else s for s in splits]
     if data.requires_grad:
         # differentiable all_to_all
-        distF.all_to_all(collected, data.split(splits, dim=0))
+        if trace is not None and trace.enabled:
+            exchanged = distF.all_to_all(collected, data.split(splits, dim=0))
+            trace.watch_exchange(exchanged)
+        else:
+            distF.all_to_all(collected, data.split(splits, dim=0))
     else:
         # non-differentiable all_to_all
         torch.distributed.all_to_all(collected, list(data.split(splits, dim=0)))

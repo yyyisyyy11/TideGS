@@ -229,6 +229,7 @@ def distributed_rasterization_pipeline(
     compute_stream=None,
     comm_stream=None,
     buffer_count: int = 2,
+    capture_timeline: bool = False,
 ):
     """Return the optional TideGS P/C1 pipeline from the pinned gsplat tree."""
 
@@ -242,6 +243,7 @@ def distributed_rasterization_pipeline(
         compute_stream=compute_stream,
         comm_stream=comm_stream,
         buffer_count=int(buffer_count),
+        capture_timeline=bool(capture_timeline),
     )
 
 

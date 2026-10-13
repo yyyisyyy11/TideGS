@@ -21,6 +21,7 @@ from torch import Tensor
 
 from .cuda._wrapper import fully_fused_projection, isect_offset_encode, isect_tiles, rasterize_to_pixels, spherical_harmonics
 from .distributed import all_gather_int32, all_gather_tensor_list, all_to_all_int32, all_to_all_tensor_list
+from .distributed_trace import MicrobatchTrace
 
 
 def _nvtx_push(name: str) -> None:
@@ -384,6 +385,7 @@ def _forward_exchange(
         [means2d, depths, conics, opacities, colors],
         cnts,
         output_splits=collected_splits,
+        trace=state.get("trace"),
     )
     offsets = torch.tensor(
         [0] + C_world[:-1], device=camera_ids.device, dtype=camera_ids.dtype
@@ -518,6 +520,7 @@ class DistributedRasterizationHandle:
     state: Optional[Dict[str, object]] = None
     projection_done: Optional[torch.cuda.Event] = None
     exchange_done: Optional[torch.cuda.Event] = None
+    render_start: Optional[torch.cuda.Event] = None
     render_done: Optional[torch.cuda.Event] = None
     backward_done: Optional[torch.cuda.Event] = None
     c1_wait_start: Optional[torch.cuda.Event] = None
@@ -525,10 +528,12 @@ class DistributedRasterizationHandle:
     rendered: Optional[Tensor] = None
     alphas: Optional[Tensor] = None
     meta: Optional[Dict[str, object]] = None
+    trace: Optional[MicrobatchTrace] = None
     _started: bool = False
     _rendered: bool = False
 
     def start_forward_exchange(self) -> "DistributedRasterizationHandle":
+        self.pipeline._ensure_not_aborted()
         if self.state is None or self._started:
             raise RuntimeError("projection handle is not ready or C1 was already started")
         stream = self.pipeline.comm_stream
@@ -550,6 +555,7 @@ class DistributedRasterizationHandle:
         return self
 
     def wait_and_render(self):
+        self.pipeline._ensure_not_aborted()
         if not self._started or self.state is None:
             raise RuntimeError("C1 must be started before render")
         if self._rendered:
@@ -559,6 +565,10 @@ class DistributedRasterizationHandle:
         with torch.cuda.stream(compute_stream):
             compute_stream.wait_event(self.exchange_done)
             _record_stream_recursive(self.state, compute_stream)
+            # C1 may finish while this stream is still executing P(i+1).
+            # Record on the compute stream so that time is not called Render.
+            self.render_start = _cuda_event()
+            self.render_start.record(compute_stream)
             _nvtx_push(f"Tide:S1:MB{self.microbatch_index}:Render")
             self.rendered, self.alphas, self.meta = _render_prepared(self.state)
             _nvtx_pop()
@@ -567,12 +577,23 @@ class DistributedRasterizationHandle:
         self._rendered = True
         return self.rendered, self.alphas, self.meta
 
+    def trace_backward(self, loss: Tensor) -> None:
+        """Attach observers to the actual graph without changing its gradients."""
+        self.pipeline._ensure_not_aborted()
+        if not self._rendered or self.backward_done is not None:
+            raise RuntimeError("backward tracing requires an unconsumed render")
+        if self.trace is not None:
+            self.trace.watch_backward(loss)
+
     def mark_backward_done(self, event: torch.cuda.Event) -> None:
+        self.pipeline._ensure_not_aborted()
         if not self._rendered:
             raise RuntimeError("backward cannot finish before render is submitted")
         if self.backward_done is not None:
             raise RuntimeError("backward completion was already recorded")
         self.backward_done = event
+        if self.trace is not None:
+            self.trace.close()
 
     def snapshot(self) -> Dict[str, object]:
         """Return timing-only state so completed tensors can be released."""
@@ -585,6 +606,7 @@ class DistributedRasterizationHandle:
             "pipeline_buffer_slot": self.slot,
             "projection_start": state.get("projection_start"),
             "projection_end": state.get("projection_end"),
+            "projection_done": self.projection_done,
             "projection_submit_ns": state.get("projection_submit_ns", 0),
             "c1_submit_ns": state.get("c1_submit_ns", 0),
             "render_submit_ns": state.get("render_submit_ns", 0),
@@ -595,8 +617,10 @@ class DistributedRasterizationHandle:
             "payload_start": state.get("payload_start"),
             "payload_end": state.get("payload_end"),
             "exchange_done": self.exchange_done,
+            "render_start": self.render_start,
             "render_done": self.render_done,
             "backward_done": self.backward_done,
+            "backward_trace": self.trace.snapshot() if self.trace is not None else [],
         }
 
     @staticmethod
@@ -621,7 +645,7 @@ class DistributedRasterizationHandle:
                 snapshot.get("metadata_start"), snapshot.get("payload_end")
             ),
             "render_ms": elapsed(
-                snapshot.get("exchange_done"), snapshot.get("render_done")
+                snapshot.get("render_start"), snapshot.get("render_done")
             ),
         }
 
@@ -653,17 +677,26 @@ class DistributedRasterizationHandle:
 class DistributedRasterizationPipeline:
     """Double-buffered P/C1 pipeline for packed distributed rendering."""
 
-    def __init__(self, *, compute_stream=None, comm_stream=None, buffer_count: int = 2):
+    def __init__(self, *, compute_stream=None, comm_stream=None, buffer_count: int = 2,
+                 capture_timeline: bool = False):
         if not torch.cuda.is_available():
             raise RuntimeError("pc1 requires CUDA")
         self.compute_stream = compute_stream or torch.cuda.current_stream()
         self.comm_stream = comm_stream or torch.cuda.Stream(device=self.compute_stream.device)
         self.buffer_count = max(2, int(buffer_count))
+        self.capture_timeline = bool(capture_timeline)
         self._active = {}
         self._drained = False
         self._closed = False
+        self._aborted = False
+        self._quarantine = []
+
+    def _ensure_not_aborted(self) -> None:
+        if self._aborted:
+            raise RuntimeError("PC1 pipeline aborted; worker must exit, NCCL batch cannot be resumed")
 
     def submit_projection(self, *, microbatch_index: int = 0, **kwargs) -> DistributedRasterizationHandle:
+        self._ensure_not_aborted()
         if self._closed or self._drained:
             raise RuntimeError("cannot submit projection after pipeline shutdown")
         slot = int(microbatch_index) % self.buffer_count
@@ -680,10 +713,17 @@ class DistributedRasterizationPipeline:
             self.compute_stream.wait_event(previous.backward_done)
             self._active.pop(slot, None)
         handle = DistributedRasterizationHandle(self, slot, int(microbatch_index))
+        if self.capture_timeline:
+            handle.trace = MicrobatchTrace(kwargs["means"].device, microbatch_index)
         with torch.cuda.stream(self.compute_stream):
             _nvtx_push(f"Tide:S1:MB{microbatch_index}:Projection")
             submit_ns = time.perf_counter_ns()
             handle.state = _projection_prepare(**kwargs)
+            handle.state["trace"] = handle.trace
+            if handle.trace is not None:
+                handle.trace.watch_node(
+                    [handle.state["means2d"], handle.state["colors"]], "FinalGrad"
+                )
             handle.state["projection_submit_ns"] = submit_ns
             handle.projection_done = _cuda_event()
             handle.projection_done.record(self.compute_stream)
@@ -694,6 +734,7 @@ class DistributedRasterizationPipeline:
     def drain(self) -> None:
         """Wait for all active GPU work before another NCCL collective."""
 
+        self._ensure_not_aborted()
         if self._drained:
             return
         for handle in list(self._active.values()):
@@ -709,21 +750,26 @@ class DistributedRasterizationPipeline:
     def close(self) -> None:
         """Drop Python references after :meth:`drain` has completed."""
 
+        self._ensure_not_aborted()
         if not self._drained:
             raise RuntimeError("pipeline.close() requires pipeline.drain() first")
         self._active.clear()
         self._closed = True
 
     def abort(self) -> None:
-        """Release all Python-side handles after a stage raises.
+        """Mark the pipeline terminal and retain potentially in-flight tensors.
 
         CUDA/NCCL work already submitted to a stream cannot be cancelled here;
-        clearing the handles prevents stale state from being reused after the
-        caller has synchronized the rank error.
+        the engine's CPU watchdog must exit the worker. Retaining handles
+        avoids allocator/destructor activity on a damaged communicator. Abort
+        does not imply drain completed and never permits reuse or safe close.
         """
 
+        if self._aborted:
+            return
+        self._aborted = True
+        self._quarantine.extend(self._active.values())
         self._active.clear()
-        self._drained = True
 
     @staticmethod
     def timing_from_snapshot(snapshot: Dict[str, object]) -> Dict[str, float]:

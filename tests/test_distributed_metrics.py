@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from strategies.tide_engine.distributed_metrics import (
     DistributedMetricsWriter,
     LegacyCudaMetricsCollector,
+    cuda_interval_union_ms,
 )
 
 
@@ -72,6 +73,52 @@ def _read_rows(path):
 
 
 class DistributedMetricsTest(unittest.TestCase):
+    def test_cuda_union_excludes_double_counting_across_streams(self):
+        class Event:
+            def __init__(self, ms):
+                self.ms = ms
+
+            def elapsed_time(self, other):
+                return other.ms - self.ms
+
+        anchor = Event(100)
+        # Curvature before the anchor; overlapping P/C1/previous backward;
+        # a gap before optimizer. Union is 2 + 10 + 3, not the sum 22.
+        intervals = [(98, 100), (100, 106), (103, 110), (106, 110), (112, 115)]
+        self.assertEqual(cuda_interval_union_ms(
+            anchor, [(Event(a), Event(b)) for a, b in intervals]
+        ), 15.0)
+        self.assertEqual(cuda_interval_union_ms(anchor, []), 0.0)
+        with self.assertRaisesRegex(ValueError, "ends before"):
+            cuda_interval_union_ms(anchor, [(Event(102), Event(101))])
+
+    def test_backward_trace_fields_survive_rank_and_global_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = DistributedMetricsWriter(
+                args=SimpleNamespace(log_folder=directory, tide_detailed_metrics=True),
+                context=_Context(),
+            )
+            stages = {
+                "intermediate_grad_ms": 2.0, "c2_ms": 3.0,
+                "final_grad_ms": 4.0, "grad_accumulate_ms": 0.5,
+            }
+            writer.write_batch({"iteration": 1, **stages})
+            local = _read_rows(Path(directory) / "metrics_batch_rank0.tsv")[0]
+            global_row = _read_rows(Path(directory) / "metrics_batch_global.tsv")[0]
+            for key, value in stages.items():
+                self.assertEqual(float(local[key]), value)
+                self.assertEqual(float(global_row[key + "_max"]), value)
+            writer.write_timeline_event(
+                name="Tide:S1:MB0:C2", lane="nccl", start_ns=100, end_ns=125,
+                iteration=1, stage="C2", scope="autograd_node",
+                node_name="_AlltoAllBackward", stream_id=7, microbatch_index=0,
+                timing_source="cuda_event_relative_to_batch_anchor",
+            )
+            event = json.loads((Path(directory) / "timeline_events_rank0.jsonl").read_text())
+            self.assertEqual(event["stage"], "C2")
+            self.assertEqual(event["stream_id"], 7)
+            self.assertEqual(event["duration_ns"], 25)
+
     def test_grad_sample_rows_accepts_all_rows_sentinel(self):
         with tempfile.TemporaryDirectory() as directory:
             writer = DistributedMetricsWriter(

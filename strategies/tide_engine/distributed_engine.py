@@ -14,10 +14,12 @@ import torch.nn as nn
 import utils.general_utils as utils
 from strategies.base_engine import torch_compiled_loss
 from utils.distributed import DistributedContext
+from utils.tide_trace import tide_range
 
 from .distributed_plan import DistributedBatchPlan
 from .distributed_metrics import (
     GRAD_METRIC_VALUE_FIELDS,
+    cuda_interval_union_ms,
     get_distributed_metrics_writer,
 )
 from .gradient_sparsity import (
@@ -312,11 +314,19 @@ def _synchronize_rank_errors(
     error: Optional[BaseException],
     group=None,
 ) -> None:
+    # A peer may be stuck in a CUDA-to-CPU split conversion inside C1 and
+    # never reach this Gloo checkpoint. Publish failure independently first.
+    controller = getattr(context, "pc1_error_controller", None) if group is not None else None
+    if controller is not None and error is not None:
+        controller.fail(phase, error)
     payload = {
         "rank": int(context.rank),
         "error": _error_description(error),
     }
-    if group is None:
+    if controller is not None:
+        with controller.operation(phase):
+            statuses = context.all_gather_object(payload, group=group)
+    elif group is None:
         statuses = context.all_gather_object(payload)
     else:
         statuses = context.all_gather_object(payload, group=group)
@@ -688,7 +698,15 @@ def train_distributed_tide_batch(
     pc1_nccl_stream = None
     pc1_layout = None
     pc1_error_group = getattr(context, "error_group", None)
+    pc1_error_controller = getattr(context, "pc1_error_controller", None)
     pc1_records = []
+
+    def _pc1_run(phase, function, *positional, **keywords):
+        if pc1_error_controller is None:
+            raise RuntimeError("PC1 requires an initialized CPU error controller")
+        with pc1_error_controller.operation(phase):
+            return function(*positional, **keywords)
+
     if pipeline_mode == "pc1":
         pc1_nccl_stream = torch.cuda.Stream(
             device=probe_device,
@@ -698,6 +716,7 @@ def train_distributed_tide_batch(
             compute_stream=torch.cuda.current_stream(leaves["xyz"].device),
             comm_stream=pc1_nccl_stream,
             buffer_count=int(getattr(args, "tide_pipeline_buffer_count", 2)),
+            capture_timeline=timeline_enabled,
         )
         layout_error = None
         batch_viewmats = None
@@ -728,7 +747,8 @@ def train_distributed_tide_batch(
         )
         layout_error = None
         try:
-            pc1_layout = prepare_distributed_camera_layout(
+            pc1_layout = _pc1_run(
+                "PC1 batch camera layout", prepare_distributed_camera_layout,
                 means=leaves["xyz"],
                 viewmats=batch_viewmats,
                 Ks=batch_Ks,
@@ -1084,7 +1104,9 @@ def train_distributed_tide_batch(
         pc1_error = None
         try:
             first_cameras = batched_cameras[:microbatch]
-            pc1_current, pc1_current_inputs = _pc1_submit(0, first_cameras)
+            pc1_current, pc1_current_inputs = _pc1_run(
+                "PC1 initial projection", _pc1_submit, 0, first_cameras
+            )
         except BaseException as error:
             pc1_error = error
             pc1_pipeline.abort()
@@ -1098,154 +1120,163 @@ def train_distributed_tide_batch(
         for microbatch_index, start in enumerate(
             range(0, len(batched_cameras), microbatch)
         ):
-            cameras = batched_cameras[start:start + microbatch]
-            local_error = None
-            next_handle = None
-            next_inputs = None
-            submit_error = None
-            try:
-                pc1_current.start_forward_exchange()
-                next_start = start + microbatch
-                if next_start < len(batched_cameras):
-                    next_cameras = batched_cameras[next_start:next_start + microbatch]
-                    next_handle, next_inputs = _pc1_submit(
-                        microbatch_index + 1, next_cameras
+            # Guard the entire microbatch, including event recording, memory
+            # probes, image packing and error checkpoints between CUDA calls.
+            with pc1_error_controller.operation(f"PC1 MB{microbatch_index}"):
+                cameras = batched_cameras[start:start + microbatch]
+                local_error = None
+                next_handle = None
+                next_inputs = None
+                submit_error = None
+                try:
+                    _pc1_run(
+                        f"PC1 MB{microbatch_index} C1", pc1_current.start_forward_exchange
                     )
-            except BaseException as error:
-                submit_error = error
-                pc1_pipeline.abort()
-
-            render_inputs = pc1_current_inputs
-            scales, rotations, opacities, sh_coefficients = render_inputs
-            forward_submit_ns = time.perf_counter_ns() if timeline_enabled else None
-            try:
-                write_memory_point(
-                    phase="before_forward",
-                    microbatch_index=microbatch_index,
-                    cameras=cameras,
-                )
-                forward_start = pc1_current.state["projection_start"]
-                rendered, _, meta = pc1_current.wait_and_render()
-                forward_end = pc1_current.render_done
-                forward_ranges.append(
-                    (forward_start, forward_end, forward_submit_ns, cameras)
-                )
-                projection_events = meta.get(PROJECTION_TIMING_FIX)
-                if projection_events is not None:
-                    projection_event_pairs.append(projection_events)
-                if grad_zero_sample_due:
-                    _mark_projection_cull_survivors(
-                        projection_cull_survivor_mask,
-                        meta,
-                        owner_active_rows,
-                    )
-                    if tile_contribution_mode == "off":
-                        tile_survivor_mask.copy_(projection_cull_survivor_mask)
-                    else:
-                        _merge_owner_tile_survivors(
-                            tile_survivor_mask,
-                            tile_mask_counts,
-                            meta,
-                            owner_active_rows=owner_active_rows,
-                            participation_rows=participation_rows,
-                            uses_sentinel=uses_sentinel,
+                    next_start = start + microbatch
+                    if next_start < len(batched_cameras):
+                        next_cameras = batched_cameras[next_start:next_start + microbatch]
+                        next_handle, next_inputs = _pc1_run(
+                            f"PC1 MB{microbatch_index + 1} Projection", _pc1_submit,
+                            microbatch_index + 1, next_cameras,
                         )
-                loss_start = torch.cuda.Event(enable_timing=True)
-                loss_end = torch.cuda.Event(enable_timing=True)
-                loss_start.record()
-                micro_losses = []
-                for local_index, camera in enumerate(cameras):
-                    image = rendered[local_index].permute(2, 0, 1).contiguous()
-                    micro_losses.append(torch_compiled_loss(image, camera.original_image))
-                loss_end.record()
-                loss_ranges.append(
-                    (loss_start, loss_end, forward_submit_ns, cameras)
-                )
-                detached_losses.extend(loss.detach() for loss in micro_losses)
-                write_memory_point(
-                    phase="after_forward",
-                    microbatch_index=microbatch_index,
-                    cameras=cameras,
-                )
-            except BaseException as error:
-                local_error = error
-                if isinstance(error, torch.OutOfMemoryError):
-                    write_memory_point(
-                        phase="oom",
-                        microbatch_index=microbatch_index,
-                        cameras=cameras,
-                        error=error,
-                    )
-            if local_error is None and submit_error is not None:
-                local_error = submit_error
-            if local_error is not None:
-                pc1_pipeline.abort()
-            _synchronize_rank_errors(
-                context,
-                phase=f"S1 microbatch {microbatch_index} forward",
-                error=local_error,
-                group=pc1_error_group,
-            )
+                except BaseException as error:
+                    submit_error = error
+                    pc1_pipeline.abort()
 
-            local_error = None
-            try:
-                backward_submit_ns = time.perf_counter_ns() if timeline_enabled else None
-                backward_start = torch.cuda.Event(enable_timing=True)
-                backward_end = torch.cuda.Event(enable_timing=True)
-                backward_start.record()
-                if torch.cuda.is_available():
-                    torch.cuda.nvtx.range_push(
-                        f"Tide:S1:MB{microbatch_index}:Backward"
-                    )
-                torch.stack(micro_losses).sum().backward()
-                if torch.cuda.is_available():
-                    torch.cuda.nvtx.range_pop()
-                backward_end.record()
-                pc1_current.mark_backward_done(backward_end)
-                backward_ranges.append(
-                    (backward_start, backward_end, backward_submit_ns, cameras)
-                )
-                write_memory_point(
-                    phase="after_backward",
-                    microbatch_index=microbatch_index,
-                    cameras=cameras,
-                )
-            except BaseException as error:
-                local_error = error
-                if isinstance(error, torch.OutOfMemoryError):
+                render_inputs = pc1_current_inputs
+                scales, rotations, opacities, sh_coefficients = render_inputs
+                forward_submit_ns = time.perf_counter_ns() if timeline_enabled else None
+                try:
                     write_memory_point(
-                        phase="oom",
+                        phase="before_forward",
                         microbatch_index=microbatch_index,
                         cameras=cameras,
-                        error=error,
                     )
-                pc1_pipeline.abort()
-            _synchronize_rank_errors(
-                context,
-                phase=f"S1 microbatch {microbatch_index} backward",
-                error=local_error,
-                group=pc1_error_group,
-            )
-            # Keep only CUDA events and host timestamps.  Retaining the full
-            # handle here would retain every packed projection/render tensor
-            # until the end of the batch and can exhaust GPU memory.
-            pc1_records.append((pc1_current.snapshot(), cameras, microbatch_index))
-            pc1_current = next_handle
-            pc1_current_inputs = next_inputs
-            del (
-                rendered,
-                meta,
-                image,
-                micro_losses,
-                scales,
-                rotations,
-                opacities,
-                sh_coefficients,
-            )
+                    forward_start = pc1_current.state["projection_start"]
+                    rendered, _, meta = _pc1_run(
+                        f"PC1 MB{microbatch_index} Render", pc1_current.wait_and_render
+                    )
+                    forward_end = pc1_current.render_done
+                    forward_ranges.append(
+                        (forward_start, forward_end, forward_submit_ns, cameras)
+                    )
+                    projection_events = meta.get(PROJECTION_TIMING_FIX)
+                    if projection_events is not None:
+                        projection_event_pairs.append(projection_events)
+                    if grad_zero_sample_due:
+                        _mark_projection_cull_survivors(
+                            projection_cull_survivor_mask,
+                            meta,
+                            owner_active_rows,
+                        )
+                        if tile_contribution_mode == "off":
+                            tile_survivor_mask.copy_(projection_cull_survivor_mask)
+                        else:
+                            _merge_owner_tile_survivors(
+                                tile_survivor_mask,
+                                tile_mask_counts,
+                                meta,
+                                owner_active_rows=owner_active_rows,
+                                participation_rows=participation_rows,
+                                uses_sentinel=uses_sentinel,
+                            )
+                    loss_start = torch.cuda.Event(enable_timing=True)
+                    loss_end = torch.cuda.Event(enable_timing=True)
+                    loss_start.record()
+                    micro_losses = []
+                    with tide_range(f"Tide:S1:MB{microbatch_index}:Loss"):
+                        for local_index, camera in enumerate(cameras):
+                            image = rendered[local_index].permute(2, 0, 1).contiguous()
+                            micro_losses.append(_pc1_run(
+                                f"PC1 MB{microbatch_index} Loss", torch_compiled_loss,
+                                image, camera.original_image,
+                            ))
+                    loss_end.record()
+                    loss_ranges.append(
+                        (loss_start, loss_end, forward_submit_ns, cameras)
+                    )
+                    detached_losses.extend(loss.detach() for loss in micro_losses)
+                    write_memory_point(
+                        phase="after_forward",
+                        microbatch_index=microbatch_index,
+                        cameras=cameras,
+                    )
+                except BaseException as error:
+                    local_error = error
+                    if pc1_error_controller is not None:
+                        pc1_error_controller.fail(f"PC1 MB{microbatch_index} forward", error)
+                if local_error is None and submit_error is not None:
+                    local_error = submit_error
+                if local_error is not None:
+                    pc1_pipeline.abort()
+                _synchronize_rank_errors(
+                    context,
+                    phase=f"S1 microbatch {microbatch_index} forward",
+                    error=local_error,
+                    group=pc1_error_group,
+                )
+
+                local_error = None
+                try:
+                    backward_submit_ns = time.perf_counter_ns() if timeline_enabled else None
+                    backward_start = torch.cuda.Event(enable_timing=True)
+                    backward_end = torch.cuda.Event(enable_timing=True)
+                    backward_start.record()
+                    if torch.cuda.is_available():
+                        torch.cuda.nvtx.range_push(
+                            f"Tide:S1:MB{microbatch_index}:Backward"
+                        )
+                    try:
+                        def _backward():
+                            loss = torch.stack(micro_losses).sum()
+                            pc1_current.trace_backward(loss)
+                            loss.backward()
+
+                        _pc1_run(f"PC1 MB{microbatch_index} Backward", _backward)
+                    finally:
+                        if torch.cuda.is_available():
+                            torch.cuda.nvtx.range_pop()
+                    backward_end.record()
+                    pc1_current.mark_backward_done(backward_end)
+                    backward_ranges.append(
+                        (backward_start, backward_end, backward_submit_ns, cameras)
+                    )
+                    write_memory_point(
+                        phase="after_backward",
+                        microbatch_index=microbatch_index,
+                        cameras=cameras,
+                    )
+                except BaseException as error:
+                    local_error = error
+                    if pc1_error_controller is not None:
+                        pc1_error_controller.fail(f"PC1 MB{microbatch_index} backward", error)
+                    pc1_pipeline.abort()
+                _synchronize_rank_errors(
+                    context,
+                    phase=f"S1 microbatch {microbatch_index} backward",
+                    error=local_error,
+                    group=pc1_error_group,
+                )
+                # Keep only CUDA events and host timestamps.  Retaining the full
+                # handle here would retain every packed projection/render tensor
+                # until the end of the batch and can exhaust GPU memory.
+                pc1_records.append((pc1_current.snapshot(), cameras, microbatch_index))
+                pc1_current = next_handle
+                pc1_current_inputs = next_inputs
+                del (
+                    rendered,
+                    meta,
+                    image,
+                    micro_losses,
+                    scales,
+                    rotations,
+                    opacities,
+                    sh_coefficients,
+                )
 
         drain_error = None
         try:
-            pc1_pipeline.drain()
+            _pc1_run("PC1 pipeline drain", pc1_pipeline.drain)
         except BaseException as error:
             drain_error = error
             pc1_pipeline.abort()
@@ -1488,18 +1519,19 @@ def train_distributed_tide_batch(
         prepared = None
         prepare_error = None
         try:
-            prepared = optimizer.prepare_step(
-                iteration=iteration,
-                gaussians=gaussians,
-                sparse_grad_local_ids=gradient_local,
-                sparse_grad_components=sparse_grad_components,
-                sparse_curvature_local_ids=curvature_local,
-                sparse_curvature_components=(
-                    sparse_curvature_components if curvature_due else None
-                ),
-                curvature_due=curvature_due,
-                optimizer_step=optimizer_step,
-            )
+            with tide_range(f"Tide:S1:Optimizer:{optimizer_algorithm}:Prepare"):
+                prepared = optimizer.prepare_step(
+                    iteration=iteration,
+                    gaussians=gaussians,
+                    sparse_grad_local_ids=gradient_local,
+                    sparse_grad_components=sparse_grad_components,
+                    sparse_curvature_local_ids=curvature_local,
+                    sparse_curvature_components=(
+                        sparse_curvature_components if curvature_due else None
+                    ),
+                    curvature_due=curvature_due,
+                    optimizer_step=optimizer_step,
+                )
         except BaseException as error:
             prepare_error = error
         try:
@@ -1515,7 +1547,8 @@ def train_distributed_tide_batch(
 
         step_error = None
         try:
-            step_stats = optimizer.commit_step(prepared)
+            with tide_range(f"Tide:S1:Optimizer:{optimizer_algorithm}:Commit"):
+                step_stats = optimizer.commit_step(prepared)
         except BaseException as error:
             step_error = error
         _synchronize_rank_errors(
@@ -1526,12 +1559,13 @@ def train_distributed_tide_batch(
     else:
         step_error = None
         try:
-            step_stats = optimizer.step(
-                iteration=iteration,
-                gaussians=gaussians,
-                sparse_grad_local_ids=gradient_local,
-                sparse_grad_components=sparse_grad_components,
-            )
+            with tide_range(f"Tide:S1:Optimizer:{optimizer_algorithm}"):
+                step_stats = optimizer.step(
+                    iteration=iteration,
+                    gaussians=gaussians,
+                    sparse_grad_local_ids=gradient_local,
+                    sparse_grad_components=sparse_grad_components,
+                )
         except BaseException as error:
             step_error = error
         _synchronize_rank_errors(
@@ -1615,6 +1649,13 @@ def train_distributed_tide_batch(
     pc1_metadata_ms = 0.0
     pc1_payload_ms = 0.0
     pc1_render_ms = 0.0
+    backward_stage_ms = dict.fromkeys(
+        ("IntermediateGrad", "C2", "FinalGrad", "AccumulateGrad"), 0.0
+    )
+    train_ms = (
+        curvature_forward_ms + curvature_vjp_ms + forward_ms
+        + loss_ms + backward_ms + optimizer_ms
+    )
     if pipeline_mode == "pc1":
         for record_index, (record, _, _) in enumerate(pc1_records):
             timing = pc1_pipeline.timing_from_snapshot(record)
@@ -1636,6 +1677,26 @@ def train_distributed_tide_batch(
                         0.0,
                         min(c1_ms, p_offset + p_ms) - max(0.0, p_offset),
                     )
+        gpu_anchor = pc1_records[0][0]["projection_start"]
+        for stage in backward_stage_ms:
+            backward_stage_ms[stage] = cuda_interval_union_ms(
+                gpu_anchor,
+                [
+                    (span["start_event"], span["end_event"])
+                    for record, _, _ in pc1_records
+                    for span in record.get("backward_trace", [])
+                    if span["stage"] == stage and span["complete"]
+                ],
+            )
+        # Forward request intervals overlap in PC1. Adding them (and then
+        # adding backward again) overstates covered training time.
+        train_ms = cuda_interval_union_ms(
+            gpu_anchor,
+            [(entry[0], entry[1]) for ranges in (
+                curvature_forward_ranges, curvature_vjp_ranges,
+                forward_ranges, loss_ranges, backward_ranges,
+            ) for entry in ranges] + [(optimizer_start, optimizer_end)],
+        )
     if timeline_enabled:
         anchor_event = None
         anchor_host_ns = None
@@ -1715,7 +1776,7 @@ def train_distributed_tide_batch(
                     ("C1:Wait", "nccl", record.get("c1_wait_start"), record.get("c1_wait_end")),
                     ("C1:Metadata", "nccl", record.get("metadata_start"), record.get("metadata_end")),
                     ("C1:Payload", "nccl", record.get("payload_start"), record.get("payload_end")),
-                    ("Render", "gpu", record.get("exchange_done"), record.get("render_done")),
+                    ("Render", "gpu", record.get("render_start"), record.get("render_done")),
                 )
                 for suffix, lane, start_event, end_event in spans:
                     span = _event_span(start_event, end_event)
@@ -1733,6 +1794,28 @@ def train_distributed_tide_batch(
                         pipeline_buffer_slot=int(record["pipeline_buffer_slot"]),
                         pipeline_mode=pipeline_mode,
                         camera_uids=camera_uids(cameras),
+                        stage=suffix,
+                        scope="stage",
+                    )
+                for node_index, node_span in enumerate(record.get("backward_trace", [])):
+                    if not node_span["complete"]:
+                        continue
+                    _write_cuda_event(
+                        name=f"Tide:S1:MB{microbatch_index}:{node_span['stage']}",
+                        lane="nccl" if node_span["stage"] == "C2" else "gpu",
+                        start_event=node_span["start_event"],
+                        end_event=node_span["end_event"],
+                        microbatch_index=microbatch_index,
+                        microbatch_count=microbatch_count,
+                        camera_uids=camera_uids(cameras),
+                        stage=node_span["stage"],
+                        scope="autograd_node",
+                        node_index=node_index,
+                        node_name=node_span["node_name"],
+                        stream_id=node_span["stream_id"],
+                        timing_kind=node_span["timing_kind"],
+                        detail=("includes_collective_readiness_wait"
+                                if node_span["stage"] == "C2" else None),
                     )
             _write_cuda_ranges(
                 lambda index: f"Tide:S1:MB{index}:Loss",
@@ -1747,15 +1830,8 @@ def train_distributed_tide_batch(
                 detail="includes_projection_cull",
             )
             _write_cuda_ranges("Loss", "gpu", loss_ranges)
-        _write_cuda_ranges(
-            (
-                lambda index: f"Tide:S1:MB{index}:Backward"
-                if pipeline_mode == "pc1"
-                else "Backward"
-            ),
-            "gpu",
-            backward_ranges,
-        )
+        if pipeline_mode != "pc1":
+            _write_cuda_ranges("Backward", "gpu", backward_ranges)
         _write_cuda_ranges("curvature_forward", "gpu", curvature_forward_ranges)
         for (
             start_event,
@@ -1776,10 +1852,13 @@ def train_distributed_tide_batch(
                 camera_uids=camera_uids(cameras),
             )
         _write_cuda_event(
-            name=optimizer_algorithm,
+            name=(f"Tide:S1:Optimizer:{optimizer_algorithm}"
+                  if pipeline_mode == "pc1" else optimizer_algorithm),
             lane="gpu",
             start_event=optimizer_start,
             end_event=optimizer_end,
+            stage="Optimizer",
+            scope="batch",
         )
         h2d_events = retention_stats.get("h2d_events")
         if h2d_events is not None:
@@ -1870,19 +1949,16 @@ def train_distributed_tide_batch(
         "c1_metadata_ms": pc1_metadata_ms,
         "c1_payload_ms": pc1_payload_ms,
         "pipeline_render_ms": pc1_render_ms,
+        "intermediate_grad_ms": backward_stage_ms["IntermediateGrad"],
+        "c2_ms": backward_stage_ms["C2"],
+        "final_grad_ms": backward_stage_ms["FinalGrad"],
+        "grad_accumulate_ms": backward_stage_ms["AccumulateGrad"],
         "curvature_forward_ms": curvature_forward_ms,
         "curvature_vjp_ms": curvature_vjp_ms,
         "gaussian_projection_cull_ms": projection_ms,
         "backward_ms": backward_ms,
         "optimizer_ms": optimizer_ms,
-        "train_ms": (
-            curvature_forward_ms
-            + curvature_vjp_ms
-            + forward_ms
-            + loss_ms
-            + backward_ms
-            + optimizer_ms
-        ),
+        "train_ms": train_ms,
         "bounds_sync_ms": bounds_sync_ms,
         "barrier_ms": barrier_ms,
         "batch_total_ms": (time.perf_counter() - batch_start) * 1000.0,

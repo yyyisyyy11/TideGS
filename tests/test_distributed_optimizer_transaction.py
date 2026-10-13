@@ -1,5 +1,6 @@
 import ast
 import copy
+from contextlib import nullcontext
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -93,6 +94,7 @@ class DistributedOptimizerTransactionTest(unittest.TestCase):
                 raise RuntimeError("rank=1 RuntimeError: peer prepare failed")
 
         namespace = {
+            "tide_range": lambda name: nullcontext(),
             "optimizer_algorithm": "3dgs2_tr",
             "optimizer": optimizer,
             "_synchronize_rank_errors": synchronize,

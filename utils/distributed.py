@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import math
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any, List
@@ -10,9 +11,17 @@ from typing import Any, List
 import torch
 import torch.distributed as dist
 from utils.tide_trace import tide_range
+from utils.distributed_error_control import PC1ErrorController
 
 
 _DISTRIBUTED_MODES = {"off", "gaussian_sharded"}
+
+
+def _positive_timeout(name: str, default: str) -> float:
+    value = float(os.environ.get(name, default))
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be positive and finite")
+    return value
 
 
 def distributed_mode(args: Any) -> str:
@@ -30,6 +39,7 @@ class DistributedContext:
     local_rank: int = 0
     world_size: int = 1
     error_group: Any = field(default=None, repr=False, compare=False)
+    pc1_error_controller: Any = field(default=None, repr=False, compare=False)
 
     @property
     def enabled(self) -> bool:
@@ -90,10 +100,48 @@ class DistributedContext:
                 "torch.distributed process-group metadata does not match torchrun"
             )
 
-        # Error reporting must not share the NCCL communicator used by the
-        # asynchronous PC1 exchange.  A CPU Gloo group remains usable when a
-        # rank has failed before submitting the matching NCCL collective.
-        error_group = dist.new_group(backend="gloo")
+        pc1 = str(getattr(args, "tide_forward_pipeline", "off")).lower() == "pc1"
+        # Gloo error checkpoints alone cannot interrupt a main thread blocked
+        # in CUDA/NCCL. PC1 additionally needs independent fatal supervision.
+        if pc1:
+            setup_timeout = timedelta(seconds=_positive_timeout("TIDE_PC1_ERROR_TIMEOUT_SEC", "30"))
+            io_timeout = timedelta(seconds=_positive_timeout("TIDE_PC1_CONTROL_IO_TIMEOUT_SEC", "1"))
+            stage_timeout = _positive_timeout("TIDE_PC1_STAGE_TIMEOUT_SEC", "60")
+            # A healthy peer can still be completing a protected host stage
+            # when another rank reaches its CPU checkpoint. Gloo must not
+            # time out earlier than the controller's permitted stage skew.
+            runtime_timeout = max(setup_timeout, timedelta(
+                seconds=stage_timeout + 2 * io_timeout.total_seconds() + 5,
+            ))
+            error_group = dist.new_group(
+                backend="gloo", timeout=runtime_timeout,
+            )
+        else:
+            error_group = dist.new_group(backend="gloo")
+        pc1_error_controller = None
+        if pc1:
+            control_store = None
+            control_port = [None]
+            if rank == 0:
+                control_store = dist.TCPStore(
+                    host_name="0.0.0.0", port=0, world_size=world_size,
+                    is_master=True, timeout=setup_timeout, wait_for_workers=False,
+                )
+                control_port[0] = control_store.port
+            # This CPU startup exchange allocates a unique port per job. The
+            # watchdog never runs collectives on this (or the NCCL) group.
+            dist.broadcast_object_list(control_port, src=0, group=error_group)
+            if rank != 0:
+                control_store = dist.TCPStore(
+                    host_name=os.environ["MASTER_ADDR"], port=int(control_port[0]),
+                    world_size=world_size, is_master=False,
+                    timeout=setup_timeout, wait_for_workers=False,
+                )
+            control_store.set_timeout(io_timeout)
+            pc1_error_controller = PC1ErrorController(
+                store=control_store, rank=rank, world_size=world_size,
+                stage_timeout=stage_timeout,
+            )
 
         args.gpu = local_rank
         context = cls(
@@ -102,6 +150,7 @@ class DistributedContext:
             local_rank=local_rank,
             world_size=world_size,
             error_group=error_group,
+            pc1_error_controller=pc1_error_controller,
         )
         setattr(args, "_tide_distributed_context", context)
         return context
@@ -129,6 +178,12 @@ class DistributedContext:
 
     def close(self) -> None:
         if self.enabled and dist.is_initialized():
+            if self.pc1_error_controller is not None:
+                self.pc1_error_controller.close()
+                # Rank 0 owns the TCPStore server. All watchdogs must stop
+                # before that server is released during healthy shutdown.
+                dist.barrier(group=self.error_group)
+                self.pc1_error_controller.release_store()
             if self.error_group is not None:
                 dist.destroy_process_group(self.error_group)
             dist.destroy_process_group()

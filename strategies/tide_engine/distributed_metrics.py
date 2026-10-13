@@ -83,6 +83,10 @@ BATCH_FIELDS = [
     "c1_metadata_ms",
     "c1_payload_ms",
     "pipeline_render_ms",
+    "intermediate_grad_ms",
+    "c2_ms",
+    "final_grad_ms",
+    "grad_accumulate_ms",
     "curvature_forward_ms",
     "curvature_vjp_ms",
     "gaussian_projection_cull_ms",
@@ -106,6 +110,27 @@ BATCH_FIELDS = [
     "next_plan_finalize_wait_ms",
     "next_plan_target_iteration",
 ]
+
+
+def cuda_interval_union_ms(anchor_event, intervals) -> float:
+    """Measure covered time, not summed latency, across CUDA streams.
+
+    All events must have completed on the same device. Negative offsets are
+    valid for stages preceding the batch anchor (for example curvature).
+    """
+    spans = sorted(
+        (float(anchor_event.elapsed_time(start)), float(anchor_event.elapsed_time(end)))
+        for start, end in intervals
+    )
+    total = 0.0
+    right = float("-inf")
+    for start, end in spans:
+        if end < start:
+            raise ValueError("CUDA interval ends before it starts")
+        total += max(0.0, end - max(start, right))
+        right = max(right, end)
+    return total
+
 
 GRAD_ZERO_COMPONENTS = GRADIENT_COMPONENTS
 GRAD_ZERO_HISTOGRAM_FIELDS = [
