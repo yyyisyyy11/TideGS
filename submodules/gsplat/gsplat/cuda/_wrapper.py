@@ -579,7 +579,8 @@ def rasterize_to_pixels(
         - **Rendered alphas**. [..., image_height, image_width, 1]
     """
 
-    image_dims = means2d.shape[:-2]
+    # Packed Gaussians have no image axes; tile offsets retain those axes.
+    image_dims = isect_offsets.shape[:-2] if packed else means2d.shape[:-2]
     channels = colors.shape[-1]
     device = means2d.device
     if packed:
@@ -2265,7 +2266,8 @@ def rasterize_to_pixels_2dgs(
 
 
     """
-    image_dims = means2d.shape[:-2]
+    # Packed Gaussians have no image axes; tile offsets retain those axes.
+    image_dims = isect_offsets.shape[:-2] if packed else means2d.shape[:-2]
     channels = colors.shape[-1]
     device = means2d.device
     if packed:
