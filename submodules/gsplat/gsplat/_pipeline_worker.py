@@ -1,4 +1,4 @@
-"""Torch-free FIFO worker and absolute-deadline primitives for PC1.
+"""Torch-free FIFO worker and absolute-deadline primitives for Micro Pipeline.
 
 GPU event readiness is deliberately independent from Future completion.  The
 backend publishes an event after enqueueing work; drain polls that event with a
@@ -22,16 +22,16 @@ class PipelineTimeoutError(TimeoutError):
 
 def deadline_after(timeout_s: float) -> float:
     if not math.isfinite(float(timeout_s)) or float(timeout_s) <= 0:
-        raise ValueError("PC1 timeout must be finite and positive")
+        raise ValueError("Micro Pipeline timeout must be finite and positive")
     return time.monotonic() + float(timeout_s)
 
 
 def remaining(deadline: float, phase: str) -> float:
     if not math.isfinite(float(deadline)):
-        raise ValueError("PC1 deadline must be finite")
+        raise ValueError("Micro Pipeline deadline must be finite")
     seconds = float(deadline) - time.monotonic()
     if seconds <= 0:
-        raise PipelineTimeoutError(f"PC1 deadline exceeded during {phase}")
+        raise PipelineTimeoutError(f"Micro Pipeline deadline exceeded during {phase}")
     return seconds
 
 
@@ -39,7 +39,7 @@ def wait_future(future: Future, deadline: float):
     try:
         return future.result(timeout=remaining(deadline, "Future wait"))
     except FutureTimeout as error:
-        raise PipelineTimeoutError("PC1 deadline exceeded during Future wait") from error
+        raise PipelineTimeoutError("Micro Pipeline deadline exceeded during Future wait") from error
 
 
 def wait_event(event, deadline: float, phase: str = "GPU event") -> None:
@@ -55,7 +55,7 @@ class CommunicationIdentity:
     slot: int
     stage: str
     comm_sequence: int
-    schedule_version: str = "pc1-window-v2"
+    schedule_version: str = "micro-pipeline-window-v2"
 
 
 @dataclass(frozen=True)
@@ -76,11 +76,11 @@ class FIFOCommWorker:
 
     def __init__(self, *, execute, initialize=None, buffer_count: int = 2,
                  on_failure=None, default_timeout_s: float = 120.0,
-                 name: str = "pc1-comm"):
+                 name: str = "micro-pipeline-comm"):
         if int(buffer_count) <= 0:
-            raise ValueError("PC1 buffer_count must be positive")
+            raise ValueError("Micro Pipeline buffer_count must be positive")
         if not math.isfinite(float(default_timeout_s)) or float(default_timeout_s) <= 0:
-            raise ValueError("PC1 default_timeout_s must be finite and positive")
+            raise ValueError("Micro Pipeline default_timeout_s must be finite and positive")
         self.buffer_count = int(buffer_count)
         self.default_timeout_s = float(default_timeout_s)
         self._execute = execute
@@ -109,7 +109,7 @@ class FIFOCommWorker:
     def resolve_deadline(self, deadline):
         value = deadline_after(self.default_timeout_s) if deadline is None else float(deadline)
         if not math.isfinite(value):
-            raise ValueError("PC1 deadline must be finite")
+            raise ValueError("Micro Pipeline deadline must be finite")
         return value
 
     def next_sequence(self) -> int:
@@ -120,9 +120,9 @@ class FIFOCommWorker:
 
     def _ensure_healthy(self):
         if self._aborted is not None:
-            raise RuntimeError("PC1 communication worker aborted") from self._aborted
+            raise RuntimeError("Micro Pipeline communication worker aborted") from self._aborted
         if self._closed or self._closing:
-            raise RuntimeError("PC1 communication worker is closed")
+            raise RuntimeError("Micro Pipeline communication worker is closed")
 
     def _enqueue(self, stage, request):
         deadline = self.resolve_deadline(getattr(request, "deadline", None))
@@ -135,7 +135,7 @@ class FIFOCommWorker:
             self._published = [result for result in self._published
                                if not result.done_event.query()]
             if request.identity.stage != stage:
-                raise ValueError("PC1 request stage does not match enqueue operation")
+                raise ValueError("Micro Pipeline request stage does not match enqueue operation")
             self._pending[future] = submission
         try:
             while True:
@@ -256,7 +256,7 @@ class FIFOCommWorker:
             self._stop.set()
         self.thread.join(timeout=remaining(deadline, "worker shutdown"))
         if self.thread.is_alive():
-            error = PipelineTimeoutError("PC1 deadline exceeded during worker shutdown")
+            error = PipelineTimeoutError("Micro Pipeline deadline exceeded during worker shutdown")
             self.abort(error)
             raise error
         with self._lock:
@@ -264,7 +264,7 @@ class FIFOCommWorker:
 
     def abort(self, error):
         if error is None:
-            error = RuntimeError("PC1 communication worker aborted")
+            error = RuntimeError("Micro Pipeline communication worker aborted")
         with self._lock:
             if self._aborted is not None:
                 return

@@ -4,12 +4,12 @@
 #include "Cameras.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    // Audited PC1 entry points operate only on C++/ATen/CUDA values. Argument
+    // Audited Micro Pipeline entry points operate only on C++/ATen/CUDA values. Argument
     // conversion and result wrapping still run under pybind11's GIL; the guard
     // covers native GPU waits (including packed projection's count.item()).
-    m.attr("PC1_NATIVE_ABI_VERSION") = 1;
-    m.attr("PC1_NATIVE_BINDING") = "gsplat/cuda/ext.cpp";
-    m.attr("PC1_GIL_RELEASED_OPS") = py::make_tuple(
+    m.attr("MICRO_PIPELINE_NATIVE_ABI_VERSION") = 1;
+    m.attr("MICRO_PIPELINE_NATIVE_BINDING") = "gsplat/cuda/ext.cpp";
+    m.attr("MICRO_PIPELINE_GIL_RELEASED_OPS") = py::make_tuple(
         "projection_ewa_3dgs_packed_fwd", "projection_ewa_3dgs_packed_bwd",
         "spherical_harmonics_fwd", "spherical_harmonics_bwd",
         "intersect_tile", "intersect_offset",

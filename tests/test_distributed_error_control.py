@@ -14,7 +14,7 @@ import unittest
 import weakref
 
 from utils.distributed_error_control import (
-    PC1ErrorController, PC1FatalError, PC1_FATAL_EXIT_CODE,
+    MicroPipelineErrorController, MicroPipelineFatalError, MICRO_PIPELINE_FATAL_EXIT_CODE,
 )
 
 
@@ -69,9 +69,9 @@ def blocked_worker(rank, values, ready, reasons, local_failure):
 
     def exit_callback(reason):
         reports.set(f"rank-{rank}", reason)
-        os._exit(PC1_FATAL_EXIT_CODE)
+        os._exit(MICRO_PIPELINE_FATAL_EXIT_CODE)
 
-    controller = PC1ErrorController(
+    controller = MicroPipelineErrorController(
         store=store, rank=rank, world_size=2 if local_failure else 1,
         stage_timeout=2.0 if local_failure else 0.3,
         poll_interval=0.01, exit_callback=exit_callback,
@@ -88,7 +88,7 @@ def blocked_worker(rank, values, ready, reasons, local_failure):
 class DistributedErrorControlTest(unittest.TestCase):
     def controller(self, **kwargs):
         self.reasons = []
-        controller = PC1ErrorController(
+        controller = MicroPipelineErrorController(
             store=MemoryStore(), rank=0, world_size=1,
             poll_interval=0.005, exit_callback=self.reasons.append, **kwargs,
         )
@@ -122,16 +122,16 @@ class DistributedErrorControlTest(unittest.TestCase):
     def test_stage_exception_is_fatal_and_keeps_original_cause(self):
         controller = self.controller()
         original = ValueError("projection failed")
-        with self.assertRaises(PC1FatalError) as caught:
+        with self.assertRaises(MicroPipelineFatalError) as caught:
             with controller.operation("projection"):
                 raise original
         self.assertIs(caught.exception.__cause__, original)
         self.assertEqual(len(self.reasons), 1)
         self.assertIn("ValueError: projection failed", self.reasons[0])
         self.assertTrue(controller.failed)
-        with self.assertRaises(PC1FatalError):
+        with self.assertRaises(MicroPipelineFatalError):
             controller.close()
-        with self.assertRaises(PC1FatalError):
+        with self.assertRaises(MicroPipelineFatalError):
             with controller.operation("next batch"):
                 self.fail("failed controller reused")
         self.assertEqual(len(self.reasons), 1)
@@ -140,7 +140,7 @@ class DistributedErrorControlTest(unittest.TestCase):
         controller = self.controller(stage_timeout=0.15)
         callback_done = threading.Event()
         controller._exit_callback = lambda reason: (self.reasons.append(reason), callback_done.set())
-        with self.assertRaises(PC1FatalError):
+        with self.assertRaises(MicroPipelineFatalError):
             with controller.operation("outer collective"):
                 threading.Event().wait(0.08)
                 with controller.operation("inner payload"):
@@ -152,7 +152,7 @@ class DistributedErrorControlTest(unittest.TestCase):
         controller = self.controller()
         callback_done = threading.Event()
         controller._exit_callback = lambda reason: (self.reasons.append(reason), callback_done.set())
-        controller.store.set("pc1-fatal-rank-0", b"peer pre-submit failure")
+        controller.store.set("micro-pipeline-fatal-rank-0", b"peer pre-submit failure")
         self.assertTrue(callback_done.wait(2))
         self.assertIn("peer pre-submit failure", self.reasons[0])
 
@@ -163,7 +163,7 @@ class DistributedErrorControlTest(unittest.TestCase):
 
         callback_done = threading.Event()
         reasons = []
-        controller = PC1ErrorController(
+        controller = MicroPipelineErrorController(
             store=BrokenStore(), rank=0, world_size=1,
             exit_callback=lambda reason: (reasons.append(reason), callback_done.set()),
         )
@@ -178,7 +178,7 @@ class DistributedErrorControlTest(unittest.TestCase):
             raise OSError("publish failed")
 
         controller.store.set = broken_set
-        with self.assertRaises(PC1FatalError):
+        with self.assertRaises(MicroPipelineFatalError):
             controller.fail("submit", RuntimeError("local failure"))
         self.assertEqual(len(self.reasons), 1)
         self.assertIn("local failure", self.reasons[0])
@@ -193,7 +193,7 @@ class DistributedErrorControlTest(unittest.TestCase):
     def test_invalid_timeouts_are_rejected(self):
         for timeout in (0, -1, float("nan"), float("inf")):
             with self.subTest(timeout=timeout), self.assertRaises(ValueError):
-                PC1ErrorController(store=MemoryStore(), rank=0, world_size=1, stage_timeout=timeout)
+                MicroPipelineErrorController(store=MemoryStore(), rank=0, world_size=1, stage_timeout=timeout)
 
     @unittest.skipUnless(os.name == "posix", "requires POSIX stderr pipe flags")
     def test_default_fatal_exit_does_not_block_on_full_stderr_pipe(self):
@@ -214,7 +214,7 @@ _exit_worker('fatal with a full blocking stderr pipe')
             cwd=Path(__file__).resolve().parents[1],
         )
         try:
-            self.assertEqual(worker.wait(timeout=2), PC1_FATAL_EXIT_CODE)
+            self.assertEqual(worker.wait(timeout=2), MICRO_PIPELINE_FATAL_EXIT_CODE)
         finally:
             if worker.poll() is None:
                 worker.kill()
@@ -222,14 +222,14 @@ _exit_worker('fatal with a full blocking stderr pipe')
 
     def test_default_fatal_exit_keeps_cpu_diagnostics_when_logging_is_available(self):
         program = """from utils.distributed_error_control import _exit_worker
-_exit_worker('PC1 fatal rank=0 phase=projection: injected CPU error')
+_exit_worker('Micro Pipeline fatal rank=0 phase=projection: injected CPU error')
 """
         result = subprocess.run(
             [sys.executable, "-c", program], capture_output=True, text=True,
             cwd=Path(__file__).resolve().parents[1], timeout=2,
         )
-        self.assertEqual(result.returncode, PC1_FATAL_EXIT_CODE)
-        self.assertIn("PC1 fatal rank=0 phase=projection: injected CPU error", result.stderr)
+        self.assertEqual(result.returncode, MICRO_PIPELINE_FATAL_EXIT_CODE)
+        self.assertIn("Micro Pipeline fatal rank=0 phase=projection: injected CPU error", result.stderr)
 
     def run_workers(self, local_failure):
         context = mp.get_context("spawn")
@@ -248,7 +248,7 @@ _exit_worker('PC1 fatal rank=0 phase=projection: injected CPU error')
             for worker in workers:
                 worker.join(timeout=4)
             self.assertTrue(all(not worker.is_alive() for worker in workers))
-            self.assertEqual([worker.exitcode for worker in workers], [PC1_FATAL_EXIT_CODE] * count)
+            self.assertEqual([worker.exitcode for worker in workers], [MICRO_PIPELINE_FATAL_EXIT_CODE] * count)
             reports = SharedArrayStore(reasons)
             return [(rank, reports.get(f"rank-{rank}").decode("utf-8")) for rank in range(count)]
         finally:

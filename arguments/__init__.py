@@ -18,6 +18,7 @@ import math
 import sys
 import os
 import utils.general_utils as utils
+from utils.pipeline_mode import normalize_pipeline_mode
 
 
 class GroupParams:
@@ -44,7 +45,13 @@ class ParamGroup:
                         "--" + key, ("-" + key[0:1]), default=value, type=t
                     )
             else:
-                if t == bool:
+                if key == "tide_forward_pipeline":
+                    group.add_argument(
+                        "--" + key, default=value, type=normalize_pipeline_mode,
+                        choices=("off", "micro"),
+                        help="TideGS Micro Pipeline mode (legacy pc1 is accepted as micro)",
+                    )
+                elif t == bool:
                     group.add_argument("--" + key, default=value, action="store_true")
                 elif t == list:
                     type_to_use = int
@@ -243,10 +250,10 @@ class AuxiliaryParams(ParamGroup):
         self.tide_force_active_sh_degree = -1  # Diagnostic override in [-1, sh_degree]; -1 keeps the normal schedule
         self.tide_block_cull_backend = "cpu"  # {cpu, gpu}; frustum block cull backend
         self.tide_block_cull_camera_chunk = 8  # GPU cull cameras per chunk
-        # Experimental forward pipeline.  ``off`` preserves the synchronous
-        # distributed rasterizer; ``pc1`` overlaps the next projection with
-        # the current microbatch's first packed-Gaussian exchange.
-        self.tide_forward_pipeline = "off"  # {off, pc1}
+        # TideGS Micro Pipeline uses fixed windows: all P/C1 submissions,
+        # then all M/C2 submissions, then ordered Gaussian backward G.
+        # ``off`` keeps the synchronous distributed rasterizer.
+        self.tide_forward_pipeline = "off"  # {off, micro}
         self.tide_pipeline_buffer_count = 2
         self.tide_nccl_stream_priority = -1
         # Public TideGS aliases. These map onto the internal paper_* names for
@@ -272,6 +279,8 @@ class AuxiliaryParams(ParamGroup):
 
     def extract(self, args):
         g = super().extract(args)
+        if getattr(g, "tide_forward_pipeline", None) is not None:
+            g.tide_forward_pipeline = normalize_pipeline_mode(g.tide_forward_pipeline)
         return g
 
 
@@ -506,6 +515,7 @@ def _apply_tide_aliases(args):
 
 
 def init_args(args):
+    args.tide_forward_pipeline = normalize_pipeline_mode(getattr(args, "tide_forward_pipeline", "off"))
     _apply_tide_aliases(args)
     _apply_pure_ssd_release_defaults(args)
 

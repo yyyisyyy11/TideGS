@@ -13,14 +13,16 @@ from typing import Any, List
 import torch
 import torch.distributed as dist
 from utils.tide_trace import tide_range
-from utils.distributed_error_control import PC1ErrorController
+from utils.distributed_error_control import MicroPipelineErrorController
+from utils.pipeline_mode import normalize_pipeline_mode
 
 
 _DISTRIBUTED_MODES = {"off", "gaussian_sharded"}
 
 
 def _positive_timeout(name: str, default: str) -> float:
-    value = float(os.environ.get(name, default))
+    legacy_name = name.replace("TIDE_MICRO_PIPELINE_", "TIDE_PC1_", 1)
+    value = float(os.environ.get(name, os.environ.get(legacy_name, default)))
     if not math.isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be positive and finite")
     return value
@@ -41,9 +43,9 @@ class DistributedContext:
     local_rank: int = 0
     world_size: int = 1
     error_group: Any = field(default=None, repr=False, compare=False)
-    pc1_error_controller: Any = field(default=None, repr=False, compare=False)
+    micro_pipeline_error_controller: Any = field(default=None, repr=False, compare=False)
     pipeline_comm_worker: Any = field(default=None, repr=False, compare=False)
-    pc1_native_runtime: Any = field(default=None, repr=False, compare=False)
+    micro_pipeline_native_runtime: Any = field(default=None, repr=False, compare=False)
 
     @property
     def enabled(self) -> bool:
@@ -55,6 +57,8 @@ class DistributedContext:
 
     @classmethod
     def initialize(cls, args: Any) -> "DistributedContext":
+        pipeline_mode = normalize_pipeline_mode(getattr(args, "tide_forward_pipeline", "off"))
+        args.tide_forward_pipeline = pipeline_mode
         mode = distributed_mode(args)
         if mode not in _DISTRIBUTED_MODES:
             raise ValueError(
@@ -104,13 +108,13 @@ class DistributedContext:
                 "torch.distributed process-group metadata does not match torchrun"
             )
 
-        pc1 = str(getattr(args, "tide_forward_pipeline", "off")).lower() == "pc1"
+        micro = pipeline_mode == "micro"
         # Gloo error checkpoints alone cannot interrupt a main thread blocked
-        # in CUDA/NCCL. PC1 additionally needs independent fatal supervision.
-        if pc1:
-            setup_timeout = timedelta(seconds=_positive_timeout("TIDE_PC1_ERROR_TIMEOUT_SEC", "30"))
-            io_timeout = timedelta(seconds=_positive_timeout("TIDE_PC1_CONTROL_IO_TIMEOUT_SEC", "1"))
-            stage_timeout = _positive_timeout("TIDE_PC1_STAGE_TIMEOUT_SEC", "60")
+        # in CUDA/NCCL. Micro Pipeline additionally needs independent fatal supervision.
+        if micro:
+            setup_timeout = timedelta(seconds=_positive_timeout("TIDE_MICRO_PIPELINE_ERROR_TIMEOUT_SEC", "30"))
+            io_timeout = timedelta(seconds=_positive_timeout("TIDE_MICRO_PIPELINE_CONTROL_IO_TIMEOUT_SEC", "1"))
+            stage_timeout = _positive_timeout("TIDE_MICRO_PIPELINE_STAGE_TIMEOUT_SEC", "60")
             # A healthy peer can still be completing a protected host stage
             # when another rank reaches its CPU checkpoint. Gloo must not
             # time out earlier than the controller's permitted stage skew.
@@ -122,8 +126,8 @@ class DistributedContext:
             )
         else:
             error_group = dist.new_group(backend="gloo")
-        pc1_error_controller = None
-        if pc1:
+        micro_pipeline_error_controller = None
+        if micro:
             control_store = None
             control_port = [None]
             if rank == 0:
@@ -142,7 +146,7 @@ class DistributedContext:
                     timeout=setup_timeout, wait_for_workers=False,
                 )
             control_store.set_timeout(io_timeout)
-            pc1_error_controller = PC1ErrorController(
+            micro_pipeline_error_controller = MicroPipelineErrorController(
                 store=control_store, rank=rank, world_size=world_size,
                 stage_timeout=stage_timeout,
             )
@@ -154,7 +158,7 @@ class DistributedContext:
             local_rank=local_rank,
             world_size=world_size,
             error_group=error_group,
-            pc1_error_controller=pc1_error_controller,
+            micro_pipeline_error_controller=micro_pipeline_error_controller,
         )
         setattr(args, "_tide_distributed_context", context)
         return context
@@ -189,58 +193,58 @@ class DistributedContext:
         The frozen context owns the runtime for its entire rank lifetime; batch
         pipelines borrow it and must not shut it down between batches.
         """
-        if not self.enabled or self.pc1_error_controller is None:
-            raise RuntimeError("PC1 communication requires an initialized error controller")
+        if not self.enabled or self.micro_pipeline_error_controller is None:
+            raise RuntimeError("Micro Pipeline communication requires an initialized error controller")
         buffer_count = int(buffer_count)
         if buffer_count < 2:
-            raise ValueError("PC1 buffer_count must be at least 2")
+            raise ValueError("Micro Pipeline buffer_count must be at least 2")
         worker = self.pipeline_comm_worker
         if worker is not None:
             if worker.buffer_count != buffer_count:
-                raise RuntimeError("PC1 buffer_count cannot change during a rank lifetime")
+                raise RuntimeError("Micro Pipeline buffer_count cannot change during a rank lifetime")
             return worker
 
-        from utils.pc1_native_capabilities import check_pc1_native_capabilities
+        from utils.micro_pipeline_native_capabilities import check_micro_pipeline_native_capabilities
         from gsplat.distributed_pipeline import PipelineCommWorker
 
         # Loading/JIT compilation here is intentional: the communication thread
         # must never be the first caller of a CUDA extension.
-        with self.pc1_error_controller.operation("PC1 native initialization and worker startup"):
-            runtime = check_pc1_native_capabilities(require_tile_mask=require_tile_mask)
+        with self.micro_pipeline_error_controller.operation("Micro Pipeline native initialization and worker startup"):
+            runtime = check_micro_pipeline_native_capabilities(require_tile_mask=require_tile_mask)
             print(
-                f"[PC1 native rank={self.rank}] " + json.dumps(runtime, sort_keys=True),
+                f"[Micro Pipeline native rank={self.rank}] " + json.dumps(runtime, sort_keys=True),
                 flush=True,
             )
             worker = PipelineCommWorker(
                 device=torch.device("cuda", self.local_rank),
                 comm_stream=comm_stream,
                 buffer_count=buffer_count,
-                default_timeout_s=self.pc1_error_controller.stage_timeout,
-                on_failure=lambda error: self.pc1_error_controller.fail(
-                    "PC1 communication worker", error,
+                default_timeout_s=self.micro_pipeline_error_controller.stage_timeout,
+                on_failure=lambda error: self.micro_pipeline_error_controller.fail(
+                    "Micro Pipeline communication worker", error,
                 ),
             )
-        object.__setattr__(self, "pc1_native_runtime", runtime)
+        object.__setattr__(self, "micro_pipeline_native_runtime", runtime)
         object.__setattr__(self, "pipeline_comm_worker", worker)
         return worker
 
     def close(self) -> None:
         worker = self.pipeline_comm_worker
         if worker is not None:
-            controller = self.pc1_error_controller
+            controller = self.micro_pipeline_error_controller
             deadline = time.monotonic() + controller.stage_timeout
             # Keep fatal supervision alive while queue, GPU events and worker
             # shutdown are still capable of blocking.
-            with controller.operation("PC1 communication worker shutdown"):
+            with controller.operation("Micro Pipeline communication worker shutdown"):
                 worker.drain(deadline)
                 worker.close(deadline)
         if self.enabled and dist.is_initialized():
-            if self.pc1_error_controller is not None:
-                self.pc1_error_controller.close()
+            if self.micro_pipeline_error_controller is not None:
+                self.micro_pipeline_error_controller.close()
                 # Rank 0 owns the TCPStore server. All watchdogs must stop
                 # before that server is released during healthy shutdown.
                 dist.barrier(group=self.error_group)
-                self.pc1_error_controller.release_store()
+                self.micro_pipeline_error_controller.release_store()
             if self.error_group is not None:
                 dist.destroy_process_group(self.error_group)
             dist.destroy_process_group()

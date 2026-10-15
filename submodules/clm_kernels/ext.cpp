@@ -8,10 +8,10 @@
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // These audited entry points use only C++/ATen/CUDA, with per-call device
   // guards and the caller's current PyTorch stream; none calls back to Python.
-  m.attr("PC1_NATIVE_ABI_VERSION") = 1;
-  m.attr("PC1_NATIVE_BINDING") = "clm_kernels/ext.cpp";
-  m.attr("PC1_SSIM_CURRENT_STREAM") = true;
-  m.attr("PC1_GIL_RELEASED_OPS") = py::make_tuple(
+  m.attr("MICRO_PIPELINE_NATIVE_ABI_VERSION") = 1;
+  m.attr("MICRO_PIPELINE_NATIVE_BINDING") = "clm_kernels/ext.cpp";
+  m.attr("MICRO_PIPELINE_SSIM_CURRENT_STREAM") = true;
+  m.attr("MICRO_PIPELINE_GIL_RELEASED_OPS") = py::make_tuple(
       "fusedssim", "fusedssim_backward", "tile_contribution_mask");
   m.def("set_signal", &SetSignal);
   m.def("compute_cnt_h", &ComputeCntH);

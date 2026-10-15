@@ -126,7 +126,7 @@ def load_trace():
         cuda=cuda,
     )
     spec = importlib.util.spec_from_file_location(
-        "pc1_trace_under_test", GSPLAT / "distributed_trace.py"
+        "micro_pipeline_trace_under_test", GSPLAT / "distributed_trace.py"
     )
     module = importlib.util.module_from_spec(spec)
     with patch.dict("sys.modules", {"torch": fake_torch}):

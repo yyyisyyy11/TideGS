@@ -254,7 +254,7 @@ def distributed_rasterization_pipeline(
 
 
 def prepare_distributed_camera_layout(*, means, viewmats, Ks, microbatch):
-    """Gather one batch of camera metadata for the PC1 pipeline."""
+    """Gather one batch of camera metadata for the Micro Pipeline."""
 
     require_distributed_gsplat()
     from gsplat.distributed_pipeline import prepare_batch_camera_layout

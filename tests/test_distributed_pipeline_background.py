@@ -1,4 +1,4 @@
-"""Exercise the real PC1 engine/background adapter without CUDA/PyTorch."""
+"""Exercise the real Micro Pipeline engine/background adapter without CUDA/PyTorch."""
 
 import ast
 from pathlib import Path
@@ -51,15 +51,15 @@ class RenderProbe:
 
 
 def load_functions(namespace, *, engine_source=None):
-    """Compile complete production functions, including the nested PC1 submit."""
+    """Compile complete production functions, including the nested Micro Pipeline submit."""
     engine = ast.parse(
         ENGINE_PATH.read_text(encoding="utf-8")
         if engine_source is None else engine_source
     )
     backend = ast.parse(BACKEND_PATH.read_text(encoding="utf-8"))
-    pc1_submit = next(
+    micro_pipeline_submit = next(
         node for node in ast.walk(engine)
-        if isinstance(node, ast.FunctionDef) and node.name == "_pc1_submit"
+        if isinstance(node, ast.FunctionDef) and node.name == "_micro_pipeline_submit"
     )
     backend_functions = [
         node for node in backend.body
@@ -67,7 +67,7 @@ def load_functions(namespace, *, engine_source=None):
         and node.name in {"_stack_cameras", "distributed_rasterize"}
     ]
     for filename, functions in (
-        (ENGINE_PATH, [pc1_submit]),
+        (ENGINE_PATH, [micro_pipeline_submit]),
         (BACKEND_PATH, backend_functions),
     ):
         module = ast.Module(body=[
@@ -80,7 +80,7 @@ def load_functions(namespace, *, engine_source=None):
         ], type_ignores=[])
         ast.fix_missing_locations(module)
         exec(compile(module, str(filename), "exec"), namespace)
-    return namespace["_pc1_submit"], namespace["distributed_rasterize"]
+    return namespace["_micro_pipeline_submit"], namespace["distributed_rasterize"]
 
 
 def make_case(camera_count, background, *, missing_layout=False):
@@ -91,7 +91,7 @@ def make_case(camera_count, background, *, missing_layout=False):
         )
         for index in range(camera_count)
     ]
-    pc1_probe, off_probe = RenderProbe(), RenderProbe()
+    micro_pipeline_probe, off_probe = RenderProbe(), RenderProbe()
     render_inputs = tuple(object() for _ in range(4))
     leaves = {"xyz": object()}
     gaussians = SimpleNamespace(active_sh_degree=2)
@@ -102,12 +102,12 @@ def make_case(camera_count, background, *, missing_layout=False):
         "leaves": leaves,
         "_transformed_leaves": lambda gaussian_model, tensors: render_inputs,
         "debug_projection_input": lambda **kwargs: None,
-        "pc1_layout": None if missing_layout else SimpleNamespace(
+        "micro_pipeline_layout": None if missing_layout else SimpleNamespace(
             microbatch_cameras=lambda index: ("global-viewmats", "global-Ks"),
             N_world=[32, 32],
             microbatch_C_world=[camera_count, camera_count],
         ),
-        "pc1_pipeline": SimpleNamespace(submit_projection=pc1_probe),
+        "micro_pipeline": SimpleNamespace(submit_projection=micro_pipeline_probe),
         "image_width": 12,
         "image_height": 8,
         "args": SimpleNamespace(radius_clip=0.25),
@@ -115,7 +115,7 @@ def make_case(camera_count, background, *, missing_layout=False):
             rasterization=off_probe
         ),
     }
-    return namespace, cameras, pc1_probe, off_probe, render_inputs
+    return namespace, cameras, micro_pipeline_probe, off_probe, render_inputs
 
 
 class DistributedPipelineBackgroundTest(unittest.TestCase):
@@ -123,14 +123,14 @@ class DistributedPipelineBackgroundTest(unittest.TestCase):
         for camera_count in (1, 4):
             with self.subTest(camera_count=camera_count, values=values):
                 background = None if values is None else FakeTensor(values)
-                namespace, cameras, pc1, off, render_inputs = make_case(
+                namespace, cameras, micro, off, render_inputs = make_case(
                     camera_count, background
                 )
                 submit, rasterize = load_functions(namespace)
                 deadline = time.monotonic() + 60.0
                 handle = submit(1, cameras, deadline=deadline)
-                self.assertIs(handle, pc1.result)
-                self.assertEqual(pc1.calls[0]["deadline"], deadline)
+                self.assertIs(handle, micro.result)
+                self.assertEqual(micro.calls[0]["deadline"], deadline)
                 rasterize(
                     means=namespace["leaves"]["xyz"],
                     scales=render_inputs[0],
@@ -144,32 +144,32 @@ class DistributedPipelineBackgroundTest(unittest.TestCase):
                     background=background,
                     radius_clip=0.25,
                 )
-                self.assertEqual(len(pc1.calls), 1)
+                self.assertEqual(len(micro.calls), 1)
                 self.assertEqual(len(off.calls), 1)
-                pc1_values, off_values = pc1.calls[0], off.calls[0]
+                micro_pipeline_values, off_values = micro.calls[0], off.calls[0]
                 if values is None:
-                    self.assertIsNone(pc1_values["backgrounds"])
+                    self.assertIsNone(micro_pipeline_values["backgrounds"])
                     self.assertIsNone(off_values["backgrounds"])
                 else:
                     expected = np.repeat([values], camera_count, axis=0)
-                    self.assertEqual(pc1_values["backgrounds"].shape, (camera_count, 3))
+                    self.assertEqual(micro_pipeline_values["backgrounds"].shape, (camera_count, 3))
                     np.testing.assert_array_equal(
-                        pc1_values["backgrounds"].values,
+                        micro_pipeline_values["backgrounds"].values,
                         off_values["backgrounds"].values,
                     )
                     np.testing.assert_allclose(
-                        pc1_values["backgrounds"].values, expected
+                        micro_pipeline_values["backgrounds"].values, expected
                     )
                     np.testing.assert_array_equal(background.values, values)
                 for name in ("viewmats", "Ks"):
                     np.testing.assert_array_equal(
-                        pc1_values[name].values, off_values[name].values
+                        micro_pipeline_values[name].values, off_values[name].values
                     )
                 for name in (
                     "means", "quats", "scales", "opacities", "colors",
                     "width", "height", "sh_degree", "radius_clip",
                 ):
-                    self.assertEqual(pc1_values[name], off_values[name])
+                    self.assertEqual(micro_pipeline_values[name], off_values[name])
 
     def test_default_black_background_preserves_none(self):
         self.assert_background_matches_off(None)
@@ -181,13 +181,13 @@ class DistributedPipelineBackgroundTest(unittest.TestCase):
         self.assert_background_matches_off([0.125, 0.25, 0.75])
 
     def test_missing_layout_fails_before_renderer(self):
-        namespace, cameras, pc1, off, _ = make_case(
+        namespace, cameras, micro, off, _ = make_case(
             4, None, missing_layout=True
         )
         submit, _ = load_functions(namespace)
         with self.assertRaisesRegex(RuntimeError, "camera layout is not initialized"):
             submit(0, cameras, deadline=time.monotonic() + 60.0)
-        self.assertEqual(pc1.calls, [])
+        self.assertEqual(micro.calls, [])
         self.assertEqual(off.calls, [])
 
 

@@ -1,0 +1,43 @@
+{
+  "purpose": "Reviewable portable Micro Pipeline analysis snapshot; historical experiments untouched",
+  "source_directory": "/Users/mac/Projects/proj_tidegs_isc/experiment/timeline/scripts",
+  "files": [
+    {
+      "file": "analyze_micro_pipeline_overlap.py",
+      "source": "/Users/mac/Projects/proj_tidegs_isc/experiment/timeline/scripts/analyze_micro_pipeline_overlap.py",
+      "sha256": "d5f0227f1841875a23c07dfd8ce13ad1f000af0eab4beecb67faeeeae5898cd2"
+    },
+    {
+      "file": "analyze_micro_pipeline_submission_order.py",
+      "source": "/Users/mac/Projects/proj_tidegs_isc/experiment/timeline/scripts/analyze_micro_pipeline_submission_order.py",
+      "sha256": "298d7048f9848d683a3df2efc592a05496c62da5291ac8934bc40f49f4de8cb4"
+    },
+    {
+      "file": "extract_timeline_cuda.py",
+      "source": "/Users/mac/Projects/proj_tidegs_isc/experiment/timeline/scripts/extract_timeline_cuda.py",
+      "sha256": "89e7266d41800131603bd6f9f7748cef91593d8c5bb0a087a9c15dc6f8ae5462"
+    },
+    {
+      "file": "extract_superpod_comparison.py",
+      "source": "/Users/mac/Projects/proj_tidegs_isc/experiment/timeline/scripts/extract_superpod_comparison.py",
+      "sha256": "79b0b39106df33fa0d1867e9485229d7fe2b6255f7defe90a764bd2d098341c2"
+    },
+    {
+      "file": "timeline_svg.py",
+      "source": "/Users/mac/Projects/proj_tidegs_isc/experiment/timeline/scripts/timeline_svg.py",
+      "sha256": "315b236a238722de1ada78e7b547564f6fe892b6c03ef9a4fa0a8781f70c980e"
+    }
+  ],
+  "compatibility_entrypoints": [
+    {
+      "file": "analyze_pc1_overlap.py",
+      "source": "/Users/mac/Projects/proj_tidegs_isc/experiment/timeline/scripts/analyze_pc1_overlap.py",
+      "sha256": "225b51e8868dd9d95962bc8d0c0fcdae8d624ea6bcc6b54de6c1dcfb93c64256"
+    },
+    {
+      "file": "analyze_pc1_submission_order.py",
+      "source": "/Users/mac/Projects/proj_tidegs_isc/experiment/timeline/scripts/analyze_pc1_submission_order.py",
+      "sha256": "c9a92f02176859aabf071ae0cc3deb0a36932e32702716246cccb9e73a3d0f78"
+    }
+  ]
+}

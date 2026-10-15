@@ -1,4 +1,4 @@
-"""Exercise real PC1 camera slicing and validation without CUDA/PyTorch."""
+"""Exercise real Micro Pipeline camera slicing and validation without CUDA/PyTorch."""
 
 import ast
 from dataclasses import dataclass

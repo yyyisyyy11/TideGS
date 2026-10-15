@@ -22,14 +22,14 @@ class DistributedPipelineContractTest(unittest.TestCase):
             name = function.id if isinstance(function, ast.Name) else getattr(function, 'attr', '')
             self.assertNotIn(name, forbidden)
 
-    def test_pc1_has_no_implicit_differentiable_communication(self):
+    def test_micro_pipeline_has_no_implicit_differentiable_communication(self):
         for node in ast.walk(self.tree):
             if isinstance(node, ast.ImportFrom):
                 self.assertNotEqual(node.module, 'torch.distributed.nn.functional')
                 self.assertNotIn('all_to_all_tensor_list', [alias.name for alias in node.names])
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
                 self.assertFalse(node.func.attr == 'synchronize',
-                                 'PC1 must use bounded event queries, never global/device synchronization')
+                                 'Micro Pipeline must use bounded event queries, never global/device synchronization')
 
 
 if __name__ == '__main__':

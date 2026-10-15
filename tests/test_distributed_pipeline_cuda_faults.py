@@ -1,4 +1,4 @@
-"""External parent for disposable two-rank CUDA/NCCL PC1 failure tests.
+"""External parent for disposable two-rank CUDA/NCCL Micro Pipeline failure tests.
 
     TIDE_RUN_CUDA_ABORT_TEST=1 python -m unittest \
         tests.test_distributed_pipeline_cuda_faults -v
@@ -21,7 +21,7 @@ import tempfile
 import time
 import unittest
 
-from tests.pc1_fault_evidence import SCENARIOS, validate_fault_evidence
+from tests.micro_pipeline_fault_evidence import SCENARIOS, validate_fault_evidence
 
 try:
     import torch
@@ -76,9 +76,9 @@ class DistributedPipelineCudaFaultTest(unittest.TestCase):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
             reservation.bind(("127.0.0.1", 0))
             port = reservation.getsockname()[1]
-        with tempfile.TemporaryDirectory(prefix=f"tide-pc1-{scenario}-") as result_dir:
+        with tempfile.TemporaryDirectory(prefix=f"tide-micro-pipeline-{scenario}-") as result_dir:
             result_path = Path(result_dir)
-            command = [sys.executable, "-m", "tests.pc1_cuda_fault_worker",
+            command = [sys.executable, "-m", "tests.micro_pipeline_cuda_fault_worker",
                        "--scenario", scenario, "--result-dir", result_dir,
                        "--stage-timeout", str(stage_timeout)]
             processes = []
@@ -145,9 +145,9 @@ class FaultEvidenceCpuTest(unittest.TestCase):
             "native_backward_entered": False,
         })
         for rank in range(2):
-            reason = ("PC1 fatal control channel failed: ConnectionError"
+            reason = ("Micro Pipeline fatal control channel failed: ConnectionError"
                       if scenario == "control_channel" else
-                      f"PC1 fatal RuntimeError: injected rank-0 {scenario} failure")
+                      f"Micro Pipeline fatal RuntimeError: injected rank-0 {scenario} failure")
             self._write(root, f"rank-{rank}-fatal.json", {
                 "rank": rank, "exit_code": 86, "time": 10.1, "reason": reason,
             })
@@ -183,7 +183,7 @@ class FaultEvidenceCpuTest(unittest.TestCase):
             root = Path(directory)
             self._fixture(root, "final_gradient")
             self._write(root, "rank-1-fatal.json", {
-                "rank": 1, "exit_code": 86, "time": 17.0, "reason": "PC1 fatal peer failure",
+                "rank": 1, "exit_code": 86, "time": 17.0, "reason": "Micro Pipeline fatal peer failure",
             })
             with self.assertRaisesRegex(AssertionError, "exceeds its deadline"):
                 validate_fault_evidence(root, "final_gradient", {0: 86, 1: 86}, 4.0)

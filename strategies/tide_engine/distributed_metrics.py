@@ -11,6 +11,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Dict, Iterable, List
+from utils.pipeline_mode import normalize_pipeline_mode
 
 from .gradient_schema import (
     GRADIENT_COMPONENTS,
@@ -887,8 +888,8 @@ class LegacyCudaMetricsCollector:
                     )
             row[field] = total_ms
 
-        if row.get("pipeline_mode") == "pc1":
-            # PC1's forward/backward values are request latencies and overlap.
+        if normalize_pipeline_mode(row.get("pipeline_mode", "off")) == "micro":
+            # Micro Pipeline's forward/backward values are request latencies and overlap.
             # Preserve the engine's resolved union when a row passes through
             # this deferred writer. Otherwise resolve the same union directly.
             if "train_ms" not in row:

@@ -1,4 +1,4 @@
-"""Opt-in CUDA intervals for the actual PC1 backward autograd nodes.
+"""Opt-in CUDA intervals for the actual Micro Pipeline backward autograd nodes.
 
 Events bracket node execution on the stream selected by the autograd engine.
 For NCCL this is the caller-stream readiness interval, including the collective's
@@ -20,7 +20,7 @@ import torch
 class MicrobatchTrace:
     """Observe one microbatch without replacing Functions or gradient tensors.
 
-    PC1 calls ``watch_backward(loss)`` for the independent image graph, releases
+    Micro Pipeline calls ``watch_backward(loss)`` for the independent image graph, releases
     those hooks, then observes the original Gaussian graph with FinalGrad as
     its default stage. Explicit C2 transport owns separate comm-stream events.
     The legacy differentiable helper can still mark graph cuts through
@@ -69,7 +69,7 @@ class MicrobatchTrace:
             "thread_id": threading.get_native_id(),
             "python_thread_id": threading.get_ident(),
             "thread_role": "main" if threading.get_native_id() == self._main_thread_id else "autograd",
-            "schedule_version": "pc1-window-v2",
+            "schedule_version": "micro-pipeline-window-v2",
             "start_event": start,
             "end_event": end,
             "stream_id": int(stream.cuda_stream),
@@ -82,7 +82,7 @@ class MicrobatchTrace:
         range_name = (f"Tide:S1:MB{self.microbatch_index}:{stage}"
             + (f":{node_name}" if node_name else "")
             + f"|rank={self.rank},batch={self.batch_index},slot={self.slot},"
-              f"tid={threading.get_native_id()},schedule=pc1-window-v2")
+              f"tid={threading.get_native_id()},schedule=micro-pipeline-window-v2")
         # Node failure may skip the posthook. Async IDs allow CPU-only abort
         # cleanup from the main thread without touching an autograd thread's
         # NVTX stack. Ordinary Python scopes keep their same-thread push/pop.
@@ -106,7 +106,7 @@ class MicrobatchTrace:
         # Autograd executes a node's pre/post hooks on the same thread and
         # stream.  Never record its end on the engine caller's default stream.
         if threading.get_native_id() != interval["thread_id"]:
-            raise RuntimeError("PC1 NVTX pre/post hooks must run on the same thread")
+            raise RuntimeError("Micro Pipeline NVTX pre/post hooks must run on the same thread")
         if interval.get("aborted"):
             return
         try:

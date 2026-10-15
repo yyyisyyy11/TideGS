@@ -1,0 +1,11 @@
+test_actual_compiled_loss_on_nondefault_compute_stream (tests.test_distributed_pipeline_cuda.DistributedPipelineCudaSmokeTest.test_actual_compiled_loss_on_nondefault_compute_stream) ... skipped 'set TIDE_RUN_CUDA_SMOKE=1 on a two-GPU host'
+test_backgrounds_sh_trace_and_nondefault_stream (tests.test_distributed_pipeline_cuda.DistributedPipelineCudaSmokeTest.test_backgrounds_sh_trace_and_nondefault_stream) ... skipped 'set TIDE_RUN_CUDA_SMOKE=1 on a two-GPU host'
+test_one_through_four_microbatches_and_slot_reuse (tests.test_distributed_pipeline_cuda.DistributedPipelineCudaSmokeTest.test_one_through_four_microbatches_and_slot_reuse) ... skipped 'set TIDE_RUN_CUDA_SMOKE=1 on a two-GPU host'
+test_repeated_batches_match_adam_parameters_and_all_states (tests.test_distributed_pipeline_cuda.DistributedPipelineCudaSmokeTest.test_repeated_batches_match_adam_parameters_and_all_states) ... skipped 'set TIDE_RUN_CUDA_SMOKE=1 on a two-GPU host'
+test_zero_peer_packed_zero_and_empty_owner_sentinel (tests.test_distributed_pipeline_cuda.DistributedPipelineCudaSmokeTest.test_zero_peer_packed_zero_and_empty_owner_sentinel) ... skipped 'set TIDE_RUN_CUDA_SMOKE=1 on a two-GPU host'
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.000s
+
+OK (skipped=5)
+Micro Pipeline acceptance requires 5 passing tests and zero skips

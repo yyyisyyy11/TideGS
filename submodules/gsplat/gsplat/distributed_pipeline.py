@@ -1,4 +1,4 @@
-"""Explicit C1/C2 transport and segmented backward for the PC1 pipeline.
+"""Explicit C1/C2 transport and segmented backward for the Micro Pipeline.
 
 Only the main thread owns graphs, handles and slots.  The persistent worker
 receives detached immutable packets and publishes results plus GPU events.
@@ -120,24 +120,24 @@ class BatchCameraLayout:
 def prepare_batch_camera_layout(
     *, means: Tensor, viewmats: Tensor, Ks: Tensor, microbatch: int
 ) -> BatchCameraLayout:
-    """Gather all static projection metadata before the PC1 loop starts."""
+    """Gather all static projection metadata before the Micro Pipeline loop starts."""
 
     if means.device.type != "cuda":
-        raise ValueError("pc1 requires CUDA tensors")
+        raise ValueError("Micro Pipeline requires CUDA tensors")
     if not torch.distributed.is_initialized():
         raise RuntimeError(
-            "pc1 requires an initialized torch.distributed process group"
+            "Micro Pipeline requires an initialized torch.distributed process group"
         )
     if viewmats.ndim != 3 or viewmats.shape[-2:] != (4, 4):
-        raise ValueError("pc1 requires batch viewmats with shape [C,4,4]")
+        raise ValueError("Micro Pipeline requires batch viewmats with shape [C,4,4]")
     if Ks.ndim != 3 or Ks.shape[-2:] != (3, 3):
-        raise ValueError("pc1 requires batch intrinsics with shape [C,3,3]")
+        raise ValueError("Micro Pipeline requires batch intrinsics with shape [C,3,3]")
     local_camera_count = int(viewmats.shape[0])
     microbatch = int(microbatch)
     if local_camera_count <= 0 or microbatch <= 0:
-        raise ValueError("pc1 requires positive camera and microbatch counts")
+        raise ValueError("Micro Pipeline requires positive camera and microbatch counts")
     if local_camera_count % microbatch:
-        raise ValueError("pc1 local camera count must be divisible by microbatch")
+        raise ValueError("Micro Pipeline local camera count must be divisible by microbatch")
 
     world_size = torch.distributed.get_world_size()
     device = means.device
@@ -149,7 +149,7 @@ def prepare_batch_camera_layout(
     )]
     if any(count != local_camera_count for count in C_world):
         raise ValueError(
-            "pc1 requires the same number of local cameras on every rank; "
+            "Micro Pipeline requires the same number of local cameras on every rank; "
             f"got {C_world}"
         )
     viewmats_global, Ks_global = all_gather_tensor_list(
@@ -192,43 +192,43 @@ def _projection_prepare(
     """Run P(i) and return tensors immediately before C1(i)."""
 
     if means.ndim != 2 or quats.ndim != 2 or scales.ndim != 2:
-        raise ValueError("pc1 requires unbatched Gaussian tensors")
+        raise ValueError("Micro Pipeline requires unbatched Gaussian tensors")
     if not torch.is_tensor(viewmats) or viewmats.ndim != 3:
-        raise ValueError("pc1 requires [C,4,4] viewmats")
+        raise ValueError("Micro Pipeline requires [C,4,4] viewmats")
     if not torch.is_tensor(Ks) or Ks.ndim != 3:
-        raise ValueError("pc1 requires [C,3,3] intrinsics")
+        raise ValueError("Micro Pipeline requires [C,3,3] intrinsics")
     if means.device.type != "cuda":
-        raise ValueError("pc1 requires CUDA tensors")
+        raise ValueError("Micro Pipeline requires CUDA tensors")
     if colors.ndim != 3 or colors.shape[0] != means.shape[0] or colors.shape[-1] != 3:
-        raise ValueError("pc1 requires per-Gaussian SH colors with shape [N,K,3]")
+        raise ValueError("Micro Pipeline requires per-Gaussian SH colors with shape [N,K,3]")
     if sh_degree is None:
-        raise ValueError("pc1 requires an active SH degree")
+        raise ValueError("Micro Pipeline requires an active SH degree")
     if rasterize_mode != "classic":
-        raise ValueError("pc1 currently supports rasterize_mode='classic' only")
+        raise ValueError("Micro Pipeline currently supports rasterize_mode='classic' only")
 
     device = means.device
     N = int(means.shape[0])
     C_local = int(viewmats.shape[0])
     if C_local <= 0:
-        raise ValueError("pc1 requires at least one local camera")
+        raise ValueError("Micro Pipeline requires at least one local camera")
     world_size = len(N_world)
     if len(C_world) != world_size or any(int(count) <= 0 for count in C_world):
-        raise ValueError("pc1 received an invalid microbatch camera layout")
+        raise ValueError("Micro Pipeline received an invalid microbatch camera layout")
     if world_size != torch.distributed.get_world_size():
-        raise ValueError("pc1 batch camera layout world size changed during the batch")
+        raise ValueError("Micro Pipeline batch camera layout world size changed during the batch")
     world_rank = torch.distributed.get_rank()
     if int(N_world[world_rank]) != N:
         raise ValueError(
-            "pc1 local Gaussian count changed after batch layout preparation"
+            "Micro Pipeline local Gaussian count changed after batch layout preparation"
         )
     if int(C_world[world_rank]) != C_local:
         raise ValueError(
-            "pc1 local camera count does not match microbatch camera layout"
+            "Micro Pipeline local camera count does not match microbatch camera layout"
         )
     if int(sum(C_world)) != int(viewmats_global.shape[0]):
-        raise ValueError("pc1 microbatch camera layout does not match gathered tensors")
+        raise ValueError("Micro Pipeline microbatch camera layout does not match gathered tensors")
     if int(sum(C_world)) != int(Ks_global.shape[0]):
-        raise ValueError("pc1 microbatch intrinsics layout does not match gathered tensors")
+        raise ValueError("Micro Pipeline microbatch intrinsics layout does not match gathered tensors")
     C_global = int(viewmats_global.shape[0])
 
     projection_start = _cuda_event()
@@ -445,7 +445,7 @@ def _pack_floats(tensors, columns):
     dtype = tensors[0].dtype
     for tensor in tensors:
         if int(tensor.shape[0]) != rows or tensor.dtype != dtype:
-            raise ValueError("PC1 float payload must have a common row count and dtype")
+            raise ValueError("Micro Pipeline float payload must have a common row count and dtype")
     # Explicit widths also support packed zero-row projections.
     return torch.cat([tensor.reshape(rows, column.width)
                       for tensor, column in zip(tensors, columns)], dim=1).contiguous()
@@ -494,7 +494,7 @@ class PipelineCommWorker(FIFOCommWorker):
                          initialize=lambda: torch.cuda.set_device(self.device),
                          buffer_count=buffer_count, on_failure=on_failure,
                          default_timeout_s=default_timeout_s,
-                         name=f"pc1-comm-{self.device.index}")
+                         name=f"micro-pipeline-comm-{self.device.index}")
 
     def _execute_request(self, stage, request):
         remaining(request.deadline, f"{stage} worker submission")
@@ -712,7 +712,7 @@ class DistributedRasterizationHandle:
         self.pipeline._ensure_main_thread()
         self.pipeline._ensure_not_aborted()
         if self.phase != expected:
-            raise RuntimeError(f"PC1 MB{self.microbatch_index} requires {expected}; got {self.phase}")
+            raise RuntimeError(f"Micro Pipeline MB{self.microbatch_index} requires {expected}; got {self.phase}")
 
     def _identity(self, stage):
         identity = CommunicationIdentity(
@@ -728,7 +728,7 @@ class DistributedRasterizationHandle:
         range_name = (f"Tide:S1:MB{self.microbatch_index}:{name}"
                       f"|rank={self.pipeline.rank},batch={self.pipeline.batch_index},"
                       f"slot={self.slot},seq={sequence},tid={threading.get_native_id()},"
-                      "schedule=pc1-window-v2")
+                      "schedule=micro-pipeline-window-v2")
         with _nvtx_range(range_name):
             try:
                 yield
@@ -740,7 +740,7 @@ class DistributedRasterizationHandle:
                     "rank": self.pipeline.rank, "batch_index": self.pipeline.batch_index,
                     "microbatch_index": self.microbatch_index, "slot": self.slot,
                     "communication_sequence": identity.comm_sequence if identity else -1,
-                    "schedule_version": "pc1-window-v2",
+                    "schedule_version": "micro-pipeline-window-v2",
                 })
 
     def start_forward_exchange(self, deadline=None):
@@ -769,7 +769,7 @@ class DistributedRasterizationHandle:
         identity = result.identity
         if (identity.batch_index, identity.microbatch_index, identity.slot) != (
                 self.pipeline.batch_index, self.microbatch_index, self.slot):
-            raise RuntimeError("PC1 received a communication result for a different slot")
+            raise RuntimeError("Micro Pipeline received a communication result for a different slot")
         self.cpu_trace.append({
             "name": f"{stage}:Worker", "start_ns": result.worker_begin_ns,
             "end_ns": result.worker_end_ns, "thread_id": result.native_thread_id,
@@ -897,7 +897,7 @@ class DistributedRasterizationHandle:
     def mark_backward_done(self, event):
         self._check("C2_QUEUED")
         if self.c2_result is None:
-            raise RuntimeError("PC1 final gradient must consume explicit C2 before slot release")
+            raise RuntimeError("Micro Pipeline final gradient must consume explicit C2 before slot release")
         self.backward_done = event
         self.phase = "BACKWARD_SUBMITTED"
         if self.trace is not None:
@@ -909,7 +909,7 @@ class DistributedRasterizationHandle:
         snapshot = {
             "rank": self.pipeline.rank, "batch_index": self.pipeline.batch_index,
             "microbatch_index": self.microbatch_index,
-            "pipeline_buffer_slot": self.slot, "schedule_version": "pc1-window-v2",
+            "pipeline_buffer_slot": self.slot, "schedule_version": "micro-pipeline-window-v2",
             "projection_start": self.state.get("projection_start"),
             "projection_end": self.state.get("projection_end"),
             "projection_done": self.projection_done,
@@ -984,9 +984,9 @@ class DistributedRasterizationPipeline:
     def __init__(self, *, compute_stream=None, comm_stream=None, buffer_count=2,
                  capture_timeline=False, comm_worker=None, batch_index=0, deadline=None):
         if not torch.cuda.is_available():
-            raise RuntimeError("pc1 requires CUDA")
+            raise RuntimeError("Micro Pipeline requires CUDA")
         if int(buffer_count) <= 0:
-            raise ValueError("PC1 buffer_count must be positive")
+            raise ValueError("Micro Pipeline buffer_count must be positive")
         self.compute_stream = compute_stream or torch.cuda.current_stream()
         self.buffer_count = int(buffer_count)
         self.capture_timeline = bool(capture_timeline)
@@ -1000,7 +1000,7 @@ class DistributedRasterizationPipeline:
             buffer_count=self.buffer_count)
         self.comm_stream = self.comm_worker.comm_stream
         if self.comm_worker.buffer_count != self.buffer_count:
-            raise ValueError("PC1 context worker buffer count does not match pipeline")
+            raise ValueError("Micro Pipeline context worker buffer count does not match pipeline")
         self._active = {}
         self._retired = []
         self._drained = self._closed = self._aborted = False
@@ -1011,11 +1011,11 @@ class DistributedRasterizationPipeline:
 
     def _ensure_main_thread(self):
         if threading.get_ident() != self._owner_thread:
-            raise RuntimeError("PC1 graph and slot state belongs to the main thread")
+            raise RuntimeError("Micro Pipeline graph and slot state belongs to the main thread")
 
     def _ensure_not_aborted(self):
         if self._aborted:
-            raise RuntimeError("PC1 pipeline aborted; worker must exit, NCCL batch cannot be resumed")
+            raise RuntimeError("Micro Pipeline aborted; worker must exit, NCCL batch cannot be resumed")
 
     def submit_projection(self, *, microbatch_index=0, deadline=None, **kwargs):
         self._ensure_main_thread()
@@ -1059,7 +1059,7 @@ class DistributedRasterizationPipeline:
         try:
             for handle in self._active.values():
                 if handle.phase != "BACKWARD_SUBMITTED":
-                    raise RuntimeError("PC1 drain requires final backward for every active slot")
+                    raise RuntimeError("Micro Pipeline drain requires final backward for every active slot")
             self.comm_worker.drain(deadline)
             for handle in self._active.values():
                 wait_event(handle.backward_done, deadline, "pipeline final backward drain")

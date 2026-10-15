@@ -1,4 +1,4 @@
-"""CPU-only fatal control for PC1; a failed NCCL batch is never resumed.
+"""CPU-only fatal control for Micro Pipeline; a failed NCCL batch is never resumed.
 
 The watchdog uses a separate Store, not a collective on either process group.
 It can terminate a worker whose main thread is waiting in a CUDA/NCCL call.
@@ -15,10 +15,10 @@ import time
 from typing import Callable
 
 
-PC1_FATAL_EXIT_CODE = 86
+MICRO_PIPELINE_FATAL_EXIT_CODE = 86
 
 
-class PC1FatalError(RuntimeError):
+class MicroPipelineFatalError(RuntimeError):
     """Raised only if an injected fatal-exit callback returns."""
 
 
@@ -33,17 +33,17 @@ def _exit_worker(reason: str) -> None:
             pass
 
     try:
-        logger = threading.Thread(target=log_best_effort, name="pc1-fatal-log", daemon=True)
+        logger = threading.Thread(target=log_best_effort, name="micro-pipeline-fatal-log", daemon=True)
         logger.start()
         logger.join(timeout=0.05)
     except (OSError, RuntimeError):
         pass
     finally:
-        os._exit(PC1_FATAL_EXIT_CODE)
+        os._exit(MICRO_PIPELINE_FATAL_EXIT_CODE)
 
 
-class PC1ErrorController:
-    """Bound PC1 stage waits and propagate fatal errors independently of NCCL.
+class MicroPipelineErrorController:
+    """Bound Micro Pipeline stage waits and propagate fatal errors independently of NCCL.
 
     ``store`` implements the public torch.distributed.Store set/check/get API
     and must have a short I/O timeout. All production failures exit the worker;
@@ -58,9 +58,9 @@ class PC1ErrorController:
     ):
         for name, value in (("stage_timeout", stage_timeout), ("poll_interval", poll_interval)):
             if not math.isfinite(value) or value <= 0:
-                raise ValueError(f"PC1 {name} must be positive and finite")
+                raise ValueError(f"Micro Pipeline {name} must be positive and finite")
         if world_size < 1 or not 0 <= rank < world_size:
-            raise ValueError("invalid PC1 rank/world_size")
+            raise ValueError("invalid Micro Pipeline rank/world_size")
         self.store = store
         self.rank = int(rank)
         self.world_size = int(world_size)
@@ -73,13 +73,13 @@ class PC1ErrorController:
         self._closed = False
         self._stop = threading.Event()
         self._watchdog = threading.Thread(
-            target=self._watch, name=f"pc1-error-control-rank-{rank}", daemon=True,
+            target=self._watch, name=f"micro-pipeline-error-control-rank-{rank}", daemon=True,
         )
         self._watchdog.start()
 
     @staticmethod
     def _error_key(rank: int) -> str:
-        return f"pc1-fatal-rank-{rank}"
+        return f"micro-pipeline-fatal-rank-{rank}"
 
     @property
     def failed(self) -> bool:
@@ -90,9 +90,9 @@ class PC1ErrorController:
         with self._lock:
             reason, closed = self._reason, self._closed
         if reason is not None:
-            raise PC1FatalError(reason)
+            raise MicroPipelineFatalError(reason)
         if closed:
-            raise RuntimeError("PC1 error controller is closed")
+            raise RuntimeError("Micro Pipeline error controller is closed")
 
     @contextmanager
     def operation(self, phase: str):
@@ -119,14 +119,14 @@ class PC1ErrorController:
     def fail(self, phase: str, error: BaseException) -> None:
         """Publish a local failure and exit; never wait for a peer collective."""
         reason = (
-            f"PC1 fatal rank={self.rank} phase={phase}: "
+            f"Micro Pipeline fatal rank={self.rank} phase={phase}: "
             f"{type(error).__name__}: {error}; NCCL batch cannot be resumed"
         )
         self._trip(reason, publish=True)
         # A returning callback is allowed only for tests. Keep them terminal.
         with self._lock:
             reason = self._reason
-        raise PC1FatalError(reason) from error
+        raise MicroPipelineFatalError(reason) from error
 
     def _trip(self, reason: str, *, publish: bool) -> None:
         with self._lock:
@@ -157,7 +157,7 @@ class PC1ErrorController:
             phase = self._expired_stage()
             if phase is not None:
                 self._trip(
-                    f"PC1 fatal rank={self.rank} phase={phase}: stage exceeded "
+                    f"Micro Pipeline fatal rank={self.rank} phase={phase}: stage exceeded "
                     f"{self.stage_timeout:g}s; NCCL batch cannot be resumed",
                     publish=True,
                 )
@@ -170,13 +170,13 @@ class PC1ErrorController:
                         if isinstance(message, bytes):
                             message = message.decode("utf-8", errors="replace")
                         self._trip(
-                            f"PC1 fatal rank={self.rank}: peer failure: {message}",
+                            f"Micro Pipeline fatal rank={self.rank}: peer failure: {message}",
                             publish=False,
                         )
                         return
             except Exception as error:
                 self._trip(
-                    f"PC1 fatal rank={self.rank}: control channel failed: "
+                    f"Micro Pipeline fatal rank={self.rank}: control channel failed: "
                     f"{type(error).__name__}: {error}", publish=False,
                 )
                 return
@@ -188,20 +188,20 @@ class PC1ErrorController:
             if self._closed:
                 return
             if self._reason is not None:
-                raise PC1FatalError(self._reason)
+                raise MicroPipelineFatalError(self._reason)
             if self._operations:
-                raise RuntimeError("cannot close PC1 error controller during an operation")
+                raise RuntimeError("cannot close Micro Pipeline error controller during an operation")
             self._closed = True
         self._stop.set()
         if deadline is None:
             deadline = time.monotonic() + self.stage_timeout
         self._watchdog.join(timeout=max(0.0, deadline - time.monotonic()))
         if self._watchdog.is_alive():
-            self.fail("watchdog shutdown", TimeoutError("PC1 watchdog shutdown deadline exceeded"))
+            self.fail("watchdog shutdown", TimeoutError("Micro Pipeline watchdog shutdown deadline exceeded"))
 
     def release_store(self) -> None:
         """Release only after every rank has stopped its healthy watchdog."""
         with self._lock:
             if not self._closed:
-                raise RuntimeError("PC1 store release requires controller.close()")
+                raise RuntimeError("Micro Pipeline store release requires controller.close()")
         self.store = None

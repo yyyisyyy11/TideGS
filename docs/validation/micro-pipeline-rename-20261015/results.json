@@ -1,0 +1,245 @@
+{
+  "validation_date": "2026-10-15",
+  "parent_commit": "60771c4",
+  "purpose": "Rename the current implementation to TideGS Micro Pipeline; preserve legacy inputs and reports",
+  "python_executable": "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3",
+  "python_version": "3.12.14 (main, Aug 25 2026, 13:50:33) [Clang 22.1.3 ]",
+  "gpu_execution": "not_run; this host has no PyTorch/CUDA",
+  "focused": {
+    "total": 162,
+    "errors": 0,
+    "failures": 0,
+    "skipped": 15,
+    "passed": 147,
+    "exit_code": 0,
+    "modules": [
+      "tests.test_distributed_error_control",
+      "tests.test_distributed_metrics",
+      "tests.test_distributed_pipeline_background",
+      "tests.test_distributed_pipeline_contract",
+      "tests.test_distributed_pipeline_cuda",
+      "tests.test_distributed_pipeline_cuda_faults",
+      "tests.test_distributed_trace",
+      "tests.test_micro_pipeline_render_timing",
+      "tests.test_micro_pipeline_comm_worker",
+      "tests.test_micro_pipeline_context_lifecycle",
+      "tests.test_micro_pipeline_native_capabilities",
+      "tests.test_micro_pipeline_native_cuda",
+      "tests.test_micro_pipeline_overlap_analysis",
+      "tests.test_micro_pipeline_paired_benchmark",
+      "tests.test_micro_pipeline_schedule",
+      "tests.test_micro_pipeline_segmented_transport",
+      "tests.test_micro_pipeline_engine_error_checkpoint",
+      "tests.test_micro_pipeline_submission_order_summary",
+      "tests.test_micro_pipeline_timeline_threads",
+      "tests.test_micro_pipeline_mode",
+      "tests.test_distributed_pipeline_camera_layout"
+    ]
+  },
+  "bundled_analysis": {
+    "total": 33,
+    "errors": 0,
+    "failures": 0,
+    "skipped": 0,
+    "passed": 33,
+    "exit_code": 0
+  },
+  "full": {
+    "total": 391,
+    "errors": 23,
+    "failures": 0,
+    "skipped": 38,
+    "passed": 330,
+    "exit_code": 1
+  },
+  "error_comparison": {
+    "reference": "../pc1-20261015-review-fixes/full-unittest.log",
+    "unchanged_error_test_set": true,
+    "new_errors": [],
+    "resolved_errors": []
+  },
+  "compileall": {
+    "exit_code": 0
+  },
+  "analyzer_self_test": {
+    "exit_code": 0
+  },
+  "ssh_cpu_tests": {
+    "total": 23,
+    "errors": 0,
+    "failures": 0,
+    "skipped": 0,
+    "passed": 23,
+    "exit_code": 0
+  },
+  "ssh_no_gpu_acceptance_rejections": {
+    "numerical": {
+      "total": 5,
+      "errors": 0,
+      "failures": 0,
+      "skipped": 5,
+      "passed": 0,
+      "exit_code": 1
+    },
+    "native": {
+      "total": 2,
+      "errors": 0,
+      "failures": 0,
+      "skipped": 2,
+      "passed": 0,
+      "exit_code": 1
+    }
+  },
+  "shell_syntax": [
+    "common.sh",
+    "check_nsys.sh",
+    "package_code.sh",
+    "profile_rank.sh",
+    "install_nsys.sh",
+    "fetch_nsys_from_xingyi.sh",
+    "prepare_env.sh",
+    "run_micro_pipeline_2gpu_3000.sbatch"
+  ],
+  "snapshot_sha256": [
+    {
+      "file": "analyze_micro_pipeline_overlap.py",
+      "sha256": "d5f0227f1841875a23c07dfd8ce13ad1f000af0eab4beecb67faeeeae5898cd2"
+    },
+    {
+      "file": "analyze_micro_pipeline_submission_order.py",
+      "sha256": "298d7048f9848d683a3df2efc592a05496c62da5291ac8934bc40f49f4de8cb4"
+    },
+    {
+      "file": "extract_timeline_cuda.py",
+      "sha256": "89e7266d41800131603bd6f9f7748cef91593d8c5bb0a087a9c15dc6f8ae5462"
+    },
+    {
+      "file": "extract_superpod_comparison.py",
+      "sha256": "79b0b39106df33fa0d1867e9485229d7fe2b6255f7defe90a764bd2d098341c2"
+    },
+    {
+      "file": "timeline_svg.py",
+      "sha256": "315b236a238722de1ada78e7b547564f6fe892b6c03ef9a4fa0a8781f70c980e"
+    },
+    {
+      "file": "analyze_pc1_overlap.py",
+      "sha256": "225b51e8868dd9d95962bc8d0c0fcdae8d624ea6bcc6b54de6c1dcfb93c64256"
+    },
+    {
+      "file": "analyze_pc1_submission_order.py",
+      "sha256": "c9a92f02176859aabf071ae0cc3deb0a36932e32702716246cccb9e73a3d0f78"
+    }
+  ],
+  "diff_check": {
+    "exit_code": 0
+  },
+  "logs": [
+    {
+      "file": "analyzer-self-test.log",
+      "sha256": "6ccc7ca8650a1d5606515cd1fa101ba7c1c3be138a17207670da32f6bebd1e0a"
+    },
+    {
+      "file": "bundled-analysis-unittest.log",
+      "sha256": "48479259ecf224a2cd9546ea71324c674bd8f9fc602877bd817167ef4132c032"
+    },
+    {
+      "file": "compileall.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "diff-check.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "focused-unittest.log",
+      "sha256": "a2d3b2867b1971815eb709e048ac17444ef0d563290a2dfae65d5edbbf011b36"
+    },
+    {
+      "file": "full-unittest.log",
+      "sha256": "895057c36360245cbc2fb67aa7b793f406586336be76700c63b84bf54d6144cf"
+    },
+    {
+      "file": "ssh-cpu-unittest.log",
+      "sha256": "aae492b8b464f5e5e2d72b3f00973401d86ae6e26b14cbf9e41d70d7bd986851"
+    },
+    {
+      "file": "ssh-no-gpu-native.log",
+      "sha256": "5c44b45b4f7bc7da2c530876f373be37bd37ef650b3c34f8e628cb6d73099d54"
+    },
+    {
+      "file": "ssh-no-gpu-numerical.log",
+      "sha256": "2cc3477a8d67d5753b3e8f53ff2f3ec80edc4c880c87d0d7ea5d820f572683af"
+    }
+  ],
+  "external_entrypoints": [
+    {
+      "file": "/Users/mac/Projects/proj_tidegs_isc/ssh/superpod/micro_pipeline/README.md",
+      "sha256": "f1ec87e275bcccd7b3bf6a54246e9410a5505926877f608a5abbdb6f44d2afe3"
+    },
+    {
+      "file": "/Users/mac/Projects/proj_tidegs_isc/ssh/superpod/micro_pipeline/build_gsplat.py",
+      "sha256": "5bd478dc6c847932267671944e468e8946dfd7c94dd3ff9b4de2822f07cf9dfe"
+    },
+    {
+      "file": "/Users/mac/Projects/proj_tidegs_isc/ssh/superpod/micro_pipeline/check_nsys.sh",
+      "sha256": "62a85dc5740365e768e28c35100719c326117d10035217e9dd3e1e0b0ff03dc2"
+    },
+    {
+      "file": "/Users/mac/Projects/proj_tidegs_isc/ssh/superpod/micro_pipeline/common.sh",
+      "sha256": "f9744efb4deb4c25e54a788d3e2aba21d0652d3f1b2eb06498902f0750cab0fa"
+    },
+    {
+      "file": "/Users/mac/Projects/proj_tidegs_isc/ssh/superpod/micro_pipeline/fetch_nsys_from_xingyi.sh",
+      "sha256": "9258fa561a5a93321ddc1b310520b25e6d19e9e2f6ba16da8b6f1ebfd230c425"
+    },
+    {
+      "file": "/Users/mac/Projects/proj_tidegs_isc/ssh/superpod/micro_pipeline/install_nsys.sh",
+      "sha256": "e4b9316e3b7e124d10b8ed145abe53959c7de44d5b7ca17e261f4232564f21b7"
+    },
+    {
+      "file": "/Users/mac/Projects/proj_tidegs_isc/ssh/superpod/micro_pipeline/nsys_smoke.py",
+      "sha256": "ebe2f50747792b2550e136bb2e22a396a89f0ae7f7c4734f214caf56006bc4d0"
+    },
+    {
+      "file": "/Users/mac/Projects/proj_tidegs_isc/ssh/superpod/micro_pipeline/package_code.sh",
+      "sha256": "ec662cdd73553a1074ece4d55b70ecf5b50772f3bf0fb6f83cfc93c4da70c0b7"
+    },
+    {
+      "file": "/Users/mac/Projects/proj_tidegs_isc/ssh/superpod/micro_pipeline/preflight.py",
+      "sha256": "0b85296f435faa4307532e53d8342d68aa76e975993beb0ff6f8a494ee79435a"
+    },
+    {
+      "file": "/Users/mac/Projects/proj_tidegs_isc/ssh/superpod/micro_pipeline/prepare_env.sh",
+      "sha256": "fca1dbec249ff2a5b58f85ae410b812c990014f625a7e1294ff2319dd760dd94"
+    },
+    {
+      "file": "/Users/mac/Projects/proj_tidegs_isc/ssh/superpod/micro_pipeline/profile_rank.sh",
+      "sha256": "a3c4f5ad3e3e512aeb2accb011d4088b0b716f3e7ab029a88745a33038d332d1"
+    },
+    {
+      "file": "/Users/mac/Projects/proj_tidegs_isc/ssh/superpod/micro_pipeline/run_cuda_smoke.py",
+      "sha256": "ede678fd5e09201e703d37f5fbbd6ddf1a3d2e201405624cdc3746161351b0fc"
+    },
+    {
+      "file": "/Users/mac/Projects/proj_tidegs_isc/ssh/superpod/micro_pipeline/run_micro_pipeline_2gpu_3000.sbatch",
+      "sha256": "795ac29b31effb455fb6844cdfdd7715d834d6aba637e6449b0ab0461cb8930d"
+    },
+    {
+      "file": "/Users/mac/Projects/proj_tidegs_isc/ssh/superpod/micro_pipeline/runtime_env.py",
+      "sha256": "d8209ca14a9448e7fa504c904905a2c46af763acd61f5fd45943fe26e551b380"
+    },
+    {
+      "file": "/Users/mac/Projects/proj_tidegs_isc/ssh/superpod/micro_pipeline/test_build_gsplat.py",
+      "sha256": "2af6cacc3b3867f8102678de25f3f0a3c1ccdaa4f4b35eacd809f5939a3bb28a"
+    },
+    {
+      "file": "/Users/mac/Projects/proj_tidegs_isc/ssh/superpod/micro_pipeline/test_runtime_env.py",
+      "sha256": "1c0313deb8df87c27893817eda4520af9460181b14f9621621a6f7a2bdc949c7"
+    }
+  ],
+  "scope_notes": [
+    "Historical experiments and previous validation logs untouched",
+    "Current local worktree physical path retained; branch renamed to feat/micro-pipeline",
+    "Canonical shared analysis and new SuperPOD entrypoints updated locally; no SSH, Slurm or training runs"
+  ]
+}

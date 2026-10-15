@@ -74,17 +74,19 @@ def _read_rows(path):
 
 
 class DistributedMetricsTest(unittest.TestCase):
-    def test_deferred_writer_preserves_resolved_pc1_training_union(self):
-        writer = SimpleNamespace(enabled=True, write_batch=mock.Mock())
-        collector = LegacyCudaMetricsCollector(writer)
-        collector.enqueue({
-            "pipeline_mode": "pc1", "train_ms": 7.0,
-            "gsplat_forward_ms": 6.0, "loss_ms": 2.0,
-            "backward_ms": 5.0, "optimizer_ms": 1.0,
-        }, {})
-        self.assertEqual(writer.write_batch.call_args.args[0]["train_ms"], 7.0)
+    def test_deferred_writer_preserves_resolved_micro_pipeline_training_union(self):
+        for mode in ("micro", "pc1"):
+            with self.subTest(mode=mode):
+                writer = SimpleNamespace(enabled=True, write_batch=mock.Mock())
+                collector = LegacyCudaMetricsCollector(writer)
+                collector.enqueue({
+                    "pipeline_mode": mode, "train_ms": 7.0,
+                    "gsplat_forward_ms": 6.0, "loss_ms": 2.0,
+                    "backward_ms": 5.0, "optimizer_ms": 1.0,
+                }, {})
+                self.assertEqual(writer.write_batch.call_args.args[0]["train_ms"], 7.0)
 
-    def test_deferred_pc1_writer_uses_event_union_when_unresolved(self):
+    def test_deferred_micro_pipeline_writer_uses_event_union_when_unresolved(self):
         class Event:
             def __init__(self, ms):
                 self.ms = ms
@@ -95,15 +97,17 @@ class DistributedMetricsTest(unittest.TestCase):
             def elapsed_time(self, other):
                 return other.ms - self.ms
 
-        writer = SimpleNamespace(enabled=True, write_batch=mock.Mock())
-        collector = LegacyCudaMetricsCollector(writer)
-        collector.enqueue({"pipeline_mode": "pc1"}, {
-            "gsplat_forward_ms": [{"start": Event(0), "end": Event(6)}],
-            "loss_ms": [{"start": Event(5), "end": Event(7)}],
-            "backward_ms": [{"start": Event(6), "end": Event(11)}],
-            "optimizer_ms": [{"start": Event(12), "end": Event(13)}],
-        })
-        self.assertEqual(writer.write_batch.call_args.args[0]["train_ms"], 12.0)
+        for mode in ("micro", "pc1"):
+            with self.subTest(mode=mode):
+                writer = SimpleNamespace(enabled=True, write_batch=mock.Mock())
+                collector = LegacyCudaMetricsCollector(writer)
+                collector.enqueue({"pipeline_mode": mode}, {
+                    "gsplat_forward_ms": [{"start": Event(0), "end": Event(6)}],
+                    "loss_ms": [{"start": Event(5), "end": Event(7)}],
+                    "backward_ms": [{"start": Event(6), "end": Event(11)}],
+                    "optimizer_ms": [{"start": Event(12), "end": Event(13)}],
+                })
+                self.assertEqual(writer.write_batch.call_args.args[0]["train_ms"], 12.0)
 
     def test_cuda_union_excludes_double_counting_across_streams(self):
         class Event:

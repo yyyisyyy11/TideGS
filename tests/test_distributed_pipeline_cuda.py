@@ -1,6 +1,6 @@
-"""Opt-in real two-rank numerical, event and repeated-batch PC1 checks.
+"""Opt-in real two-rank numerical, event and repeated-batch Micro Pipeline checks.
 
-Use the bounded parent: TIDE_RUN_CUDA_SMOKE=1 python tools/run_pc1_cuda_smoke.py
+Use the bounded parent: TIDE_RUN_CUDA_SMOKE=1 python tools/run_micro_pipeline_cuda_smoke.py
 Direct entry: torchrun --standalone --nproc_per_node=2 -m unittest \
     tests.test_distributed_pipeline_cuda -v
 CPU discovery skips cleanly when torch/CUDA are absent.
@@ -130,10 +130,10 @@ class DistributedPipelineCudaSmokeTest(unittest.TestCase):
                 backend="nccl", init_method="env://", timeout=timedelta(seconds=60),
             )
         sys.path.insert(0, str(Path(__file__).parents[1] / "submodules" / "gsplat"))
-        from utils.pc1_native_capabilities import check_pc1_native_capabilities
+        from utils.micro_pipeline_native_capabilities import check_micro_pipeline_native_capabilities
         from gsplat.distributed_pipeline import PipelineCommWorker
 
-        check_pc1_native_capabilities()
+        check_micro_pipeline_native_capabilities()
         cls.worker = PipelineCommWorker(
             device=torch.device("cuda", cls.local_rank),
             comm_stream=torch.cuda.Stream(priority=-1), buffer_count=2,
@@ -207,14 +207,14 @@ class DistributedPipelineCudaSmokeTest(unittest.TestCase):
         return torch.cat(outputs), total, self._gradients(values)
 
     @_smoke_batch_ranges
-    def _pc1(
+    def _micro_pipeline(
         self, values, background=None, *, capture_timeline=True,
         sh_degree=0, real_loss=False, nondefault_stream=False, serial_reference=False,
     ):
         from gsplat.distributed_pipeline import (
             distributed_rasterization_pipeline, prepare_batch_camera_layout,
         )
-        from strategies.tide_engine.pc1_schedule import run_pc1_windows
+        from strategies.tide_engine.micro_pipeline_schedule import run_micro_pipeline_windows
 
         if real_loss:
             self._warm_loss(values)
@@ -263,7 +263,7 @@ class DistributedPipelineCudaSmokeTest(unittest.TestCase):
                 handle.final_backward(deadline=deadline)
                 snapshots.append(handle.snapshot())
 
-            run_pc1_windows(
+            run_micro_pipeline_windows(
                 range(len(viewmats)), buffer_count=1 if serial_reference else 2,
                 controller=self.controller, project=project,
                 image_backward=image, final_backward=final,
@@ -283,10 +283,10 @@ class DistributedPipelineCudaSmokeTest(unittest.TestCase):
 
     def _compare_three_paths(self, *, count=4, case="uneven", background=None, **kwargs):
         baseline = self._baseline(self._inputs(count, case), background, **kwargs)
-        serial = self._pc1(
+        serial = self._micro_pipeline(
             self._inputs(count, case), background, serial_reference=True, **kwargs,
         )
-        threaded = self._pc1(self._inputs(count, case), background, **kwargs)
+        threaded = self._micro_pipeline(self._inputs(count, case), background, **kwargs)
         self._assert_numerical_match(serial[:3], baseline)
         self._assert_numerical_match(threaded[:3], baseline)
         self._assert_events(threaded[3], count, kwargs.get("capture_timeline", True))
@@ -321,7 +321,7 @@ class DistributedPipelineCudaSmokeTest(unittest.TestCase):
 
     def test_repeated_batches_match_adam_parameters_and_all_states(self):
         trajectories = []
-        for mode in ("off", "serial", "pc1"):
+        for mode in ("off", "serial", "micro"):
             values = self._inputs()
             optimizer = torch.optim.Adam(values[:5], lr=1e-3, foreach=False)
             memories, peaks, tensor_counts, worker_counts = [], [], [], []
@@ -331,7 +331,7 @@ class DistributedPipelineCudaSmokeTest(unittest.TestCase):
                 if mode == "off":
                     result = self._baseline(values, sh_degree=3)
                 else:
-                    result = self._pc1(
+                    result = self._micro_pipeline(
                         values, sh_degree=3, serial_reference=mode == "serial",
                     )
                 # Adam state must exist for every Gaussian parameter component,
