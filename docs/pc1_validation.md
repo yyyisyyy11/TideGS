@@ -13,7 +13,30 @@
 | 范围 | 常驻通信线程、显式 C1/C2、分段梯度、固定窗口、原生能力检查、故障控制、trace 与验证工具 |
 | 默认值 | pipeline 为 `off`，buffer_count 为 2；不新增生产模式 |
 
-## 结果
+## 修复复验
+
+**本轮 3 项 P2 已修复。** 新记录保存到独立目录，首轮原始日志保持不变。
+
+| 问题 | 修复后的行为 |
+| --- | --- |
+| 未知 overlap 被稀释为零 | 仅完整目标 batch 进入均值，输出完整 / 未知 / 无配对数量与覆盖率；全未知为 null，实测零仍为零 |
+| 非 main / comm 线程被误标 autograd | 明确反向节点标签才能认证 autograd；SSD / watchdog 无证据时进入独立 unknown 子行，保留真实 tid |
+| 原生 CUDA 命令变量错误 | 改用 TIDE_RUN_NATIVE_CUDA；双卡、两项执行、零跳过才算验收 |
+
+| 检查 | 通过 | 错误 | 跳过 |
+| --- | ---: | ---: | ---: |
+| PC1 定向回归，139 项 | **124** | 0 | 15 |
+| Git 内分析快照回归，27 项 | **27** | 0 | 0 |
+| 完整 unittest，376 项 | 315 | 23 | 38 |
+| compileall / 共享脚本 py_compile / diff 检查 | 通过 | 0 | — |
+
+**23 项错误测试集合与首轮及干净基线相同，无新增错误。** 五个共享脚本与 Git 快照的 SHA-256 一致；新增 14 项行为测试覆盖未知汇总、覆盖率、旧 schema、线程证据和 SVG 四个独立 CPU 子行。CUDA / NCCL 实机验收仍未执行。
+
+证据：[results.json](validation/pc1-20261015-review-fixes/results.json)、[定向日志](validation/pc1-20261015-review-fixes/focused-unittest.log)、[快照分析日志](validation/pc1-20261015-review-fixes/bundled-analysis-unittest.log)、[完整日志](validation/pc1-20261015-review-fixes/full-unittest.log)。
+
+## 首轮结果
+
+以下为 `7e9317d` 的首轮记录；本轮新增验证见上表。
 
 | 检查 | 通过 | 错误 | 跳过 | 结论 |
 | --- | ---: | ---: | ---: | --- |
@@ -57,13 +80,13 @@
 
 ## 复现
 
-线程、数学语义、构建、CUDA smoke、故障、GIL / Nsight 与配对命令见 [pc1_timeline.md](pc1_timeline.md)。定向测试模块清单保存在 results.json 的 focused.modules，可按该清单复现同一组测试。
+线程、数学语义、构建、CUDA smoke、故障、GIL / Nsight 与配对命令见 [pc1_timeline.md](pc1_timeline.md)。最新定向测试模块清单保存在 [修复复验 results.json](validation/pc1-20261015-review-fixes/results.json) 的 focused.modules，可按该清单复现同一组测试。
 
 ```bash
 cd /path/to/TideGS-pc1-pipeline
 python3 -m compileall -q strategies/tide_engine submodules/gsplat/gsplat utils tests tools
 python3 -m unittest discover -s tests
-TIDE_TIMELINE_SCRIPTS="$PWD/tools/pc1_timeline" python3 -m unittest tests.test_pc1_overlap_analysis -v
+TIDE_TIMELINE_SCRIPTS="$PWD/tools/pc1_timeline" python3 -m unittest tests.test_pc1_overlap_analysis tests.test_pc1_submission_order_summary tests.test_pc1_timeline_threads -v
 python3 tools/pc1_timeline/analyze_pc1_overlap.py --self-test
 git diff --check
 ```
@@ -74,6 +97,7 @@ git diff --check
 | --- | --- |
 | 设计与复现 | [pc1_timeline.md](pc1_timeline.md) |
 | 测试证据及错误对照 | [validation/pc1-20261015](validation/pc1-20261015/results.json) |
+| 三项 P2 修复复验 | [validation/pc1-20261015-review-fixes](validation/pc1-20261015-review-fixes/results.json) |
 | 可移植共享分析脚本 | [tools/pc1_timeline](../tools/pc1_timeline/README.md)，附源位置和 SHA-256 |
 | 数值外部超时入口 | `tools/run_pc1_cuda_smoke.py` |
 | 原生 GIL 探针 | `tools/probe_pc1_native_gil.py` |

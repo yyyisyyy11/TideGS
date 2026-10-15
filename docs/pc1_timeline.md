@@ -69,7 +69,7 @@ cd "$TIDE_CODE"
 
 ## Timeline
 
-保留 GPU、CPU、SSD 主轨，CPU 内区分 main、comm、autograd，并保留真实 native thread ID。NVTX 名称使用 `Tide:S1:MB<i>:<stage>[:node]|rank=...,batch=...,slot=...,seq=...,tid=...,schedule=pc1-window-v2`。普通范围在本线程用异常安全的 push/pop；autograd hook 使用可配对清理的 range ID，避免异常时跨线程 pop。
+保留 GPU、CPU、SSD 主轨，CPU 内区分 main、comm、autograd、unknown，并保留真实 native thread ID。comm 由通信执行标签识别，autograd 由反向节点标签识别；SSD 预取、watchdog 等没有反向证据的线程进入独立 unknown 行。NVTX 名称使用 `Tide:S1:MB<i>:<stage>[:node]|rank=...,batch=...,slot=...,seq=...,tid=...,schedule=pc1-window-v2`。普通范围在本线程用异常安全的 push/pop；autograd hook 使用可配对清理的 range ID，避免异常时跨线程 pop。
 
 | 记录 | 统计口径 |
 | --- | --- |
@@ -94,6 +94,8 @@ cd "$TIDE_CODE"
 | final_c2 | FinalGrad / AccumulateGrad(i) 与 C2(i+1) |
 
 只计算**同设备、不同 stream**的 kernel 区间交集，先取并集，按配对 / batch / rank 输出样本数。slot 回绕标识新窗口，不产生跨窗口目标配对。旧报告继续读取，仅有旧 P/C1 标签时不声称存在分段反向目标。
+
+提交顺序摘要的 `target_next_projection_c1_overlap_ms_per_batch` 只对证据完整的目标 batch 求均值；同 batch 任一目标配对未知，则整个 batch 保持未知。摘要同时输出 complete / unknown / no-pair batch 数及 `target_next_projection_c1_coverage_fraction`；全部未知时均值为 `null`，已证实没有交集时保留 `0`。新版使用 batch 目标区间并集；旧版保留完整配对求和口径。fine-tag 归属量只表示已归属的下界。
 
 ```bash
 export TIDE_RUN_CUDA_SMOKE=1
@@ -144,16 +146,24 @@ python tools/run_pc1_paired_benchmark.py summarize /new/output/paired-runs \
 
 ## 复现入口
 
+| 验收入口 | 启用变量 |
+| --- | --- |
+| 双 rank 数值 smoke | `TIDE_RUN_CUDA_SMOKE=1` |
+| 原生 SSIM stream / device 测试 | `TIDE_RUN_NATIVE_CUDA=1` |
+| 双 rank 故障退出 | `TIDE_RUN_CUDA_ABORT_TEST=1` |
+
 ```bash
 python3 -m compileall strategies/tide_engine submodules/gsplat/gsplat utils tests tools
 python3 -m unittest discover -s tests
 git diff --check
 TIDE_RUN_CUDA_SMOKE=1 python tools/run_pc1_cuda_smoke.py --timeout 600
-TIDE_RUN_CUDA_SMOKE=1 python -m unittest tests.test_pc1_native_cuda -v
+TIDE_RUN_NATIVE_CUDA=1 timeout 120s python -m unittest tests.test_pc1_native_cuda -v
 TIDE_RUN_CUDA_ABORT_TEST=1 python -m unittest tests.test_distributed_pipeline_cuda_faults -v
 timeout 240s nsys profile --trace=cuda,nvtx,osrt -o /new/output/pc1-gil \
   python tools/probe_pc1_native_gil.py --include-backward --output /new/output/pc1-gil.json
 ```
+
+**原生 CUDA 验收需要双卡，结果必须为 2 项执行、0 项跳过。** `OK (skipped=...)` 表示尚未完成验收；设置环境变量不能代替 CUDA 及设备数量条件。
 
 数值 smoke 对比 off、串行分段参考、窗口 PC1，覆盖 1–4 个 microbatch、SH 0/3、背景、零分片 / 零行 / sentinel、trace 开关、非默认 stream、MSE / 真实 Loss、多 batch 的全部参数梯度和 Adam 状态。图像容差为 `rtol=1e-4, atol=1e-4`，Loss / 梯度为 `rtol=1e-4, atol=1e-5`；Adam 使用测试内明确的严格容差，不为通过而放宽。真实 GIL 探针只证明原生调用期间其他线程可推进，不能当作训练加速证据。
 

@@ -13,6 +13,7 @@ Example:
 import argparse
 import csv
 import json
+import math
 import statistics
 from collections import defaultdict
 from pathlib import Path
@@ -43,6 +44,92 @@ def write_csv(path, rows):
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def nonnegative_number(value):
+    """A measured zero is evidence; a blank/null/nonfinite value is not."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
+
+
+def optional_object(value):
+    if value is None or value == "":
+        return None
+    decoded = json.loads(value) if isinstance(value, str) else value
+    if not isinstance(decoded, dict):
+        raise ValueError("Expected a JSON object in batch target metadata")
+    return decoded
+
+
+def projection_target_summary(rank, batches, pairs):
+    """Average only complete target batches, preserving unknown as null.
+
+    New reports supply the per-batch interval union and expected pair count.
+    Legacy reports lack those fields: retain their sum-of-pairs convention,
+    but accept it only when every declared projection/C1 pair is assessable.
+    Missing pairs or an undeclared target never establish a measured zero.
+    """
+    target = "projection_c1"
+    prefix = "target_next_projection_c1"
+    pair_batches = defaultdict(list)
+    for row in pairs:
+        if str(row["rank"]) == str(rank) and (row.get("target_type") or target) == target:
+            pair_batches[str(row["trace_batch"])].append(row)
+    results, complete_values = [], []
+    declared_batches = no_pair_batches = 0
+    for batch in batches:
+        batch_id = str(batch["trace_batch"])
+        rows = pair_batches[batch_id]
+        counts = optional_object(batch.get("target_pair_samples"))
+        overlaps = optional_object(batch.get("target_overlap_ms"))
+        declared = bool(rows) or target in (counts or {}) or target in (overlaps or {})
+        declared_batches += int(declared)
+        no_pair_batches += int(not rows)
+        reasons = []
+        if not rows:
+            reasons.append("no_target_pairs" if declared else "target_not_declared")
+        if counts is not None:
+            expected = nonnegative_number(counts.get(target))
+            if expected is None or expected <= 0 or expected != int(expected):
+                reasons.append("missing_or_invalid_target_pair_count")
+            elif int(expected) != len(rows):
+                reasons.append("target_pair_count_mismatch")
+        values = [nonnegative_number(row.get("cross_stream_overlap_ms")) for row in rows]
+        if any(row.get("status") != "assessable" or value is None
+               for row, value in zip(rows, values)):
+            reasons.append("unassessable_target_pair")
+        source = "recorded_batch_union" if overlaps is not None else "legacy_complete_pair_sum"
+        if overlaps is not None:
+            overlap = nonnegative_number(overlaps.get(target))
+            if overlap is None:
+                reasons.append("missing_or_unknown_batch_target_union")
+        else:
+            overlap = sum(values) if values and all(value is not None for value in values) else None
+        if not reasons:
+            complete_values.append(overlap)
+        results.append({
+            "trace_batch": int(batch_id), "status": "complete" if not reasons else "unknown",
+            "declared_pairs": len(rows), "overlap_ms": overlap if not reasons else None,
+            "source": source, "reasons": reasons,
+        })
+    complete = len(complete_values)
+    total = len(batches)
+    return {
+        # Retain the existing field, with a complete-batch denominator.
+        prefix + "_overlap_ms_per_batch": statistics.mean(complete_values) if complete_values else None,
+        prefix + "_complete_batches": complete,
+        prefix + "_unknown_batches": total - complete,
+        prefix + "_declared_batches": declared_batches,
+        prefix + "_no_pair_batches": no_pair_batches,
+        prefix + "_coverage_fraction": complete / total if total else None,
+        prefix + "_batch_results": results,
+        prefix + "_aggregation": "mean over complete target batches; recorded batch union when present, otherwise legacy complete-pair sum",
+    }
 
 
 def main():
@@ -125,7 +212,7 @@ def main():
         count = len(rank_batches)
         generic = sum(float(item["compute_nccl_cross_stream_overlap_ms"]) for item in rank_batches) / count
         fine = sum(by_batch.get((rank, item["trace_batch"]), 0.0) for item in rank_batches) / count
-        target = sum(float(item["cross_stream_overlap_ms"]) for item in target_pairs if item["rank"] == rank and item["status"] == "assessable" and item.get("target_type", "projection_c1") == "projection_c1") / count
+        target_summary = projection_target_summary(rank, rank_batches, target_pairs)
         summaries.append({
             "rank": int(rank), "analyzed_batches": count,
             "payload_microbatches": len(rank_payloads), "payloads_with_sync_api": sum(value > 0 for value in sync),
@@ -140,8 +227,9 @@ def main():
             "cpu_gap_after_payload_ms": stats([item["cpu_gap_after_payload_ms"] for item in rank_orders]),
             "all_kernel_compute_nccl_overlap_ms_per_batch": generic,
             "fine_tag_owned_kernel_overlap_ms_per_batch": fine,
-            "target_next_projection_c1_overlap_ms_per_batch": target,
+            **target_summary,
             "overlap_not_explained_by_fine_tag_owned_kernels_ms_per_batch": generic - fine,
+            "fine_tag_owned_kernel_overlap_interpretation": "audited lower bound; absent or unknown kernel ownership does not certify zero actual overlap",
             "overlap_attribution_status": "Remaining activity lacks complete fine-tag kernel ownership; do not assign it to backward/plan/communication subphases",
         })
     examples = []
@@ -183,6 +271,8 @@ def main():
             "The gap to Projection NVTX also includes untagged transformed-leaf preparation and Python work; it is not just idle time",
             "This is an observed submission dependency; it does not measure the counterfactual speedup from removing synchronization",
             "Fine-tag-owned phase overlaps can overlap each other; generic minus their union is left unattributed",
+            "The target mean uses only complete target batches; any unknown pair makes its whole batch unknown, with coverage reported separately",
+            "An absent target or missing pair is unknown, never a measured zero; legacy complete batches retain their sum-of-pairs convention",
             "Kernel-only overall overlap can differ slightly from timeline categories that include CUDA memset as compute",
         ],
         "ranks": summaries,

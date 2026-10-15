@@ -62,6 +62,15 @@ CPU_NAMES = {
 RUNTIME_WAIT = re.compile(r"Synchronize|^cudaMemcpy(?:_v\d+)?$|^cudaMemset(?:_v\d+)?$", re.I)
 OSRT_WAIT = re.compile(r"wait|poll|select|sleep|join|sem_timed|futex", re.I)
 PC1_PHASE = re.compile(r"^Tide:S[12]:MB\d+:(Projection|C1(?::Metadata|:Payload|:Wait)?|C2(?::Payload|:Wait)?|Render|Loss|Backward|IntermediateGrad|FinalGrad|AccumulateGrad|Enqueue|FutureWait|Worker)(?::[^|]+)?(?:\|.*)?$")
+# A caller-side enqueue/FutureWait or a legacy C2 autograd node is not
+# evidence of a communication worker. Bare backward stages are callers too;
+# only node-qualified scopes (plus the explicit AccumulateGrad node) certify
+# an autograd thread. Both identity-suffixed and older bare labels are valid.
+COMM_THREAD_NVTX = re.compile(
+    r"^Tide:S[12]:MB\d+:(?:C[12]:(?:Metadata|Payload|Worker)|Worker(?::C[12])?)(?:\|.*)?$")
+AUTOGRAD_THREAD_NVTX = re.compile(
+    r"^Tide:S[12]:MB\d+:(?:(?:Backward|IntermediateGrad|FinalGrad|AccumulateGrad):[^|]+"
+    r"|AccumulateGrad|C2:[^|]*(?:Backward|AccumulateGrad)[^|]*)(?:\|.*)?$")
 
 
 def sha256(path):
@@ -599,10 +608,18 @@ def build_timeline(rank_data, records, mode, first, count, world_size=2, global_
                 "end": (row["end_ns"] - begin) / NS}
     phases = []
     comm_tids = {row["global_tid"] for row in rank_data["nvtx"]
-                 if re.match(r"^Tide:S1:MB\d+:C[12](?::|\||$)", row["name"])}
+                 if COMM_THREAD_NVTX.fullmatch(row["name"])}
+    autograd_tids = {row["global_tid"] for row in rank_data["nvtx"]
+                     if AUTOGRAD_THREAD_NVTX.fullmatch(row["name"])}
     def thread_role(row):
-        return "main" if row["global_tid"] == rank_data["main_tid"] else (
-            "comm" if row["global_tid"] in comm_tids else "autograd")
+        tid = row["global_tid"]
+        if tid == rank_data["main_tid"]:
+            return "main"
+        if tid in comm_tids:
+            return "comm"
+        if tid in autograd_tids:
+            return "autograd"
+        return "unknown"
     certified_main_storage = {row["source_rowid"] for row in rank_data["reads"]
                               if row["global_tid"] == rank_data["main_tid"]}
     for row in rank_data["cpu_fragments"]:
@@ -642,6 +659,7 @@ def build_timeline(rank_data, records, mode, first, count, world_size=2, global_
                     "Actual CUPTI non-NCCL kernels and memset form compute; NCCL can include peer waits.",
                     "Per-category unions are independently binned at 20 ms; categories may overlap.",
                     "CPU phases are exclusive display fragments of NVTX call scopes, not CPU utilization.",
+                    "CPU thread roles require verified main identity or explicit communication/backward-node NVTX evidence; other workers remain unknown.",
                     "SSD main-thread outer read_batch wrappers are excluded; only nested storage leaves remain.",
                     "Background read services are included only from this rank's process.",
                     "Request kind, bytes and target are populated only for proven same-worker JSONL/NVTX service pairs.",

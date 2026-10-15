@@ -72,6 +72,14 @@ def render_static(data, width=1180):
     left, right = 92, width - 28
     span = data["metadata"]["duration_seconds"]
     plot = Element("g")
+    # Four phase/wait pairs fit inside the existing CPU lane (148..226).
+    # Unknown workers have their own row, above the SSD lane beginning at 230.
+    cpu_rows = {role: 152 + 18 * index
+                for index, role in enumerate(("main", "comm", "autograd", "unknown"))}
+
+    def cpu_role(row):
+        role = row.get("thread_role")
+        return role if role in cpu_rows else "unknown"
 
     def add(tag, text=None, **attrs):
         node = SubElement(plot, tag, {k.replace("_", "-"): str(v) for k, v in attrs.items()})
@@ -82,7 +90,7 @@ def render_static(data, width=1180):
     def x(t):
         return left + max(0, min(span, t)) / span * (right - left)
 
-    def event(start, end, tip, y, height, kind, opacity=.86):
+    def event(start, end, tip, y, height, kind, opacity=.86, *, thread_role=None):
         # Clip geometry, but report the original duration in the annotation.
         node = add("rect", **{
             "class": "event", "data-tooltip": tip,
@@ -91,6 +99,8 @@ def render_static(data, width=1180):
             "rx": 3, "ry": 3, "opacity": opacity,
             "fill": "var(--muted)" if kind == "step" else f"var(--timeline-{kind})",
         })
+        if thread_role is not None:
+            node.set("data-thread-role", thread_role)
         SubElement(node, "title").text = tip
 
     def interval(start, end):
@@ -138,14 +148,15 @@ def render_static(data, width=1180):
             tip += f" · {phase['detail']}"
         if phase["name"] == "Predictive prefetch":
             tip += " · outer call includes planning, prefetch submission and waits"
-        role = phase.get("thread_role", "main")
+        role = cpu_role(phase)
         tip += f" · {role} thread {phase.get('thread_id', phase.get('global_tid', 'unknown'))}"
-        event(phase["start"], phase["end"], tip, {"main": 152, "comm": 176, "autograd": 200}.get(role, 200), 15, kind)
+        event(phase["start"], phase["end"], tip, cpu_rows[role], 10, kind, thread_role=role)
     for wait in data["cpu_waits"]:
+        role = cpu_role(wait)
         event(wait["start"], wait["end"],
               f"CPU blocking API · {wait['name']} · {interval(wait['start'], wait['end'])} · "
-              f"{wait.get('thread_role', 'main')} thread {wait.get('thread_id', wait.get('global_tid', 'unknown'))}",
-              {"main": 168, "comm": 192, "autograd": 216}.get(wait.get("thread_role", "main"), 216), 8, "wait", .65)
+              f"{role} thread {wait.get('thread_id', wait.get('global_tid', 'unknown'))}",
+              cpu_rows[role] + 11, 5, "wait", .65, thread_role=role)
     for read in data["ssd_reads"]:
         details = [f"SSD read service · {interval(read['start'], read['end'])}"]
         if read.get("read_kind"):
