@@ -1,8 +1,8 @@
-"""Disposable real CUDA worker, launched only by the fatal smoke parent.
+"""Disposable real CUDA rank for PC1 Future/worker failure tests.
 
-Test-only wrappers inject failures at real metadata/payload boundaries. No
-CUDA/NCCL cleanup is attempted after abort; the fatal callback still calls the
-production os._exit(86), adding only a small CPU evidence file beforehand.
+Only test wrappers inject errors. All transport is the actual explicit C1/C2
+NCCL path, supervised by the production CPU controller. No damaged CUDA/NCCL
+cleanup is attempted. The parent checks each process's actual exit code 86.
 """
 
 from __future__ import annotations
@@ -13,26 +13,31 @@ import json
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 from types import SimpleNamespace
 
+from tests.pc1_fault_evidence import SCENARIOS
+
 
 def _write_record(path, value):
-    # Files belong to one rank each. A killed/interrupted write fails the
-    # parent JSON check instead of silently reporting a passing fatal exit.
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        os.write(descriptor, json.dumps(value).encode("utf-8"))
+        data = memoryview(json.dumps(value).encode("utf-8"))
+        while data:
+            data = data[os.write(descriptor, data):]
     finally:
         os.close(descriptor)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scenario", required=True, choices=("before_c1_split", "mid_payload_collective"))
+    parser.add_argument("--scenario", required=True, choices=tuple(SCENARIOS))
     parser.add_argument("--result-dir", type=Path, required=True)
     parser.add_argument("--stage-timeout", type=float, default=4.0)
     args = parser.parse_args()
+    if args.stage_timeout <= 0:
+        parser.error("stage-timeout must be positive")
 
     import torch
     import torch.distributed as dist
@@ -44,12 +49,8 @@ def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     os.environ["TIDE_PG_TIMEOUT_SEC"] = "60"
     os.environ["TIDE_PC1_ERROR_TIMEOUT_SEC"] = "30"
-    # Setup/first extension use can be slow; arm the short stage timeout only
-    # after the real camera-layout/projection setup and healthy synchronization.
     os.environ["TIDE_PC1_STAGE_TIMEOUT_SEC"] = "60"
     os.environ["TIDE_PC1_CONTROL_IO_TIMEOUT_SEC"] = "0.25"
-    # Ensure the pre-C1 case reaches the CUDA split materialization rather
-    # than waiting inside Work.wait due to an inherited NCCL debug setting.
     os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "0"
     context = DistributedContext.initialize(SimpleNamespace(
         tide_distributed_mode="gaussian_sharded", tide_forward_pipeline="pc1",
@@ -61,102 +62,205 @@ def main():
         _write_record(args.result_dir / f"rank-{rank}-fatal.json", {
             "rank": rank, "exit_code": PC1_FATAL_EXIT_CODE,
             "time": time.monotonic(), "reason": reason,
+            "native_thread_id": threading.get_native_id(),
         })
         _exit_worker(reason)
 
-    # Keep the actual context/controller/watchdog path; instrument only the
-    # final public callback, so a launcher-issued SIGTERM cannot pass this test.
     controller._exit_callback = fatal_exit
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "submodules" / "gsplat"))
     import gsplat.distributed_pipeline as pc1
 
+    # Native load/ABI checking and real projection setup precede the short
+    # measured deadline. The rank reuses exactly one context-owned worker.
+    worker = context.ensure_pipeline_comm_worker(buffer_count=2)
     values = cuda_smoke_inputs(rank, local_rank, camera_count=1)
     layout = pc1.prepare_batch_camera_layout(
         means=values[0], viewmats=values[5], Ks=values[6], microbatch=1,
     )
     pipeline = pc1.distributed_rasterization_pipeline(
-        compute_stream=torch.cuda.current_stream(),
-        comm_stream=torch.cuda.Stream(priority=-1), buffer_count=2,
+        compute_stream=torch.cuda.current_stream(), comm_worker=worker,
+        buffer_count=2, batch_index=0,
     )
     handle = submit_smoke_projection(pipeline, layout, values, 0)
     torch.cuda.synchronize()
     dist.barrier(group=context.error_group)
     controller.stage_timeout = args.stage_timeout
+    pipeline.deadline = time.monotonic() + args.stage_timeout
     control_store = controller.store
+    worker_stage = threading.local()
+    close_entered = threading.Event()
 
-    def peer_wait(phase):
+    def store_wait(keys):
+        control_store.wait(keys, timedelta(seconds=args.stage_timeout / 2))
+
+    def peer_wait(*, gpu_work=True, **details):
         _write_record(args.result_dir / "peer_wait.json", {
-            "rank": rank, "phase": phase, "time": time.monotonic(),
+            "rank": rank, "phase": SCENARIOS[args.scenario],
+            "time": time.monotonic(), "gpu_work_submitted": gpu_work,
+            "native_thread_id": threading.get_native_id(),
+            **details,
         })
-        control_store.set("test-peer-wait", phase)
+        control_store.set("test-peer-wait", SCENARIOS[args.scenario])
 
-    def inject_failure():
-        # Wait on CPU evidence only, never a damaged NCCL group. Store wait has
-        # its own explicit timeout shorter than the controller stage deadline.
-        control_store.wait(["test-peer-wait"], timedelta(seconds=args.stage_timeout / 2))
-        # Give the peer time to enter the following real CUDA wait. The wait
-        # under test is the unmatched NCCL work, never this scheduling delay.
+    def record_fault():
+        keys = ["test-peer-wait"]
+        if args.scenario == "shutdown_pending":
+            keys += [f"test-shutdown-rank-{value}" for value in range(2)]
+        store_wait(keys)
+        # Peer has already submitted unmatched NCCL/GPU work. This short delay
+        # only lets it reach the public CUDA wait that the watchdog interrupts.
         time.sleep(min(0.1, args.stage_timeout / 10))
         _write_record(args.result_dir / "fault.json", {
             "scenario": args.scenario, "rank": rank, "time": time.monotonic(),
+            "native_thread_id": threading.get_native_id(),
         })
-        pipeline.abort()
-        # Abort must quarantine live tensors, and neither cleanup method may
-        # falsely claim successful drainage of this partially submitted C1.
-        assert any(retained is handle for retained in pipeline._quarantine)
-        for cleanup in (pipeline.drain, pipeline.close):
-            try:
-                cleanup()
-            except RuntimeError as error:
-                assert "aborted" in str(error)
-            else:
-                raise AssertionError("aborted PC1 cleanup unexpectedly succeeded")
-        controller.fail(args.scenario, RuntimeError("injected rank-0 C1 failure"))
 
-    original_metadata = pc1.all_to_all_int32
-    original_payload = pc1.all_to_all_tensor_list
-    payload_calls = 0
+    def inject_failure():
+        record_fault()
+        # Raising on the comm thread exercises its real on_failure callback;
+        # raising on the owner thread exercises controller.operation(). Neither
+        # test wrapper mutates the owner's graph/active-slot dictionaries.
+        raise RuntimeError(f"injected rank-0 {args.scenario} failure")
 
-    def metadata(world_size, splits, device=None):
-        collected = original_metadata(world_size, splits, device=device)
-        if args.scenario == "before_c1_split" and rank == 1:
-            peer_wait("cuda_split_read")
-            # Real pending NCCL metadata, not a sleep or CPU mock. Rank 0
-            # never enters C1, so materializing this CUDA split must wait.
-            collected[0].item()
-            raise AssertionError("missing-peer CUDA split read unexpectedly completed")
-        # For the payload case, prove both ranks completed the metadata before
-        # either can inject failure at the second real payload exchange.
-        for split in collected:
-            if isinstance(split, torch.Tensor):
-                split.item()
-        return collected
+    original_c1 = worker._c1
+    original_c2 = worker._c2
 
-    def payload(*positional, **keywords):
-        nonlocal payload_calls
-        payload_calls += 1
-        if args.scenario == "mid_payload_collective" and payload_calls == 2:
-            if rank == 0:
-                inject_failure()
-            peer_wait("payload_collective")
-            exchanged = original_payload(*positional, **keywords)
-            # On rank 1 the actual second payload collective has no matching
-            # rank-0 submission. This public CUDA wait must be interrupted by
-            # CPU supervision, not NCCL's much longer built-in timeout.
-            torch.cuda.current_stream().synchronize()
-            raise AssertionError("missing-peer payload collective unexpectedly completed")
-        exchanged = original_payload(*positional, **keywords)
-        if args.scenario == "mid_payload_collective" and payload_calls == 1:
-            torch.cuda.current_stream().synchronize()
-        return exchanged
-
-    pc1.all_to_all_int32 = metadata
-    pc1.all_to_all_tensor_list = payload
-    with controller.operation(f"smoke-{args.scenario}"):
-        if rank == 0 and args.scenario == "before_c1_split":
+    def c1(request):
+        worker_stage.stage = "C1"
+        worker_stage.payload_index = 0
+        if args.scenario == "shutdown_pending" and rank == 0:
+            if not close_entered.wait(args.stage_timeout / 2):
+                raise TimeoutError("shutdown did not begin with pending C1")
             inject_failure()
-        handle.start_forward_exchange()
-        raise AssertionError("fatal fault worker unexpectedly returned from C1")
+        return original_c1(request)
+
+    def c2(request):
+        worker_stage.stage = "C2"
+        worker_stage.payload_index = 0
+        return original_c2(request)
+
+    worker._c1, worker._c2 = c1, c2
+    original_collective = dist.all_to_all_single
+
+    def collective(output, data, *positional, **keywords):
+        metadata_target = (
+            getattr(worker_stage, "stage", None) == "C1" and data.dim() == 1
+            and args.scenario in ("before_c1", "c1_metadata", "shutdown_pending")
+        )
+        if metadata_target and rank == 0:
+            inject_failure()
+        work = original_collective(output, data, *positional, **keywords)
+        if metadata_target and rank == 1:
+            # A real async Work exists before recording evidence; retain it in
+            # this blocked frame until the production controller exits the rank.
+            work.wait()
+            peer_wait()
+            torch.cuda.current_stream().synchronize()
+            raise AssertionError("unmatched C1 metadata unexpectedly completed")
+        return work
+
+    dist.all_to_all_single = collective
+    original_payload = pc1._raw_exchange
+
+    def payload(data, send_splits, recv_splits, retained):
+        worker_stage.payload_index += 1
+        stage = getattr(worker_stage, "stage", None)
+        target = ((stage == "C1" and args.scenario == "c1_payload"
+                   and worker_stage.payload_index == 2)
+                  or (stage == "C2" and args.scenario in ("before_c2", "c2_payload")))
+        if target and rank == 0:
+            inject_failure()
+        output = original_payload(data, send_splits, recv_splits, retained)
+        if target and rank == 1:
+            peer_wait()
+            torch.cuda.current_stream().synchronize()
+            raise AssertionError("unmatched payload unexpectedly completed")
+        return output
+
+    pc1._raw_exchange = payload
+    original_enqueue_c2 = worker.enqueue_c2
+
+    def enqueue_c2(request):
+        if args.scenario == "before_c2" and rank == 0:
+            assert handle.intermediate_done is not None
+            inject_failure()
+        return original_enqueue_c2(request)
+
+    worker.enqueue_c2 = enqueue_c2
+    original_backward = torch.autograd.backward
+
+    def backward(*positional, **keywords):
+        if args.scenario != "final_gradient":
+            return original_backward(*positional, **keywords)
+        if rank == 0:
+            inject_failure()
+        # We are inside final_backward's G stage, before invoking its actual
+        # autograd engine. Observe real pending GPU work before any first-use
+        # backward allocation can wait on the delayed stream. This marker does
+        # not claim that a native Gaussian backward kernel has been entered.
+        torch.cuda._sleep(int(args.stage_timeout * 2_000_000_000))
+        pending = torch.cuda.Event()
+        pending.record(torch.cuda.current_stream())
+        if pending.query():
+            raise AssertionError("G-stage delay completed before its entry marker")
+        peer_wait(gpu_pending_at_marker=True, native_backward_entered=False)
+        original_backward(*positional, **keywords)
+        torch.cuda.current_stream().synchronize()
+        raise AssertionError("G-stage fault did not interrupt peer GPU wait")
+
+    torch.autograd.backward = backward
+    original_drain = worker.drain
+
+    def drain(deadline=None):
+        if args.scenario == "shutdown_pending":
+            _write_record(args.result_dir / f"rank-{rank}-shutdown.json", {
+                "rank": rank, "time": time.monotonic(),
+                "pending_future": not handle.c1_future.done(),
+            })
+            control_store.set(f"test-shutdown-rank-{rank}", "entered")
+            close_entered.set()
+        return original_drain(deadline)
+
+    worker.drain = drain
+
+    class BrokenControlStore:
+        def check(self, keys):
+            if control_store.check(["test-break-control"]):
+                raise ConnectionError("injected PC1 control channel failure")
+            return control_store.check(keys)
+
+        def get(self, key):
+            return control_store.get(key)
+
+        def set(self, key, value):
+            return control_store.set(key, value)
+
+    if args.scenario == "control_channel":
+        controller.store = BrokenControlStore()
+
+    with controller.operation(f"fault-{args.scenario}"):
+        if args.scenario == "before_c1" and rank == 0:
+            inject_failure()
+        handle.start_forward_exchange(deadline=pipeline.deadline)
+        if args.scenario == "shutdown_pending":
+            context.close()
+            raise AssertionError("shutdown with pending task unexpectedly succeeded")
+        images, _, _ = handle.wait_and_render(deadline=pipeline.deadline)
+        if args.scenario == "control_channel":
+            if rank == 1:
+                peer_wait(gpu_work=False)
+                store_wait(["test-break-control"])
+            else:
+                record_fault()
+                control_store.set("test-break-control", "disconnected")
+            # The actual watchdog's Store exception, not an explicit fail(),
+            # must trigger each rank's production exit path.
+            threading.Event().wait(args.stage_timeout * 2)
+            raise AssertionError("control-channel failure was not detected")
+        loss = ((images - values[7][:1]) ** 2).mean()
+        handle.intermediate_backward(loss, deadline=pipeline.deadline)
+        handle.final_backward(deadline=pipeline.deadline)
+        raise AssertionError("fatal fault worker unexpectedly completed its window")
 
 
 if __name__ == "__main__":

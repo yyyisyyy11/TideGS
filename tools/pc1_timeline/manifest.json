@@ -1,0 +1,31 @@
+{
+  "purpose": "Reviewable portable snapshot of modified shared scripts; historical experiments untouched",
+  "source_directory": "/Users/mac/Projects/proj_tidegs_isc/experiment/timeline/scripts",
+  "files": [
+    {
+      "file": "analyze_pc1_overlap.py",
+      "source": "/Users/mac/Projects/proj_tidegs_isc/experiment/timeline/scripts/analyze_pc1_overlap.py",
+      "sha256": "3cd8c15f5054bec2acccac3d051352ee709556b6fced49e27df347f236007317"
+    },
+    {
+      "file": "analyze_pc1_submission_order.py",
+      "source": "/Users/mac/Projects/proj_tidegs_isc/experiment/timeline/scripts/analyze_pc1_submission_order.py",
+      "sha256": "4c5afe190d6a4c92535e9133d1a27744900de50b5dfcf10633fa1f9aaaf9a990"
+    },
+    {
+      "file": "extract_timeline_cuda.py",
+      "source": "/Users/mac/Projects/proj_tidegs_isc/experiment/timeline/scripts/extract_timeline_cuda.py",
+      "sha256": "2c264990fc00e2f56459e2a933ed7030cd7ec6a4268ef1291e92ce0bbb3d0f95"
+    },
+    {
+      "file": "extract_superpod_comparison.py",
+      "source": "/Users/mac/Projects/proj_tidegs_isc/experiment/timeline/scripts/extract_superpod_comparison.py",
+      "sha256": "9ec39e896d1e55a446fdef4356aa5466024c86e5fbb01471a16d8e8833004f40"
+    },
+    {
+      "file": "timeline_svg.py",
+      "source": "/Users/mac/Projects/proj_tidegs_isc/experiment/timeline/scripts/timeline_svg.py",
+      "sha256": "07dae07ce8c47790f22779ccea6d8ce039b405acfaf2d513f3629a26702ffa8e"
+    }
+  ]
+}

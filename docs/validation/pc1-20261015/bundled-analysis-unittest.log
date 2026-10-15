@@ -1,0 +1,19 @@
+test_cpu_parent_subtraction_is_per_thread (tests.test_pc1_overlap_analysis.PC1OverlapAnalysisTest.test_cpu_parent_subtraction_is_per_thread) ... ok
+test_crossing_same_thread_scopes_fail (tests.test_pc1_overlap_analysis.PC1OverlapAnalysisTest.test_crossing_same_thread_scopes_fail) ... ok
+test_four_targets_and_intermediate_subset_use_all_threads (tests.test_pc1_overlap_analysis.PC1OverlapAnalysisTest.test_four_targets_and_intermediate_subset_use_all_threads) ... ok
+test_launch_without_captured_kernel_makes_image_target_unassessable (tests.test_pc1_overlap_analysis.PC1OverlapAnalysisTest.test_launch_without_captured_kernel_makes_image_target_unassessable) ... ok
+test_legacy_c2_node_scope_remains_a_valid_communication_boundary (tests.test_pc1_overlap_analysis.PC1OverlapAnalysisTest.test_legacy_c2_node_scope_remains_a_valid_communication_boundary) ... ok
+test_legacy_reports_still_pass_builtin_self_test (tests.test_pc1_overlap_analysis.PC1OverlapAnalysisTest.test_legacy_reports_still_pass_builtin_self_test) ... ok
+test_missing_required_phase_never_reports_a_partial_target_as_complete (tests.test_pc1_overlap_analysis.PC1OverlapAnalysisTest.test_missing_required_phase_never_reports_a_partial_target_as_complete) ... ok
+test_missing_runtime_is_unassessable_and_csv_accepts_both_schemas (tests.test_pc1_overlap_analysis.PC1OverlapAnalysisTest.test_missing_runtime_is_unassessable_and_csv_accepts_both_schemas) ... ok
+test_present_kernel_free_loss_scope_is_valid_without_borrowing_unknown_work (tests.test_pc1_overlap_analysis.PC1OverlapAnalysisTest.test_present_kernel_free_loss_scope_is_valid_without_borrowing_unknown_work) ... ok
+test_same_stream_and_other_process_never_prove_overlap (tests.test_pc1_overlap_analysis.PC1OverlapAnalysisTest.test_same_stream_and_other_process_never_prove_overlap) ... ok
+test_slot_wrap_starts_a_new_window_without_cross_window_targets (tests.test_pc1_overlap_analysis.PC1OverlapAnalysisTest.test_slot_wrap_starts_a_new_window_without_cross_window_targets) ... ok
+test_submission_report_accepts_worker_payload_and_unknown_kernel (tests.test_pc1_overlap_analysis.PC1OverlapAnalysisTest.test_submission_report_accepts_worker_payload_and_unknown_kernel) ... ok
+test_unknown_is_retained_without_nearest_time_attribution (tests.test_pc1_overlap_analysis.PC1OverlapAnalysisTest.test_unknown_is_retained_without_nearest_time_attribution) ... ok
+
+----------------------------------------------------------------------
+Ran 13 tests in 0.057s
+
+OK
+Self-test OK: actual overlap/correlation checks plus ordered four-rank CLI, legacy rank/PID flags, mixed flags and duplicate reports rejected
