@@ -17,6 +17,7 @@ from utils.distributed import DistributedContext
 from utils.tide_trace import tide_range
 
 from .distributed_plan import DistributedBatchPlan
+from .pc1_schedule import PC1_SCHEDULE_VERSION, run_pc1_windows
 from .distributed_metrics import (
     GRAD_METRIC_VALUE_FIELDS,
     cuda_interval_union_ms,
@@ -407,6 +408,12 @@ def _validate_distributed_batch_contract(
         )
         if sample_count <= 0:
             raise ValueError("paper_sophia_hutchinson_samples must be positive")
+        pipeline_mode = str(getattr(args, "tide_forward_pipeline", "off")).lower()
+        if pipeline_mode not in {"off", "pc1"}:
+            raise ValueError("tide_forward_pipeline must be 'off' or 'pc1'")
+        pipeline_buffers = int(getattr(args, "tide_pipeline_buffer_count", 2))
+        if pipeline_mode == "pc1" and pipeline_buffers < 2:
+            raise ValueError("PC1 buffer_count must be at least 2")
         contract = {
             "algorithm": algorithm,
             "iteration": int(plan.iteration),
@@ -416,6 +423,8 @@ def _validate_distributed_batch_contract(
             "s2_count": len(s2_ids),
             "microbatch": microbatch,
             "sample_count": sample_count,
+            "pipeline_mode": pipeline_mode,
+            "pipeline_buffer_count": pipeline_buffers if pipeline_mode == "pc1" else None,
             "global_s1": tuple(int(value) for value in plan.global_s1_camera_ids),
             "global_s2": tuple(int(value) for value in plan.global_s2_camera_ids),
         }
@@ -444,7 +453,7 @@ def _validate_distributed_batch_contract(
     reference = statuses[0]["contract"]
     if any(status["contract"] != reference for status in statuses[1:]):
         raise RuntimeError(
-            "Distributed ranks disagree on S1/S2 counts or optimizer schedule: "
+            "Distributed ranks disagree on S1/S2 counts, optimizer or pipeline schedule: "
             f"{[status['contract'] for status in statuses]}"
         )
     return (
@@ -708,15 +717,29 @@ def train_distributed_tide_batch(
             return function(*positional, **keywords)
 
     if pipeline_mode == "pc1":
-        pc1_nccl_stream = torch.cuda.Stream(
-            device=probe_device,
-            priority=int(getattr(args, "tide_nccl_stream_priority", -1)),
+        existing_worker = getattr(context, "pipeline_comm_worker", None)
+        if existing_worker is None:
+            pc1_nccl_stream = torch.cuda.Stream(
+                device=probe_device,
+                priority=int(getattr(args, "tide_nccl_stream_priority", -1)),
+            )
+        else:
+            pc1_nccl_stream = existing_worker.comm_stream
+        pc1_worker = context.ensure_pipeline_comm_worker(
+            buffer_count=int(getattr(args, "tide_pipeline_buffer_count", 2)),
+            comm_stream=pc1_nccl_stream,
+            require_tile_mask=(
+                str(getattr(args, "tide_tile_contribution_mode", "off")).lower() != "off"
+            ),
         )
+        pc1_nccl_stream = pc1_worker.comm_stream
         pc1_pipeline = distributed_rasterization_pipeline(
             compute_stream=torch.cuda.current_stream(leaves["xyz"].device),
             comm_stream=pc1_nccl_stream,
             buffer_count=int(getattr(args, "tide_pipeline_buffer_count", 2)),
             capture_timeline=timeline_enabled,
+            comm_worker=pc1_worker,
+            batch_index=iteration,
         )
         layout_error = None
         batch_viewmats = None
@@ -1052,7 +1075,7 @@ def train_distributed_tide_batch(
             )
 
     if pipeline_mode == "pc1":
-        def _pc1_submit(microbatch_index: int, cameras):
+        def _pc1_submit(microbatch_index: int, cameras, *, deadline):
             if pc1_layout is None:
                 raise RuntimeError("PC1 batch camera layout is not initialized")
             render_inputs = _transformed_leaves(gaussians, leaves)
@@ -1072,6 +1095,7 @@ def train_distributed_tide_batch(
             )
             handle = pc1_pipeline.submit_projection(
                 microbatch_index=microbatch_index,
+                deadline=deadline,
                 means=leaves["xyz"],
                 quats=rotations,
                 scales=scales,
@@ -1097,182 +1121,135 @@ def train_distributed_tide_batch(
                 N_world=pc1_layout.N_world,
                 C_world=pc1_layout.microbatch_C_world,
             )
-            return handle, render_inputs
+            return handle
 
-        pc1_current = None
-        pc1_current_inputs = None
-        pc1_error = None
-        try:
-            first_cameras = batched_cameras[:microbatch]
-            pc1_current, pc1_current_inputs = _pc1_run(
-                "PC1 initial projection", _pc1_submit, 0, first_cameras
+        # Compile the actual Loss forward/backward for each camera shape on
+        # independent leaves before measured PC1 stages. Gaussian .grad and
+        # optimizer state are untouched. Subsequent batches reuse this cache.
+        warmup_keys = getattr(gaussians, "_tide_pc1_loss_warmup_keys", set())
+        with pc1_error_controller.operation("PC1 Loss shape warmup"):
+            for camera in batched_cameras:
+                target = camera.original_image
+                key = (
+                    image_height, image_width, str(probe_device),
+                    leaves["xyz"].dtype, tuple(target.shape), target.dtype,
+                    tuple(target.stride()),
+                )
+                if key in warmup_keys:
+                    continue
+                warmup_image = torch.zeros(
+                    (3, image_height, image_width), device=probe_device,
+                    dtype=leaves["xyz"].dtype, requires_grad=True,
+                )
+                warmup_loss = torch_compiled_loss(warmup_image, target)
+                torch.autograd.grad(warmup_loss, warmup_image)
+                warmup_done = torch.cuda.Event()
+                warmup_done.record(pc1_pipeline.compute_stream)
+                warmup_done.synchronize()
+                warmup_keys.add(key)
+                del warmup_image, warmup_loss, warmup_done
+        gaussians._tide_pc1_loss_warmup_keys = warmup_keys
+        if timeline_enabled:
+            torch.cuda.reset_peak_memory_stats()
+
+        def _project_window_item(item, *, deadline):
+            microbatch_index, cameras = item
+            handle = _pc1_submit(microbatch_index, cameras, deadline=deadline)
+            handle.start_forward_exchange(deadline=deadline)
+            return handle
+
+        def _image_window_item(item, handle, *, deadline):
+            microbatch_index, cameras = item
+            write_memory_point(
+                phase="before_forward", microbatch_index=microbatch_index,
+                cameras=cameras,
             )
+            forward_submit_ns = time.perf_counter_ns() if timeline_enabled else None
+            forward_start = handle.state["projection_start"]
+            rendered, _, meta = handle.wait_and_render(deadline=deadline)
+            forward_ranges.append(
+                (forward_start, handle.render_done, forward_submit_ns, cameras)
+            )
+            projection_events = meta.get(PROJECTION_TIMING_FIX)
+            if projection_events is not None:
+                projection_event_pairs.append(projection_events)
+            if grad_zero_sample_due:
+                _mark_projection_cull_survivors(
+                    projection_cull_survivor_mask, meta, owner_active_rows,
+                )
+                if tile_contribution_mode == "off":
+                    tile_survivor_mask.copy_(projection_cull_survivor_mask)
+                else:
+                    _merge_owner_tile_survivors(
+                        tile_survivor_mask, tile_mask_counts, meta,
+                        owner_active_rows=owner_active_rows,
+                        participation_rows=participation_rows,
+                        uses_sentinel=uses_sentinel,
+                    )
+            loss_start = torch.cuda.Event(enable_timing=True)
+            loss_end = torch.cuda.Event(enable_timing=True)
+            loss_submit_ns = time.perf_counter_ns() if timeline_enabled else None
+            loss_start.record(pc1_pipeline.compute_stream)
+            with tide_range(
+                f"Tide:S1:MB{microbatch_index}:Loss"
+                f"|rank={context.rank},batch={iteration},slot={handle.slot},"
+                f"tid={threading.get_native_id()},schedule={PC1_SCHEDULE_VERSION}"
+            ):
+                micro_losses = [
+                    torch_compiled_loss(
+                        rendered[local_index].permute(2, 0, 1).contiguous(),
+                        camera.original_image,
+                    )
+                    for local_index, camera in enumerate(cameras)
+                ]
+            loss_end.record(pc1_pipeline.compute_stream)
+            loss_ranges.append((loss_start, loss_end, loss_submit_ns, cameras))
+            detached_losses.extend(loss.detach() for loss in micro_losses)
+            write_memory_point(
+                phase="after_forward", microbatch_index=microbatch_index,
+                cameras=cameras,
+            )
+            # This differentiation stops at independent C1 image leaves. Only
+            # G below can accumulate into the shared Gaussian parameter leaves.
+            handle.intermediate_backward(
+                torch.stack(micro_losses).sum(), deadline=deadline,
+            )
+
+        def _final_window_item(item, handle, *, deadline):
+            microbatch_index, cameras = item
+            backward_end = handle.final_backward(deadline=deadline)
+            record = handle.snapshot()
+            backward_ranges.append((
+                record["intermediate_start"], backward_end,
+                record.get("intermediate_submit_ns"), cameras,
+            ))
+            write_memory_point(
+                phase="after_backward", microbatch_index=microbatch_index,
+                cameras=cameras,
+            )
+            # Timing snapshots contain CUDA events and scalars, never tensors
+            # from the completed projection or image computation graphs.
+            pc1_records.append((record, cameras, microbatch_index))
+
+        try:
+            with torch.cuda.stream(pc1_pipeline.compute_stream):
+                run_pc1_windows(
+                    [
+                        (index, batched_cameras[start:start + microbatch])
+                        for index, start in enumerate(
+                            range(0, len(batched_cameras), microbatch)
+                        )
+                    ],
+                    buffer_count=pc1_pipeline.buffer_count,
+                    controller=pc1_error_controller,
+                    project=_project_window_item,
+                    image_backward=_image_window_item,
+                    final_backward=_final_window_item,
+                )
         except BaseException as error:
-            pc1_error = error
             pc1_pipeline.abort()
-        _synchronize_rank_errors(
-            context,
-            phase="S1 pc1 initial projection",
-            error=pc1_error,
-            group=pc1_error_group,
-        )
-
-        for microbatch_index, start in enumerate(
-            range(0, len(batched_cameras), microbatch)
-        ):
-            # Guard the entire microbatch, including event recording, memory
-            # probes, image packing and error checkpoints between CUDA calls.
-            with pc1_error_controller.operation(f"PC1 MB{microbatch_index}"):
-                cameras = batched_cameras[start:start + microbatch]
-                local_error = None
-                next_handle = None
-                next_inputs = None
-                submit_error = None
-                try:
-                    _pc1_run(
-                        f"PC1 MB{microbatch_index} C1", pc1_current.start_forward_exchange
-                    )
-                    next_start = start + microbatch
-                    if next_start < len(batched_cameras):
-                        next_cameras = batched_cameras[next_start:next_start + microbatch]
-                        next_handle, next_inputs = _pc1_run(
-                            f"PC1 MB{microbatch_index + 1} Projection", _pc1_submit,
-                            microbatch_index + 1, next_cameras,
-                        )
-                except BaseException as error:
-                    submit_error = error
-                    pc1_pipeline.abort()
-
-                render_inputs = pc1_current_inputs
-                scales, rotations, opacities, sh_coefficients = render_inputs
-                forward_submit_ns = time.perf_counter_ns() if timeline_enabled else None
-                try:
-                    write_memory_point(
-                        phase="before_forward",
-                        microbatch_index=microbatch_index,
-                        cameras=cameras,
-                    )
-                    forward_start = pc1_current.state["projection_start"]
-                    rendered, _, meta = _pc1_run(
-                        f"PC1 MB{microbatch_index} Render", pc1_current.wait_and_render
-                    )
-                    forward_end = pc1_current.render_done
-                    forward_ranges.append(
-                        (forward_start, forward_end, forward_submit_ns, cameras)
-                    )
-                    projection_events = meta.get(PROJECTION_TIMING_FIX)
-                    if projection_events is not None:
-                        projection_event_pairs.append(projection_events)
-                    if grad_zero_sample_due:
-                        _mark_projection_cull_survivors(
-                            projection_cull_survivor_mask,
-                            meta,
-                            owner_active_rows,
-                        )
-                        if tile_contribution_mode == "off":
-                            tile_survivor_mask.copy_(projection_cull_survivor_mask)
-                        else:
-                            _merge_owner_tile_survivors(
-                                tile_survivor_mask,
-                                tile_mask_counts,
-                                meta,
-                                owner_active_rows=owner_active_rows,
-                                participation_rows=participation_rows,
-                                uses_sentinel=uses_sentinel,
-                            )
-                    loss_start = torch.cuda.Event(enable_timing=True)
-                    loss_end = torch.cuda.Event(enable_timing=True)
-                    loss_start.record()
-                    micro_losses = []
-                    with tide_range(f"Tide:S1:MB{microbatch_index}:Loss"):
-                        for local_index, camera in enumerate(cameras):
-                            image = rendered[local_index].permute(2, 0, 1).contiguous()
-                            micro_losses.append(_pc1_run(
-                                f"PC1 MB{microbatch_index} Loss", torch_compiled_loss,
-                                image, camera.original_image,
-                            ))
-                    loss_end.record()
-                    loss_ranges.append(
-                        (loss_start, loss_end, forward_submit_ns, cameras)
-                    )
-                    detached_losses.extend(loss.detach() for loss in micro_losses)
-                    write_memory_point(
-                        phase="after_forward",
-                        microbatch_index=microbatch_index,
-                        cameras=cameras,
-                    )
-                except BaseException as error:
-                    local_error = error
-                    if pc1_error_controller is not None:
-                        pc1_error_controller.fail(f"PC1 MB{microbatch_index} forward", error)
-                if local_error is None and submit_error is not None:
-                    local_error = submit_error
-                if local_error is not None:
-                    pc1_pipeline.abort()
-                _synchronize_rank_errors(
-                    context,
-                    phase=f"S1 microbatch {microbatch_index} forward",
-                    error=local_error,
-                    group=pc1_error_group,
-                )
-
-                local_error = None
-                try:
-                    backward_submit_ns = time.perf_counter_ns() if timeline_enabled else None
-                    backward_start = torch.cuda.Event(enable_timing=True)
-                    backward_end = torch.cuda.Event(enable_timing=True)
-                    backward_start.record()
-                    if torch.cuda.is_available():
-                        torch.cuda.nvtx.range_push(
-                            f"Tide:S1:MB{microbatch_index}:Backward"
-                        )
-                    try:
-                        def _backward():
-                            loss = torch.stack(micro_losses).sum()
-                            pc1_current.trace_backward(loss)
-                            loss.backward()
-
-                        _pc1_run(f"PC1 MB{microbatch_index} Backward", _backward)
-                    finally:
-                        if torch.cuda.is_available():
-                            torch.cuda.nvtx.range_pop()
-                    backward_end.record()
-                    pc1_current.mark_backward_done(backward_end)
-                    backward_ranges.append(
-                        (backward_start, backward_end, backward_submit_ns, cameras)
-                    )
-                    write_memory_point(
-                        phase="after_backward",
-                        microbatch_index=microbatch_index,
-                        cameras=cameras,
-                    )
-                except BaseException as error:
-                    local_error = error
-                    if pc1_error_controller is not None:
-                        pc1_error_controller.fail(f"PC1 MB{microbatch_index} backward", error)
-                    pc1_pipeline.abort()
-                _synchronize_rank_errors(
-                    context,
-                    phase=f"S1 microbatch {microbatch_index} backward",
-                    error=local_error,
-                    group=pc1_error_group,
-                )
-                # Keep only CUDA events and host timestamps.  Retaining the full
-                # handle here would retain every packed projection/render tensor
-                # until the end of the batch and can exhaust GPU memory.
-                pc1_records.append((pc1_current.snapshot(), cameras, microbatch_index))
-                pc1_current = next_handle
-                pc1_current_inputs = next_inputs
-                del (
-                    rendered,
-                    meta,
-                    image,
-                    micro_losses,
-                    scales,
-                    rotations,
-                    opacities,
-                    sh_coefficients,
-                )
+            pc1_error_controller.fail("PC1 fixed-window execution", error)
+            raise
 
         drain_error = None
         try:
@@ -1678,7 +1655,13 @@ def train_distributed_tide_batch(
                         min(c1_ms, p_offset + p_ms) - max(0.0, p_offset),
                     )
         gpu_anchor = pc1_records[0][0]["projection_start"]
+        explicit_stages = {
+            "IntermediateGrad": ("intermediate_start", "intermediate_done"),
+            "C2": ("c2_payload_start", "c2_payload_end"),
+            "FinalGrad": ("final_start", "backward_done"),
+        }
         for stage in backward_stage_ms:
+            explicit = explicit_stages.get(stage)
             backward_stage_ms[stage] = cuda_interval_union_ms(
                 gpu_anchor,
                 [
@@ -1686,6 +1669,12 @@ def train_distributed_tide_batch(
                     for record, _, _ in pc1_records
                     for span in record.get("backward_trace", [])
                     if span["stage"] == stage and span["complete"]
+                ] + [
+                    (record[explicit[0]], record[explicit[1]])
+                    for record, _, _ in pc1_records
+                    if explicit is not None
+                    and record.get(explicit[0]) is not None
+                    and record.get(explicit[1]) is not None
                 ],
             )
         # Forward request intervals overlap in PC1. Adding them (and then
@@ -1744,6 +1733,20 @@ def train_distributed_tide_batch(
                     microbatch_index=microbatch_index,
                     microbatch_count=microbatch_count,
                     camera_uids=camera_uids(cameras),
+                    thread_id=threading.get_native_id(),
+                    thread_role="main",
+                    pipeline_mode=pipeline_mode,
+                    batch_index=iteration,
+                    schedule_version=(PC1_SCHEDULE_VERSION if pipeline_mode == "pc1" else "off"),
+                    pipeline_buffer_slot=(
+                        microbatch_index % pc1_pipeline.buffer_count
+                        if pipeline_mode == "pc1" else None
+                    ),
+                    slot=(
+                        microbatch_index % pc1_pipeline.buffer_count
+                        if pipeline_mode == "pc1" else None
+                    ),
+                    communication_sequence=-1,
                 )
 
         def _write_cuda_event(
@@ -1777,11 +1780,20 @@ def train_distributed_tide_batch(
                     ("C1:Metadata", "nccl", record.get("metadata_start"), record.get("metadata_end")),
                     ("C1:Payload", "nccl", record.get("payload_start"), record.get("payload_end")),
                     ("Render", "gpu", record.get("render_start"), record.get("render_done")),
+                    ("IntermediateGrad", "gpu", record.get("intermediate_start"), record.get("intermediate_done")),
+                    ("C2:Wait", "nccl", record.get("c2_wait_start"), record.get("c2_wait_end")),
+                    ("C2:Payload", "nccl", record.get("c2_payload_start"), record.get("c2_payload_end")),
+                    ("FinalGrad", "gpu", record.get("final_start"), record.get("backward_done")),
                 )
                 for suffix, lane, start_event, end_event in spans:
                     span = _event_span(start_event, end_event)
                     if span is None:
                         continue
+                    comm_stage = suffix.split(":", 1)[0]
+                    worker_span = next((
+                        value for value in record.get("cpu_trace", [])
+                        if value.get("name") == f"{comm_stage}:Worker"
+                    ), {})
                     metrics_writer.write_timeline_event(
                         name=f"Tide:S1:MB{microbatch_index}:{suffix}",
                         lane=lane,
@@ -1793,9 +1805,31 @@ def train_distributed_tide_batch(
                         microbatch_count=microbatch_count,
                         pipeline_buffer_slot=int(record["pipeline_buffer_slot"]),
                         pipeline_mode=pipeline_mode,
+                        batch_index=iteration,
+                        slot=int(record["pipeline_buffer_slot"]),
+                        schedule_version=PC1_SCHEDULE_VERSION,
+                        thread_id=worker_span.get("thread_id", threading.get_native_id()),
+                        thread_role="comm" if worker_span else "main",
+                        stream_id=int((pc1_nccl_stream if worker_span
+                                       else pc1_pipeline.compute_stream).cuda_stream),
+                        communication_sequence=worker_span.get("communication_sequence", -1),
                         camera_uids=camera_uids(cameras),
                         stage=suffix,
                         scope="stage",
+                    )
+                for cpu_span in record.get("cpu_trace", []):
+                    fields = dict(cpu_span)
+                    name = fields.pop("name")
+                    start_ns = fields.pop("start_ns")
+                    end_ns = fields.pop("end_ns")
+                    fields.update(
+                        microbatch_index=microbatch_index,
+                        pipeline_buffer_slot=int(record["pipeline_buffer_slot"]),
+                        schedule_version=PC1_SCHEDULE_VERSION,
+                    )
+                    metrics_writer.write_timeline_event(
+                        name=f"Tide:S1:MB{microbatch_index}:{name}", lane="cpu",
+                        start_ns=start_ns, end_ns=end_ns, iteration=iteration, **fields,
                     )
                 for node_index, node_span in enumerate(record.get("backward_trace", [])):
                     if not node_span["complete"]:
@@ -1814,6 +1848,14 @@ def train_distributed_tide_batch(
                         node_name=node_span["node_name"],
                         stream_id=node_span["stream_id"],
                         timing_kind=node_span["timing_kind"],
+                        thread_id=node_span.get("thread_id"),
+                        thread_role=node_span.get("thread_role", "autograd"),
+                        pipeline_mode=pipeline_mode,
+                        batch_index=iteration,
+                        slot=int(record["pipeline_buffer_slot"]),
+                        pipeline_buffer_slot=int(record["pipeline_buffer_slot"]),
+                        communication_sequence=-1,
+                        schedule_version=PC1_SCHEDULE_VERSION,
                         detail=("includes_collective_readiness_wait"
                                 if node_span["stage"] == "C2" else None),
                     )

@@ -182,7 +182,7 @@ class PC1ErrorController:
                 return
             self._stop.wait(self.poll_interval)
 
-    def close(self) -> None:
+    def close(self, deadline: float | None = None) -> None:
         """Stop the healthy watchdog before process-group teardown."""
         with self._lock:
             if self._closed:
@@ -193,7 +193,11 @@ class PC1ErrorController:
                 raise RuntimeError("cannot close PC1 error controller during an operation")
             self._closed = True
         self._stop.set()
-        self._watchdog.join()
+        if deadline is None:
+            deadline = time.monotonic() + self.stage_timeout
+        self._watchdog.join(timeout=max(0.0, deadline - time.monotonic()))
+        if self._watchdog.is_alive():
+            self.fail("watchdog shutdown", TimeoutError("PC1 watchdog shutdown deadline exceeded"))
 
     def release_store(self) -> None:
         """Release only after every rank has stopped its healthy watchdog."""

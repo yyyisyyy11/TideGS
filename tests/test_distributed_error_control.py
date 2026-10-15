@@ -1,13 +1,15 @@
 """CPU fault injection: workers exit even while their main thread is blocked."""
 
 import ast
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 import multiprocessing as mp
 import os
 from pathlib import Path
 import subprocess
 import sys
 import threading
+from types import SimpleNamespace
 import unittest
 import weakref
 
@@ -278,11 +280,16 @@ class PipelineAbortLifecycleTest(unittest.TestCase):
             module="__future__", names=[ast.alias(name="annotations")], level=0,
         ), *classes], type_ignores=[])
         ast.fix_missing_locations(module)
-        namespace = {"dataclass": dataclass}
+        namespace = {"dataclass": dataclass, "field": field,
+                     "contextmanager": contextmanager, "threading": threading}
         exec(compile(module, str(path), "exec"), namespace)
         pipeline = namespace["DistributedRasterizationPipeline"].__new__(namespace["DistributedRasterizationPipeline"])
         pipeline._aborted = pipeline._drained = pipeline._closed = False
         pipeline._quarantine = []
+        pipeline._retired = []
+        pipeline._owner_thread = threading.get_ident()
+        aborts = []
+        pipeline.comm_worker = SimpleNamespace(abort=aborts.append)
         handle = namespace["DistributedRasterizationHandle"](pipeline, 0, 0)
         retained = weakref.ref(handle)
         pipeline._active = {0: handle}
@@ -291,6 +298,7 @@ class PipelineAbortLifecycleTest(unittest.TestCase):
         self.assertFalse(pipeline._drained)
         self.assertEqual(pipeline._active, {})
         self.assertEqual(pipeline._quarantine, [handle])
+        self.assertEqual(len(aborts), 1)
         for operation in (pipeline.drain, pipeline.close, pipeline.submit_projection,
                           handle.start_forward_exchange, handle.wait_and_render,
                           lambda: handle.mark_backward_done(None)):

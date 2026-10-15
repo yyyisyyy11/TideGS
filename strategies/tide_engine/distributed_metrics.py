@@ -887,12 +887,30 @@ class LegacyCudaMetricsCollector:
                     )
             row[field] = total_ms
 
-        row["train_ms"] = (
-            float(row.get("gsplat_forward_ms", 0.0))
-            + float(row.get("loss_ms", 0.0))
-            + float(row.get("backward_ms", 0.0))
-            + float(row.get("optimizer_ms", 0.0))
-        )
+        if row.get("pipeline_mode") == "pc1":
+            # PC1's forward/backward values are request latencies and overlap.
+            # Preserve the engine's resolved union when a row passes through
+            # this deferred writer. Otherwise resolve the same union directly.
+            if "train_ms" not in row:
+                intervals = [
+                    (spec["start"], spec["end"])
+                    for field in (
+                        "gsplat_forward_ms", "loss_ms", "backward_ms",
+                        "optimizer_ms", "curvature_forward_ms", "curvature_vjp_ms",
+                    )
+                    for spec in cuda_ranges.get(field, [])
+                ]
+                row["train_ms"] = (
+                    cuda_interval_union_ms(intervals[0][0], intervals)
+                    if intervals else 0.0
+                )
+        else:
+            row["train_ms"] = (
+                float(row.get("gsplat_forward_ms", 0.0))
+                + float(row.get("loss_ms", 0.0))
+                + float(row.get("backward_ms", 0.0))
+                + float(row.get("optimizer_ms", 0.0))
+            )
         self.writer.write_batch(row)
 
 
