@@ -180,7 +180,8 @@ except ImportError:
             extra_cuda_cflags += ["-use_fast_math"]
         sources = (
             list(glob.glob(os.path.join(PATH, "csrc/*.cu")))
-            + list(glob.glob(os.path.join(PATH, "csrc/*.cpp")))
+            + [source for source in glob.glob(os.path.join(PATH, "csrc/*.cpp"))
+               if os.path.basename(source) != "ext.cpp"]
             + [os.path.join(PATH, "ext.cpp")]
         )
 
