@@ -1,17 +1,16 @@
-"""Two-stage distributed rasterization for the TideGS P/C1 prototype.
+"""Explicit C1/C2 transport and segmented backward for the PC1 pipeline.
 
-The public :func:`gsplat.rasterization` entry point remains synchronous.  This
-module exposes a deliberately small packed, distributed path used by TideGS:
-projection and feature preparation run on the compute stream, while the first
-packed Gaussian exchange runs on a separate NCCL stream.  The implementation
-shares the same projection, all-to-all layout, and rasterization kernels as
-gsplat 1.5.3 so that the returned tensors remain connected to autograd.
+Only the main thread owns graphs, handles and slots.  The persistent worker
+receives detached immutable packets and publishes results plus GPU events.
+The public synchronous rasterization/off path is independent of this module.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 import math
+import threading
 import time
 from typing import Dict, Optional
 
@@ -20,8 +19,11 @@ import torch.distributed
 from torch import Tensor
 
 from .cuda._wrapper import fully_fused_projection, isect_offset_encode, isect_tiles, rasterize_to_pixels, spherical_harmonics
-from .distributed import all_gather_int32, all_gather_tensor_list, all_to_all_int32, all_to_all_tensor_list
+from .distributed import all_gather_int32, all_gather_tensor_list
 from .distributed_trace import MicrobatchTrace
+from ._pipeline_worker import (
+    CommunicationIdentity, FIFOCommWorker, remaining, wait_event, wait_future,
+)
 
 
 def _nvtx_push(name: str) -> None:
@@ -32,6 +34,15 @@ def _nvtx_push(name: str) -> None:
 def _nvtx_pop() -> None:
     if torch.cuda.is_available():
         torch.cuda.nvtx.range_pop()
+
+
+@contextmanager
+def _nvtx_range(name):
+    _nvtx_push(name)
+    try:
+        yield
+    finally:
+        _nvtx_pop()
 
 
 def _record_stream_recursive(value, stream, seen=None) -> None:
@@ -55,6 +66,12 @@ def _record_stream_recursive(value, stream, seen=None) -> None:
 
 def _cuda_event() -> torch.cuda.Event:
     return torch.cuda.Event(enable_timing=True)
+
+
+def _mask_radii(radii, keep):
+    """Apply a packed row mask to scalar or modern per-axis radii."""
+    mask = keep.unsqueeze(-1) if radii.ndim == keep.ndim + 1 else keep
+    return torch.where(mask, radii, torch.zeros_like(radii))
 
 
 @dataclass
@@ -283,7 +300,7 @@ def _projection_prepare(
             ]
         )
         if tile_mode == "apply":
-            radii = torch.where(keep, radii, torch.zeros_like(radii))
+            radii = _mask_radii(radii, keep)
 
     if getattr(torch, "_tide_gsplat_grad_zero_metrics", False):
         owner_projection = torch.zeros((N,), dtype=torch.bool, device=device)
@@ -346,104 +363,252 @@ def _projection_prepare(
     }
 
 
-def _forward_exchange(
-    state: Dict[str, object], stream: torch.cuda.Stream, microbatch_index: int
-) -> None:
-    """Run C1 on ``stream`` and mutate the prepared state in place."""
+FLOAT_ATTRIBUTES = ("means2d", "depths", "conics", "opacities", "colors")
 
-    world_size = torch.distributed.get_world_size()
-    world_rank = torch.distributed.get_rank()
-    device = state["means"].device
-    cnts = state["cnts"]
-    camera_ids = state["camera_ids"]
-    gaussian_ids = state["gaussian_ids"]
-    radii = state["radii"]
-    means2d = state["means2d"]
-    depths = state["depths"]
-    conics = state["conics"]
-    opacities = state["opacities"]
-    colors = state["colors"]
-    C_world = state["C_world"]
-    N_world = state["N_world"]
 
-    metadata_start = _cuda_event()
-    metadata_end = _cuda_event()
-    payload_start = _cuda_event()
-    payload_end = _cuda_event()
-    _nvtx_push(f"Tide:S1:MB{microbatch_index}:C1:Metadata")
-    metadata_start.record(stream)
-    collected_splits = all_to_all_int32(world_size, cnts, device=device)
-    metadata_end.record(stream)
-    _nvtx_pop()
-    _nvtx_push(f"Tide:S1:MB{microbatch_index}:C1:Payload")
-    payload_start.record(stream)
-    (radii,) = all_to_all_tensor_list(
-        world_size, [radii], cnts, output_splits=collected_splits
-    )
-    means2d, depths, conics, opacities, colors = all_to_all_tensor_list(
-        world_size,
-        [means2d, depths, conics, opacities, colors],
-        cnts,
-        output_splits=collected_splits,
-        trace=state.get("trace"),
-    )
-    offsets = torch.tensor(
-        [0] + C_world[:-1], device=camera_ids.device, dtype=camera_ids.dtype
-    )
-    offsets = torch.cumsum(offsets, dim=0)
-    offsets = offsets.repeat_interleave(torch.stack(cnts))
-    camera_ids = camera_ids - offsets
-    offsets = torch.tensor(
-        [0] + N_world[:-1], device=gaussian_ids.device, dtype=gaussian_ids.dtype
-    )
-    offsets = torch.cumsum(offsets, dim=0)
-    offsets = offsets.repeat_interleave(torch.stack(cnts))
-    gaussian_ids = gaussian_ids + offsets
-    camera_ids, gaussian_ids = all_to_all_tensor_list(
-        world_size,
-        [camera_ids, gaussian_ids],
-        cnts,
-        output_splits=collected_splits,
-    )
-    payload_end.record(stream)
-    _nvtx_pop()
-    state.update(
-        {
-            "radii": radii,
-            "means2d": means2d,
-            "depths": depths,
-            "conics": conics,
-            "opacities": opacities,
-            "colors": colors,
-            "camera_ids": camera_ids,
-            "gaussian_ids": gaussian_ids,
-            "metadata_start": metadata_start,
-            "metadata_end": metadata_end,
-            "payload_start": payload_start,
-            "payload_end": payload_end,
-        }
-    )
-    C_local = int(C_world[world_rank])
-    state["C_local"] = C_local
-    state["meta"]["camera_ids"] = camera_ids
-    state["meta"]["gaussian_ids"] = gaussian_ids
-    state["meta"]["radii"] = radii
-    state["meta"]["means2d"] = means2d
-    state["meta"]["depths"] = depths
-    state["meta"]["conics"] = conics
-    state["meta"]["opacities"] = opacities
-    state["meta"]["n_cameras"] = C_local
-    if getattr(torch, "_tide_partial_grad_metrics", False) and getattr(
-        torch, "_tide_partial_grad_metrics_sample", True
-    ):
-        state["meta"]["_tide_partial_gradient_context"] = torch._tide_begin_partial_gradient_metrics(
-            means2d=means2d,
-            depths=depths,
-            conics=conics,
-            opacity=opacities,
-            features=colors,
-            valid_mask=(radii > 0),
-        )
+@dataclass(frozen=True)
+class FloatColumn:
+    name: str
+    shape: tuple[int, ...]
+    width: int
+
+
+@dataclass(frozen=True)
+class ExchangeLayout:
+    send_splits: tuple[int, ...]
+    recv_splits: tuple[int, ...]
+    columns: tuple[FloatColumn, ...]
+
+
+@dataclass(frozen=True)
+class C1Request:
+    identity: CommunicationIdentity
+    deadline: float
+    projection_done: object
+    floats: tuple[Tensor, ...]
+    radii: Tensor
+    camera_ids: Tensor
+    gaussian_ids: Tensor
+    counts: tuple[Tensor, ...]
+    camera_counts: tuple[int, ...]
+    gaussian_counts: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class C1Result:
+    identity: CommunicationIdentity
+    layout: ExchangeLayout
+    floats: tuple[Tensor, ...]
+    radii: Tensor
+    camera_ids: Tensor
+    gaussian_ids: Tensor
+    done_event: object
+    retained: tuple[object, ...]
+    events: tuple[tuple[str, object], ...]
+    worker_begin_ns: int
+    worker_end_ns: int
+    thread_id: int
+    native_thread_id: int
+
+
+@dataclass(frozen=True)
+class C2Request:
+    identity: CommunicationIdentity
+    deadline: float
+    intermediate_done: object
+    gradients: tuple[Tensor, ...]
+    layout: ExchangeLayout
+
+
+@dataclass(frozen=True)
+class C2Result:
+    identity: CommunicationIdentity
+    layout: ExchangeLayout
+    gradients: tuple[Tensor, ...]
+    done_event: object
+    retained: tuple[object, ...]
+    events: tuple[tuple[str, object], ...]
+    worker_begin_ns: int
+    worker_end_ns: int
+    thread_id: int
+    native_thread_id: int
+
+
+def _columns(tensors) -> tuple[FloatColumn, ...]:
+    return tuple(FloatColumn(name, tuple(tensor.shape[1:]),
+                             math.prod(tensor.shape[1:]))
+                 for name, tensor in zip(FLOAT_ATTRIBUTES, tensors))
+
+
+def _pack_floats(tensors, columns):
+    rows = int(tensors[0].shape[0])
+    dtype = tensors[0].dtype
+    for tensor in tensors:
+        if int(tensor.shape[0]) != rows or tensor.dtype != dtype:
+            raise ValueError("PC1 float payload must have a common row count and dtype")
+    # Explicit widths also support packed zero-row projections.
+    return torch.cat([tensor.reshape(rows, column.width)
+                      for tensor, column in zip(tensors, columns)], dim=1).contiguous()
+
+
+def _unpack_floats(packed, columns):
+    rows = int(packed.shape[0])
+    return tuple(piece.reshape(rows, *column.shape)
+                 for piece, column in zip(packed.split(
+                     [column.width for column in columns], dim=1), columns))
+
+
+def _raw_exchange(data, send_splits, recv_splits, retained):
+    """Submit non-autograd NCCL, establish readiness on the caller stream."""
+    output = data.new_empty((sum(recv_splits), *data.shape[1:]))
+    retained.extend((data, output))
+    if len(send_splits) == 1:
+        output.copy_(data)
+    else:
+        work = torch.distributed.all_to_all_single(
+            output, data, output_split_sizes=list(recv_splits),
+            input_split_sizes=list(send_splits), async_op=True)
+        retained.append(work)
+        # NCCL Work.wait() inserts the dependency on the *current comm stream*.
+        # Future completion below is submission completion, not device completion.
+        work.wait()
+    return output
+
+
+def _identity_range(identity, suffix=""):
+    return (f"Tide:S1:MB{identity.microbatch_index}:{identity.stage}{suffix}"
+            f"|rank={identity.rank},batch={identity.batch_index},slot={identity.slot},"
+            f"seq={identity.comm_sequence},tid={threading.get_native_id()},"
+            f"schedule={identity.schedule_version}")
+
+
+class PipelineCommWorker(FIFOCommWorker):
+    """CUDA backend for the context-owned, persistent FIFO communication worker."""
+
+    def __init__(self, *, device, comm_stream=None, buffer_count=2,
+                 on_failure=None, default_timeout_s=120.0):
+        self.device = torch.device(device)
+        self.comm_stream = comm_stream or torch.cuda.Stream(device=self.device)
+        self._transport_inflight = []
+        super().__init__(execute=self._execute_request,
+                         initialize=lambda: torch.cuda.set_device(self.device),
+                         buffer_count=buffer_count, on_failure=on_failure,
+                         default_timeout_s=default_timeout_s,
+                         name=f"pc1-comm-{self.device.index}")
+
+    def _execute_request(self, stage, request):
+        remaining(request.deadline, f"{stage} worker submission")
+        with self._lock:
+            self._ensure_healthy()
+            self._transport_inflight = [request]
+        with torch.cuda.device(self.device), torch.cuda.stream(self.comm_stream), torch.no_grad():
+            with _nvtx_range(_identity_range(request.identity)):
+                result = self._c1(request) if stage == "C1" else self._c2(request)
+        with self._lock:
+            self._transport_inflight = []
+        return result
+
+    def abort(self, error):
+        # Keep the *mutable list* before super.abort(): a native submission may
+        # still be running and append another NCCL buffer after main-thread
+        # abort. Never clear this lease on an exception or synchronize here.
+        with self._lock:
+            if self._transport_inflight and not any(
+                    item is self._transport_inflight for item in self._quarantine):
+                self._quarantine.append(self._transport_inflight)
+        super().abort(error)
+
+    def _c1(self, request):
+        stream = self.comm_stream
+        begin = time.perf_counter_ns()
+        retained = self._transport_inflight
+        events = {}
+        for name in ("c1_wait_start", "c1_wait_end", "metadata_start", "metadata_end",
+                     "payload_start", "payload_end"):
+            events[name] = _cuda_event()
+        with _nvtx_range(_identity_range(request.identity, ":Wait")):
+            events["c1_wait_start"].record(stream)
+            stream.wait_event(request.projection_done)
+            events["c1_wait_end"].record(stream)
+        _record_stream_recursive((request.floats, request.radii, request.camera_ids,
+                                  request.gaussian_ids, request.counts), stream)
+        with _nvtx_range(_identity_range(request.identity, ":Metadata")):
+            events["metadata_start"].record(stream)
+            counts = torch.stack(request.counts).to(dtype=torch.int64).contiguous()
+            received = counts.new_empty(counts.shape)
+            retained.extend((counts, received))
+            if len(request.counts) == 1:
+                received.copy_(counts)
+            else:
+                work = torch.distributed.all_to_all_single(received, counts, async_op=True)
+                retained.append(work)
+                work.wait()
+            # One host conversion for all send and receive sizes, cached in the
+            # result and reused unchanged by C2. No per-payload scalar .item().
+            split_values = torch.cat((counts, received)).cpu().tolist()
+            world_size = len(request.counts)
+            send_splits = tuple(int(value) for value in split_values[:world_size])
+            recv_splits = tuple(int(value) for value in split_values[world_size:])
+            columns = _columns(request.floats)
+            layout = ExchangeLayout(send_splits, recv_splits, columns)
+            events["metadata_end"].record(stream)
+        remaining(request.deadline, "C1 metadata")
+        with _nvtx_range(_identity_range(request.identity, ":Payload")):
+            events["payload_start"].record(stream)
+            radii = _raw_exchange(request.radii.contiguous(), send_splits, recv_splits, retained)
+            packed = _pack_floats(request.floats, columns)
+            packed_received = _raw_exchange(packed, send_splits, recv_splits, retained)
+            floats = _unpack_floats(packed_received, columns)
+            rows = int(request.camera_ids.shape[0])
+            repeats = counts
+            camera_offsets = torch.tensor(
+                [0] + list(request.camera_counts[:-1]), device=self.device,
+                dtype=request.camera_ids.dtype).cumsum(0)
+            gaussian_offsets = torch.tensor(
+                [0] + list(request.gaussian_counts[:-1]), device=self.device,
+                dtype=request.gaussian_ids.dtype).cumsum(0)
+            camera_ids = request.camera_ids - camera_offsets.repeat_interleave(
+                repeats, output_size=rows)
+            gaussian_ids = request.gaussian_ids + gaussian_offsets.repeat_interleave(
+                repeats, output_size=rows)
+            # IDs keep their integer dtype; radii likewise remain a separate payload.
+            ids = torch.stack((camera_ids, gaussian_ids), dim=1).contiguous()
+            received_ids = _raw_exchange(ids, send_splits, recv_splits, retained)
+            events["payload_end"].record(stream)
+        done = _cuda_event()
+        done.record(stream)
+        _record_stream_recursive((floats, radii, received_ids), stream)
+        return C1Result(request.identity, layout, floats, radii,
+                        received_ids[:, 0], received_ids[:, 1], done,
+                        tuple(retained), tuple(events.items()), begin,
+                        time.perf_counter_ns(), threading.get_ident(),
+                        threading.get_native_id())
+
+    def _c2(self, request):
+        stream = self.comm_stream
+        begin = time.perf_counter_ns()
+        retained = self._transport_inflight
+        events = {name: _cuda_event() for name in
+                  ("c2_wait_start", "c2_wait_end", "c2_payload_start", "c2_payload_end")}
+        with _nvtx_range(_identity_range(request.identity, ":Wait")):
+            events["c2_wait_start"].record(stream)
+            stream.wait_event(request.intermediate_done)
+            events["c2_wait_end"].record(stream)
+        _record_stream_recursive(request.gradients, stream)
+        with _nvtx_range(_identity_range(request.identity, ":Payload")):
+            events["c2_payload_start"].record(stream)
+            packed = _pack_floats(request.gradients, request.layout.columns)
+            received = _raw_exchange(packed, request.layout.recv_splits,
+                                     request.layout.send_splits, retained)
+            gradients = _unpack_floats(received, request.layout.columns)
+            events["c2_payload_end"].record(stream)
+        done = _cuda_event()
+        done.record(stream)
+        _record_stream_recursive(gradients, stream)
+        return C2Result(request.identity, request.layout, gradients, done,
+                        tuple(retained), tuple(events.items()), begin,
+                        time.perf_counter_ns(), threading.get_ident(),
+                        threading.get_native_id())
 
 
 def _render_prepared(state: Dict[str, object]) -> tuple[Tensor, Tensor, Dict[str, object]]:
@@ -518,265 +683,425 @@ class DistributedRasterizationHandle:
     slot: int
     microbatch_index: int
     state: Optional[Dict[str, object]] = None
-    projection_done: Optional[torch.cuda.Event] = None
-    exchange_done: Optional[torch.cuda.Event] = None
-    render_start: Optional[torch.cuda.Event] = None
-    render_done: Optional[torch.cuda.Event] = None
-    backward_done: Optional[torch.cuda.Event] = None
-    c1_wait_start: Optional[torch.cuda.Event] = None
-    c1_wait_end: Optional[torch.cuda.Event] = None
+    projection_outputs: Dict[str, Tensor] = field(default_factory=dict)
+    image_leaves: Dict[str, Tensor] = field(default_factory=dict)
+    projection_done: object = None
+    exchange_done: object = None
+    intermediate_start: object = None
+    intermediate_done: object = None
+    final_start: object = None
+    render_start: object = None
+    render_done: object = None
+    backward_done: object = None
+    c1_wait_start: object = None
+    c1_wait_end: object = None
+    c1_future: object = None
+    c2_future: object = None
+    c1_result: Optional[C1Result] = None
+    c2_result: Optional[C2Result] = None
     rendered: Optional[Tensor] = None
     alphas: Optional[Tensor] = None
     meta: Optional[Dict[str, object]] = None
     trace: Optional[MicrobatchTrace] = None
-    _started: bool = False
-    _rendered: bool = False
+    phase: str = "PROJECTED"
+    cpu_trace: list = field(default_factory=list)
+    _events: dict = field(default_factory=dict)
+    _identities: dict = field(default_factory=dict)
 
-    def start_forward_exchange(self) -> "DistributedRasterizationHandle":
+    def _check(self, expected):
+        self.pipeline._ensure_main_thread()
         self.pipeline._ensure_not_aborted()
-        if self.state is None or self._started:
-            raise RuntimeError("projection handle is not ready or C1 was already started")
-        stream = self.pipeline.comm_stream
-        name = f"Tide:S1:MB{self.microbatch_index}:C1"
+        if self.phase != expected:
+            raise RuntimeError(f"PC1 MB{self.microbatch_index} requires {expected}; got {self.phase}")
+
+    def _identity(self, stage):
+        identity = CommunicationIdentity(
+            self.pipeline.rank, self.pipeline.batch_index, self.microbatch_index,
+            self.slot, stage, self.pipeline.comm_worker.next_sequence())
+        self._identities[stage] = identity
+        return identity
+
+    @contextmanager
+    def _cpu_span(self, name, identity=None):
+        start = time.perf_counter_ns()
+        sequence = identity.comm_sequence if identity else -1
+        range_name = (f"Tide:S1:MB{self.microbatch_index}:{name}"
+                      f"|rank={self.pipeline.rank},batch={self.pipeline.batch_index},"
+                      f"slot={self.slot},seq={sequence},tid={threading.get_native_id()},"
+                      "schedule=pc1-window-v2")
+        with _nvtx_range(range_name):
+            try:
+                yield
+            finally:
+                self.cpu_trace.append({
+                    "name": name, "start_ns": start, "end_ns": time.perf_counter_ns(),
+                    "thread_id": threading.get_native_id(),
+                    "python_thread_id": threading.get_ident(), "thread_role": "main",
+                    "rank": self.pipeline.rank, "batch_index": self.pipeline.batch_index,
+                    "microbatch_index": self.microbatch_index, "slot": self.slot,
+                    "communication_sequence": identity.comm_sequence if identity else -1,
+                    "schedule_version": "pc1-window-v2",
+                })
+
+    def start_forward_exchange(self, deadline=None):
+        self._check("PROJECTED")
+        deadline = self.pipeline._deadline(deadline)
+        identity = self._identity("C1")
+        request = C1Request(
+            identity, deadline, self.projection_done,
+            tuple(self.projection_outputs[name].detach() for name in FLOAT_ATTRIBUTES),
+            self.state["radii"].detach(), self.state["camera_ids"].detach(),
+            self.state["gaussian_ids"].detach(), tuple(self.state["cnts"]),
+            tuple(self.state["C_world"]), tuple(self.state["N_world"]))
         self.state["c1_submit_ns"] = time.perf_counter_ns()
-        with torch.cuda.stream(stream):
-            _record_stream_recursive(self.state, stream)
-            _nvtx_push(name + ":Wait")
-            self.c1_wait_start = _cuda_event()
-            self.c1_wait_end = _cuda_event()
-            self.c1_wait_start.record(stream)
-            stream.wait_event(self.projection_done)
-            self.c1_wait_end.record(stream)
-            _nvtx_pop()
-            _forward_exchange(self.state, stream, self.microbatch_index)
-            self.exchange_done = _cuda_event()
-            self.exchange_done.record(stream)
-        self._started = True
+        with self._cpu_span("C1:Enqueue", identity):
+            self.c1_future = self.pipeline.comm_worker.enqueue_c1(request)
+        self.phase = "C1_QUEUED"
         return self
 
-    def wait_and_render(self):
-        self.pipeline._ensure_not_aborted()
-        if not self._started or self.state is None:
-            raise RuntimeError("C1 must be started before render")
-        if self._rendered:
-            raise RuntimeError("render for this pipeline handle was already submitted")
+    def _result(self, future, deadline, stage):
+        try:
+            with self._cpu_span(f"{stage}:FutureWait", self._identities.get(stage)):
+                result = wait_future(future, self.pipeline._deadline(deadline))
+        except BaseException as error:
+            self.pipeline.abort(error)
+            raise
+        identity = result.identity
+        if (identity.batch_index, identity.microbatch_index, identity.slot) != (
+                self.pipeline.batch_index, self.microbatch_index, self.slot):
+            raise RuntimeError("PC1 received a communication result for a different slot")
+        self.cpu_trace.append({
+            "name": f"{stage}:Worker", "start_ns": result.worker_begin_ns,
+            "end_ns": result.worker_end_ns, "thread_id": result.native_thread_id,
+            "python_thread_id": result.thread_id, "thread_role": "comm",
+            "rank": identity.rank, "batch_index": identity.batch_index,
+            "microbatch_index": identity.microbatch_index, "slot": identity.slot,
+            "communication_sequence": identity.comm_sequence,
+            "schedule_version": identity.schedule_version,
+        })
+        return result
+
+    def attach_c1_result(self, result):
+        self._check("C1_QUEUED")
+        self.c1_result = result
+        self.exchange_done = result.done_event
+        self._events.update(result.events)
+        self.c1_wait_start = self._events["c1_wait_start"]
+        self.c1_wait_end = self._events["c1_wait_end"]
+        compute_stream = self.pipeline.compute_stream
+        # Future only means CPU publication. Always establish the GPU dependency,
+        # even when Future.done() already returned True.
+        compute_stream.wait_event(result.done_event)
+        _record_stream_recursive((result.floats, result.radii, result.camera_ids,
+                                  result.gaussian_ids), compute_stream)
+        with torch.cuda.stream(compute_stream):
+            self.image_leaves = {name: tensor.detach().requires_grad_(True)
+                                 for name, tensor in zip(FLOAT_ATTRIBUTES, result.floats)}
+        self.state.update(self.image_leaves)
+        self.state.update(radii=result.radii, camera_ids=result.camera_ids,
+                          gaussian_ids=result.gaussian_ids,
+                          C_local=int(self.state["C_world"][self.pipeline.rank]))
+        self.state["meta"].update({name: self.state[name] for name in
+            ("camera_ids", "gaussian_ids", "radii", "means2d", "depths", "conics", "opacities")})
+        self.state["meta"]["n_cameras"] = self.state["C_local"]
+        if getattr(torch, "_tide_partial_grad_metrics", False) and getattr(
+                torch, "_tide_partial_grad_metrics_sample", True):
+            with torch.cuda.stream(compute_stream):
+                self.state["meta"]["_tide_partial_gradient_context"] = torch._tide_begin_partial_gradient_metrics(
+                    means2d=self.image_leaves["means2d"], depths=self.image_leaves["depths"],
+                    conics=self.image_leaves["conics"], opacity=self.image_leaves["opacities"],
+                    features=self.image_leaves["colors"], valid_mask=(result.radii > 0))
+        self.phase = "C1_ATTACHED"
+
+    def wait_and_render(self, deadline=None):
+        self._check("C1_QUEUED")
+        result = self._result(self.c1_future, deadline, "C1")
+        self.attach_c1_result(result)
         compute_stream = self.pipeline.compute_stream
         self.state["render_submit_ns"] = time.perf_counter_ns()
-        with torch.cuda.stream(compute_stream):
-            compute_stream.wait_event(self.exchange_done)
-            _record_stream_recursive(self.state, compute_stream)
-            # C1 may finish while this stream is still executing P(i+1).
-            # Record on the compute stream so that time is not called Render.
+        with torch.cuda.stream(compute_stream), self._cpu_span("Render"):
             self.render_start = _cuda_event()
             self.render_start.record(compute_stream)
-            _nvtx_push(f"Tide:S1:MB{self.microbatch_index}:Render")
             self.rendered, self.alphas, self.meta = _render_prepared(self.state)
-            _nvtx_pop()
             self.render_done = _cuda_event()
             self.render_done.record(compute_stream)
-        self._rendered = True
+        self.phase = "RENDERED"
         return self.rendered, self.alphas, self.meta
 
-    def trace_backward(self, loss: Tensor) -> None:
-        """Attach observers to the actual graph without changing its gradients."""
-        self.pipeline._ensure_not_aborted()
-        if not self._rendered or self.backward_done is not None:
-            raise RuntimeError("backward tracing requires an unconsumed render")
+    def trace_backward(self, loss):
+        self._check("RENDERED")
         if self.trace is not None:
             self.trace.watch_backward(loss)
 
-    def mark_backward_done(self, event: torch.cuda.Event) -> None:
-        self.pipeline._ensure_not_aborted()
-        if not self._rendered:
-            raise RuntimeError("backward cannot finish before render is submitted")
-        if self.backward_done is not None:
-            raise RuntimeError("backward completion was already recorded")
+    def intermediate_backward(self, loss, deadline=None):
+        self._check("RENDERED")
+        deadline = self.pipeline._deadline(deadline)
+        self.state["intermediate_submit_ns"] = time.perf_counter_ns()
+        stream = self.pipeline.compute_stream
+        with torch.cuda.stream(stream), self._cpu_span("IntermediateGrad"):
+            self.intermediate_start = _cuda_event()
+            self.intermediate_start.record(stream)
+            if self.trace is not None:
+                self.trace.watch_backward(loss)
+            leaves = tuple(self.image_leaves[name] for name in FLOAT_ATTRIBUTES)
+            if loss.requires_grad:
+                gradients = torch.autograd.grad(loss, leaves, allow_unused=True,
+                                                create_graph=False, retain_graph=False)
+            else:
+                gradients = (None,) * len(leaves)
+            gradients = tuple(torch.zeros_like(leaf) if gradient is None else gradient.detach()
+                              for leaf, gradient in zip(leaves, gradients))
+            self.intermediate_done = _cuda_event()
+            self.intermediate_done.record(stream)
+            # Hook observers must not retain the completed image graph until G.
+            if self.trace is not None:
+                self.trace.remove_hooks()
+        remaining(deadline, "intermediate gradient")
+        identity = self._identity("C2")
+        request = C2Request(identity, deadline, self.intermediate_done,
+                            gradients, self.c1_result.layout)
+        self.state["c2_submit_ns"] = time.perf_counter_ns()
+        with self._cpu_span("C2:Enqueue", identity):
+            self.c2_future = self.pipeline.comm_worker.enqueue_c2(request)
+        self.rendered = self.alphas = None
+        self.phase = "C2_QUEUED"
+        return self.c2_future
+
+    def final_backward(self, deadline=None):
+        self._check("C2_QUEUED")
+        deadline = self.pipeline._deadline(deadline)
+        result = self._result(self.c2_future, deadline, "C2")
+        self.c2_result = result
+        self._events.update(result.events)
+        stream = self.pipeline.compute_stream
+        with torch.cuda.stream(stream):
+            stream.wait_event(result.done_event)
+            _record_stream_recursive(result.gradients, stream)
+            self.final_start = _cuda_event()
+            self.final_start.record(stream)
+            with self._cpu_span("FinalGrad"):
+                pairs = [(self.projection_outputs[name], gradient)
+                         for name, gradient in zip(FLOAT_ATTRIBUTES, result.gradients)
+                         if self.projection_outputs[name].requires_grad]
+                if self.trace is not None:
+                    self.trace.watch_backward([pair[0] for pair in pairs], default_stage="FinalGrad")
+                if pairs:
+                    torch.autograd.backward([pair[0] for pair in pairs],
+                                            grad_tensors=[pair[1] for pair in pairs])
+            done = _cuda_event()
+            done.record(stream)
+        remaining(deadline, "final gradient")
+        self.mark_backward_done(done)
+        return done
+
+    def mark_backward_done(self, event):
+        self._check("C2_QUEUED")
+        if self.c2_result is None:
+            raise RuntimeError("PC1 final gradient must consume explicit C2 before slot release")
         self.backward_done = event
+        self.phase = "BACKWARD_SUBMITTED"
         if self.trace is not None:
             self.trace.close()
 
-    def snapshot(self) -> Dict[str, object]:
-        """Return timing-only state so completed tensors can be released."""
-
+    def snapshot(self):
         if self.state is None:
             return {}
-        state = self.state
-        return {
+        snapshot = {
+            "rank": self.pipeline.rank, "batch_index": self.pipeline.batch_index,
             "microbatch_index": self.microbatch_index,
-            "pipeline_buffer_slot": self.slot,
-            "projection_start": state.get("projection_start"),
-            "projection_end": state.get("projection_end"),
+            "pipeline_buffer_slot": self.slot, "schedule_version": "pc1-window-v2",
+            "projection_start": self.state.get("projection_start"),
+            "projection_end": self.state.get("projection_end"),
             "projection_done": self.projection_done,
-            "projection_submit_ns": state.get("projection_submit_ns", 0),
-            "c1_submit_ns": state.get("c1_submit_ns", 0),
-            "render_submit_ns": state.get("render_submit_ns", 0),
-            "c1_wait_start": self.c1_wait_start,
-            "c1_wait_end": self.c1_wait_end,
-            "metadata_start": state.get("metadata_start"),
-            "metadata_end": state.get("metadata_end"),
-            "payload_start": state.get("payload_start"),
-            "payload_end": state.get("payload_end"),
+            "projection_submit_ns": self.state.get("projection_submit_ns", 0),
+            "c1_submit_ns": self.state.get("c1_submit_ns", 0),
+            "render_submit_ns": self.state.get("render_submit_ns", 0),
+            "intermediate_submit_ns": self.state.get("intermediate_submit_ns", 0),
+            "c2_submit_ns": self.state.get("c2_submit_ns", 0),
+            "c1_wait_start": self.c1_wait_start, "c1_wait_end": self.c1_wait_end,
             "exchange_done": self.exchange_done,
-            "render_start": self.render_start,
-            "render_done": self.render_done,
+            "render_start": self.render_start, "render_done": self.render_done,
+            "intermediate_start": self.intermediate_start,
+            "intermediate_done": self.intermediate_done, "final_start": self.final_start,
+            "c2_done": self.c2_result.done_event if self.c2_result is not None else None,
             "backward_done": self.backward_done,
             "backward_trace": self.trace.snapshot() if self.trace is not None else [],
+            "cpu_trace": [dict(record) for record in self.cpu_trace],
         }
+        snapshot.update(self._events)
+        return snapshot
 
     @staticmethod
-    def timing_from_snapshot(snapshot: Dict[str, object]) -> Dict[str, float]:
+    def timing_from_snapshot(snapshot):
         def elapsed(start, end):
             return float(start.elapsed_time(end)) if start is not None and end is not None else 0.0
+        return {name: elapsed(snapshot.get(start), snapshot.get(end))
+                for name, start, end in (
+                    ("projection_ms", "projection_start", "projection_end"),
+                    ("c1_wait_ms", "c1_wait_start", "c1_wait_end"),
+                    ("c1_metadata_ms", "metadata_start", "metadata_end"),
+                    ("c1_payload_ms", "payload_start", "payload_end"),
+                    ("c1_ms", "metadata_start", "payload_end"),
+                    ("render_ms", "render_start", "render_done"),
+                    ("intermediate_grad_ms", "intermediate_start", "intermediate_done"),
+                    ("c2_wait_ms", "c2_wait_start", "c2_wait_end"),
+                    ("c2_payload_ms", "c2_payload_start", "c2_payload_end"),
+                    ("final_grad_ms", "final_start", "backward_done"))}
 
-        return {
-            "projection_ms": elapsed(
-                snapshot.get("projection_start"), snapshot.get("projection_end")
-            ),
-            "c1_wait_ms": elapsed(
-                snapshot.get("c1_wait_start"), snapshot.get("c1_wait_end")
-            ),
-            "c1_metadata_ms": elapsed(
-                snapshot.get("metadata_start"), snapshot.get("metadata_end")
-            ),
-            "c1_payload_ms": elapsed(
-                snapshot.get("payload_start"), snapshot.get("payload_end")
-            ),
-            "c1_ms": elapsed(
-                snapshot.get("metadata_start"), snapshot.get("payload_end")
-            ),
-            "render_ms": elapsed(
-                snapshot.get("render_start"), snapshot.get("render_done")
-            ),
-        }
-
-    def timing(self) -> Dict[str, float]:
+    def timing(self):
         return self.timing_from_snapshot(self.snapshot())
 
-    def overlap_with(self, next_handle: "DistributedRasterizationHandle") -> float:
-        """Return GPU-time overlap between this handle's C1 and the next P."""
+    def overlap_with(self, next_handle):
+        left, right = self.snapshot(), next_handle.snapshot()
+        anchor, end = left.get("metadata_start"), left.get("payload_end")
+        start, finish = right.get("projection_start"), right.get("projection_end")
+        if any(event is None for event in (anchor, end, start, finish)):
+            return 0.0
+        offset = float(anchor.elapsed_time(start))
+        return max(0.0, min(float(anchor.elapsed_time(end)),
+                            offset + float(start.elapsed_time(finish))) - max(0.0, offset))
 
-        if self.state is None or next_handle.state is None:
-            return 0.0
-        c1_start = self.state.get("metadata_start")
-        c1_end = self.state.get("payload_end")
-        p_start = next_handle.state.get("projection_start")
-        p_end = next_handle.state.get("projection_end")
-        if None in (c1_start, c1_end, p_start, p_end):
-            return 0.0
-        try:
-            c1_ms = float(c1_start.elapsed_time(c1_end))
-            p_ms = float(p_start.elapsed_time(p_end))
-            p_start_offset = float(c1_start.elapsed_time(p_start))
-            left = max(0.0, p_start_offset)
-            right = min(c1_ms, p_start_offset + p_ms)
-            return max(0.0, right - left)
-        except RuntimeError:
-            return 0.0
+    def _buffer_lease(self):
+        # Results/requests contain detached transport tensors only. Recording them
+        # on the compute stream protects the allocator; explicit leases additionally
+        # retain NCCL Work and buffers until final consumption completes.
+        return (self.c1_result, self.c2_result,
+                tuple(tensor.detach() for tensor in self.projection_outputs.values()),
+                tuple(self.image_leaves.values()))
+
+
+    def _release_graph(self):
+        self.projection_outputs.clear()
+        self.image_leaves.clear()
+        self.state = self.meta = self.rendered = self.alphas = None
+        self.c1_result = self.c2_result = self.c1_future = self.c2_future = None
+
 
 
 class DistributedRasterizationPipeline:
-    """Double-buffered P/C1 pipeline for packed distributed rendering."""
+    """Main-thread-owned per-batch slots using one context-owned comm worker."""
 
-    def __init__(self, *, compute_stream=None, comm_stream=None, buffer_count: int = 2,
-                 capture_timeline: bool = False):
+    def __init__(self, *, compute_stream=None, comm_stream=None, buffer_count=2,
+                 capture_timeline=False, comm_worker=None, batch_index=0, deadline=None):
         if not torch.cuda.is_available():
             raise RuntimeError("pc1 requires CUDA")
+        if int(buffer_count) <= 0:
+            raise ValueError("PC1 buffer_count must be positive")
         self.compute_stream = compute_stream or torch.cuda.current_stream()
-        self.comm_stream = comm_stream or torch.cuda.Stream(device=self.compute_stream.device)
-        self.buffer_count = max(2, int(buffer_count))
+        self.buffer_count = int(buffer_count)
         self.capture_timeline = bool(capture_timeline)
+        self.batch_index = int(batch_index)
+        self.rank = torch.distributed.get_rank()
+        self.deadline = deadline
+        self._owner_thread = threading.get_ident()
+        self._owns_worker = comm_worker is None
+        self.comm_worker = comm_worker or PipelineCommWorker(
+            device=self.compute_stream.device, comm_stream=comm_stream,
+            buffer_count=self.buffer_count)
+        self.comm_stream = self.comm_worker.comm_stream
+        if self.comm_worker.buffer_count != self.buffer_count:
+            raise ValueError("PC1 context worker buffer count does not match pipeline")
         self._active = {}
-        self._drained = False
-        self._closed = False
-        self._aborted = False
+        self._retired = []
+        self._drained = self._closed = self._aborted = False
         self._quarantine = []
 
-    def _ensure_not_aborted(self) -> None:
+    def _deadline(self, deadline=None):
+        return self.comm_worker.resolve_deadline(self.deadline if deadline is None else deadline)
+
+    def _ensure_main_thread(self):
+        if threading.get_ident() != self._owner_thread:
+            raise RuntimeError("PC1 graph and slot state belongs to the main thread")
+
+    def _ensure_not_aborted(self):
         if self._aborted:
             raise RuntimeError("PC1 pipeline aborted; worker must exit, NCCL batch cannot be resumed")
 
-    def submit_projection(self, *, microbatch_index: int = 0, **kwargs) -> DistributedRasterizationHandle:
+    def submit_projection(self, *, microbatch_index=0, deadline=None, **kwargs):
+        self._ensure_main_thread()
         self._ensure_not_aborted()
         if self._closed or self._drained:
             raise RuntimeError("cannot submit projection after pipeline shutdown")
+        if deadline is not None:
+            remaining(deadline, "projection begin")
         slot = int(microbatch_index) % self.buffer_count
         if slot in self._active:
             previous = self._active[slot]
-            if previous.render_done is None or previous.backward_done is None:
-                raise RuntimeError(
-                    f"pipeline buffer slot {slot} is still in use; "
-                    "render and backward must be complete before reuse"
-                )
-            # Keep the explicit dependency even though the normal path uses
-            # one compute stream.  It protects the slot if autograd later
-            # introduces work on another stream.
+            if previous.phase != "BACKWARD_SUBMITTED" or previous.backward_done is None:
+                raise RuntimeError(f"pipeline buffer slot {slot} is still in use; final backward is required")
             self.compute_stream.wait_event(previous.backward_done)
-            self._active.pop(slot, None)
+            # Saved tensors have been consumed by backward. Keep only buffer
+            # leases until its event completes, never retain an old training graph.
+            self._retired.append((previous.backward_done, previous._buffer_lease()))
+            previous._release_graph()
+            self._active.pop(slot)
+        self._retired = [(event, lease) for event, lease in self._retired if not event.query()]
         handle = DistributedRasterizationHandle(self, slot, int(microbatch_index))
         if self.capture_timeline:
-            handle.trace = MicrobatchTrace(kwargs["means"].device, microbatch_index)
-        with torch.cuda.stream(self.compute_stream):
-            _nvtx_push(f"Tide:S1:MB{microbatch_index}:Projection")
+            handle.trace = MicrobatchTrace(kwargs["means"].device, microbatch_index,
+                rank=self.rank, batch_index=self.batch_index, slot=slot)
+        with torch.cuda.stream(self.compute_stream), handle._cpu_span("Projection"):
             submit_ns = time.perf_counter_ns()
             handle.state = _projection_prepare(**kwargs)
-            handle.state["trace"] = handle.trace
-            if handle.trace is not None:
-                handle.trace.watch_node(
-                    [handle.state["means2d"], handle.state["colors"]], "FinalGrad"
-                )
+            handle.projection_outputs = {name: handle.state[name] for name in FLOAT_ATTRIBUTES}
             handle.state["projection_submit_ns"] = submit_ns
             handle.projection_done = _cuda_event()
             handle.projection_done.record(self.compute_stream)
-            _nvtx_pop()
         self._active[slot] = handle
         return handle
 
-    def drain(self) -> None:
-        """Wait for all active GPU work before another NCCL collective."""
-
+    def drain(self, deadline=None):
+        self._ensure_main_thread()
         self._ensure_not_aborted()
         if self._drained:
             return
-        for handle in list(self._active.values()):
-            for event in (
-                handle.exchange_done,
-                handle.render_done,
-                handle.backward_done,
-            ):
-                if event is not None:
-                    event.synchronize()
-        self._drained = True
+        deadline = self._deadline(deadline)
+        try:
+            for handle in self._active.values():
+                if handle.phase != "BACKWARD_SUBMITTED":
+                    raise RuntimeError("PC1 drain requires final backward for every active slot")
+            self.comm_worker.drain(deadline)
+            for handle in self._active.values():
+                wait_event(handle.backward_done, deadline, "pipeline final backward drain")
+            for event, _ in self._retired:
+                wait_event(event, deadline, "pipeline retired buffer drain")
+            self._retired.clear()
+            self._drained = True
+        except BaseException as error:
+            self.abort(error)
+            raise
 
-    def close(self) -> None:
-        """Drop Python references after :meth:`drain` has completed."""
-
+    def close(self, deadline=None):
+        self._ensure_main_thread()
         self._ensure_not_aborted()
+        if self._closed:
+            return
         if not self._drained:
             raise RuntimeError("pipeline.close() requires pipeline.drain() first")
+        for handle in self._active.values():
+            handle._release_graph()
         self._active.clear()
+        if self._owns_worker:
+            self.comm_worker.close(self._deadline(deadline))
         self._closed = True
 
-    def abort(self) -> None:
-        """Mark the pipeline terminal and retain potentially in-flight tensors.
-
-        CUDA/NCCL work already submitted to a stream cannot be cancelled here;
-        the engine's CPU watchdog must exit the worker. Retaining handles
-        avoids allocator/destructor activity on a damaged communicator. Abort
-        does not imply drain completed and never permits reuse or safe close.
-        """
-
+    def abort(self, error=None):
         if self._aborted:
             return
         self._aborted = True
+        for handle in self._active.values():
+            if handle.trace is not None:
+                handle.trace.abort()
         self._quarantine.extend(self._active.values())
+        self._quarantine.extend(self._retired)
         self._active.clear()
+        self._retired.clear()
+        self.comm_worker.abort(error)
 
     @staticmethod
-    def timing_from_snapshot(snapshot: Dict[str, object]) -> Dict[str, float]:
+    def timing_from_snapshot(snapshot):
         return DistributedRasterizationHandle.timing_from_snapshot(snapshot)
 
 
-def distributed_rasterization_pipeline(**kwargs) -> DistributedRasterizationPipeline:
-    """Construct the TideGS P/C1 pipeline."""
-
+def distributed_rasterization_pipeline(**kwargs):
     return DistributedRasterizationPipeline(**kwargs)

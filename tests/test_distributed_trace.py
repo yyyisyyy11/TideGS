@@ -8,6 +8,7 @@ it does not claim to validate NCCL/CUDA timing on hardware.
 import ast
 import gc
 import importlib.util
+import math
 from pathlib import Path
 import threading
 from types import SimpleNamespace
@@ -64,7 +65,9 @@ class FakeCuda:
         self.times = {}
         self.events = []
         self.ranges = []
-        self.nvtx = SimpleNamespace(range_push=self.push, range_pop=self.pop)
+        self.active_ranges = {}
+        self.nvtx = SimpleNamespace(range_push=self.push, range_pop=self.pop,
+                                    range_start=self.start_range, range_end=self.end_range)
 
     @property
     def stream(self):
@@ -88,6 +91,16 @@ class FakeCuda:
 
     def pop(self):
         self.ranges.append(("pop", threading.get_ident(), self.local.stack.pop()))
+
+    def start_range(self, name):
+        identity = len(self.ranges)
+        self.active_ranges[identity] = name
+        self.ranges.append(("start", threading.get_ident(), name))
+        return identity
+
+    def end_range(self, identity):
+        name = self.active_ranges.pop(identity)
+        self.ranges.append(("end", threading.get_ident(), name))
 
     def Event(self, enable_timing):
         assert enable_timing
@@ -160,7 +173,8 @@ class DistributedTraceTest(unittest.TestCase):
             self.assertEqual(record["end_event"].stream, record["stream_id"])
             self.assertEqual(record["start_event"].elapsed_time(record["end_event"]), 3.0)
             self.assertTrue(record["complete"])
-        self.assertEqual(self.cuda.local.stack, [])
+        self.assertEqual(getattr(self.cuda.local, "stack", []), [])
+        self.assertEqual(self.cuda.active_ranges, {})
 
     def test_unreachable_exchange_does_not_relabel_loss_branch(self):
         unrelated = Node("_AlltoAllBackward", Node("UnrelatedProjection"))
@@ -241,7 +255,7 @@ class DistributedTraceTest(unittest.TestCase):
                 barrier.wait(timeout=5)
                 self.cuda.advance(4)
                 node.posthooks[0](gradients, gradients)
-                self.assertEqual(self.cuda.local.stack, [])
+                self.assertEqual(getattr(self.cuda.local, "stack", []), [])
             except Exception as error:
                 failures.append(error)
 
@@ -258,7 +272,36 @@ class DistributedTraceTest(unittest.TestCase):
             self.assertEqual(record["start_event"].elapsed_time(record["end_event"]), 4)
         for tid in {item[1] for item in self.cuda.ranges}:
             operations = [item[0] for item in self.cuda.ranges if item[1] == tid]
-            self.assertEqual(operations, ["push", "pop"])
+            self.assertEqual(operations, ["start", "end"])
+
+    def test_failed_node_range_can_be_aborted_from_main_without_cuda_or_foreign_pop(self):
+        trace = self.Trace("cuda", 0, rank=2, batch_index=9, slot=1)
+        node = Node("FailingBackward")
+        trace.watch_node(tensor(node), "IntermediateGrad")
+        native_ids = []
+
+        def failed_node():
+            native_ids.append(threading.get_native_id())
+            self.cuda.stream = 66
+            node.prehooks[0]((object(),))
+            # Simulate a native node exception: autograd skips its posthook.
+
+        thread = threading.Thread(target=failed_node)
+        thread.start()
+        thread.join(timeout=1)
+        self.assertTrue(self.cuda.active_ranges)
+        span = trace.snapshot()[0]
+        self.assertEqual(span["thread_id"], native_ids[0])
+        self.assertEqual((span["rank"], span["batch_index"], span["slot"]), (2, 9, 1))
+        with patch.object(self.cuda, "current_stream", side_effect=AssertionError("CUDA on abort")):
+            trace.abort()
+            trace.abort()
+        self.assertEqual(self.cuda.active_ranges, {})
+        span = trace.snapshot()[0]
+        self.assertFalse(span["complete"])
+        self.assertTrue(span["aborted"])
+        self.assertEqual([item[0] for item in self.cuda.ranges], ["start", "end"])
+        self.assertEqual(node.prehooks, [])
 
     def test_scope_preserves_exception_and_balances_nvtx(self):
         trace = self.Trace("cuda", 0)
@@ -296,7 +339,7 @@ class ArrayTensor:
         return tuple(ArrayTensor(value, self.requires_grad) for value in values)
 
 
-def load_collective_helper():
+def load_collective_helper(name="all_to_all_tensor_list"):
     calls = []
 
     def cat(tensors, dim=0):
@@ -312,30 +355,55 @@ def load_collective_helper():
             output.requires_grad = differentiable
         return tuple(outputs)
 
+    def gather(outputs, source):
+        calls.append((False, outputs, source))
+        for output in outputs:
+            output.values[:] = source.values
+
     fake_torch = SimpleNamespace(
         cat=cat,
         split=lambda value, sizes, dim: value.split(sizes, dim),
         empty=lambda shape, dtype, device: ArrayTensor(np.empty(shape, dtype=dtype)),
-        distributed=SimpleNamespace(all_to_all=lambda outputs, inputs: exchange(
-            outputs, inputs, differentiable=False)),
+        empty_like=lambda source: ArrayTensor(np.empty_like(source.values)),
+        distributed=SimpleNamespace(
+            all_to_all=lambda outputs, inputs: exchange(outputs, inputs, differentiable=False),
+            all_gather=gather),
     )
     namespace = {
         "torch": fake_torch,
         "distF": SimpleNamespace(all_to_all=lambda outputs, inputs: exchange(
             outputs, inputs, differentiable=True)),
         "Tensor": ArrayTensor,
+        "math": math,
     }
     source = ast.parse((GSPLAT / "distributed.py").read_text())
     function = next(node for node in source.body if isinstance(node, ast.FunctionDef)
-                    and node.name == "all_to_all_tensor_list")
+                    and node.name == name)
     module = ast.Module(body=[ast.ImportFrom(module="__future__", level=0,
                        names=[ast.alias(name="annotations")]), function], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), str(GSPLAT / "distributed.py"),
                  "exec"), namespace)
-    return namespace["all_to_all_tensor_list"], calls
+    return namespace[name], calls
 
 
 class CollectiveTracingParityTest(unittest.TestCase):
+    def test_packed_zero_rows_execute_explicit_width_exchange(self):
+        helper, calls = load_collective_helper()
+        for requires_grad in (False, True):
+            inputs = [ArrayTensor(np.empty((0, 2)), requires_grad),
+                      ArrayTensor(np.empty((0,)), requires_grad)]
+            outputs = helper(2, inputs, [0, 0], [0, 0])
+            self.assertEqual([value.shape for value in outputs], [(0, 2), (0,)])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([call[0] for call in calls], [False, True])
+
+    def test_zero_rows_execute_explicit_width_gather(self):
+        helper, calls = load_collective_helper("all_gather_tensor_list")
+        inputs = [ArrayTensor(np.empty((0, 2))), ArrayTensor(np.empty((0,)))]
+        outputs = helper(2, inputs)
+        self.assertEqual([value.shape for value in outputs], [(0, 2), (0,)])
+        self.assertEqual(len(calls), 1)
+
     def test_enabled_disabled_and_absent_trace_preserve_collective_and_outputs(self):
         helper, calls = load_collective_helper()
         Trace, cuda = load_trace()

@@ -3,6 +3,7 @@
 import ast
 from pathlib import Path
 from types import SimpleNamespace
+import time
 import unittest
 
 import numpy as np
@@ -126,9 +127,10 @@ class DistributedPipelineBackgroundTest(unittest.TestCase):
                     camera_count, background
                 )
                 submit, rasterize = load_functions(namespace)
-                handle, returned_inputs = submit(1, cameras)
+                deadline = time.monotonic() + 60.0
+                handle = submit(1, cameras, deadline=deadline)
                 self.assertIs(handle, pc1.result)
-                self.assertIs(returned_inputs, render_inputs)
+                self.assertEqual(pc1.calls[0]["deadline"], deadline)
                 rasterize(
                     means=namespace["leaves"]["xyz"],
                     scales=render_inputs[0],
@@ -184,7 +186,7 @@ class DistributedPipelineBackgroundTest(unittest.TestCase):
         )
         submit, _ = load_functions(namespace)
         with self.assertRaisesRegex(RuntimeError, "camera layout is not initialized"):
-            submit(0, cameras)
+            submit(0, cameras, deadline=time.monotonic() + 60.0)
         self.assertEqual(pc1.calls, [])
         self.assertEqual(off.calls, [])
 

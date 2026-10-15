@@ -20,8 +20,11 @@ import torch
 class MicrobatchTrace:
     """Observe one microbatch without replacing Functions or gradient tensors.
 
-    Pass this object to ``all_to_all_tensor_list(trace=...)`` during C1, then call
-    ``watch_backward(loss)`` before the ordinary single ``loss.backward()``.
+    PC1 calls ``watch_backward(loss)`` for the independent image graph, releases
+    those hooks, then observes the original Gaussian graph with FinalGrad as
+    its default stage. Explicit C2 transport owns separate comm-stream events.
+    The legacy differentiable helper can still mark graph cuts through
+    ``all_to_all_tensor_list(trace=...)`` before an ordinary loss backward.
     ``snapshot()`` contains only event objects and scalar metadata.  Call
     ``close()`` after backward returns to release retained node references/hooks.
     Read event timings only after the caller's existing measurement sync.
@@ -32,10 +35,15 @@ class MicrobatchTrace:
     invocations and are not independently timed by these hooks.
     """
 
-    def __init__(self, device, microbatch_index: int, enabled: bool = True):
+    def __init__(self, device, microbatch_index: int, enabled: bool = True, *,
+                 rank: int = -1, batch_index: int = -1, slot: int = -1):
         self.enabled = bool(enabled)
         self.device = torch.device(device) if self.enabled else device
         self.microbatch_index = int(microbatch_index)
+        self.rank = int(rank)
+        self.batch_index = int(batch_index)
+        self.slot = int(slot)
+        self._main_thread_id = threading.get_native_id()
         if self.enabled and self.device.type != "cuda":
             raise ValueError("MicrobatchTrace requires a CUDA device when enabled")
         self._intervals: list[dict[str, Any]] = []
@@ -55,6 +63,13 @@ class MicrobatchTrace:
         interval = {
             "stage": stage,
             "microbatch_index": self.microbatch_index,
+            "rank": self.rank,
+            "batch_index": self.batch_index,
+            "slot": self.slot,
+            "thread_id": threading.get_native_id(),
+            "python_thread_id": threading.get_ident(),
+            "thread_role": "main" if threading.get_native_id() == self._main_thread_id else "autograd",
+            "schedule_version": "pc1-window-v2",
             "start_event": start,
             "end_event": end,
             "stream_id": int(stream.cuda_stream),
@@ -64,11 +79,25 @@ class MicrobatchTrace:
             "complete": False,
             "timing_kind": "cuda_node_interval" if node_name else "cuda_stage_interval",
         }
-        torch.cuda.nvtx.range_push(
-            f"Tide:S1:MB{self.microbatch_index}:{stage}"
+        range_name = (f"Tide:S1:MB{self.microbatch_index}:{stage}"
             + (f":{node_name}" if node_name else "")
-        )
-        start.record(stream)
+            + f"|rank={self.rank},batch={self.batch_index},slot={self.slot},"
+              f"tid={threading.get_native_id()},schedule=pc1-window-v2")
+        # Node failure may skip the posthook. Async IDs allow CPU-only abort
+        # cleanup from the main thread without touching an autograd thread's
+        # NVTX stack. Ordinary Python scopes keep their same-thread push/pop.
+        if node_name:
+            interval["nvtx_range_id"] = torch.cuda.nvtx.range_start(range_name)
+        else:
+            torch.cuda.nvtx.range_push(range_name)
+        try:
+            start.record(stream)
+        except BaseException:
+            if "nvtx_range_id" in interval:
+                torch.cuda.nvtx.range_end(interval["nvtx_range_id"])
+            else:
+                torch.cuda.nvtx.range_pop()
+            raise
         with self._lock:
             self._intervals.append(interval)
         return interval
@@ -76,10 +105,20 @@ class MicrobatchTrace:
     def _finish(self, interval: dict[str, Any]) -> None:
         # Autograd executes a node's pre/post hooks on the same thread and
         # stream.  Never record its end on the engine caller's default stream.
-        interval["end_event"].record(torch.cuda.current_stream(self.device))
-        interval["host_end_ns"] = time.perf_counter_ns()
-        interval["complete"] = True
-        torch.cuda.nvtx.range_pop()
+        if threading.get_native_id() != interval["thread_id"]:
+            raise RuntimeError("PC1 NVTX pre/post hooks must run on the same thread")
+        if interval.get("aborted"):
+            return
+        try:
+            interval["end_event"].record(torch.cuda.current_stream(self.device))
+            interval["host_end_ns"] = time.perf_counter_ns()
+            interval["complete"] = True
+        finally:
+            if "nvtx_range_id" in interval:
+                torch.cuda.nvtx.range_end(interval["nvtx_range_id"])
+            else:
+                torch.cuda.nvtx.range_pop()
+            interval["nvtx_ended"] = True
 
     @contextmanager
     def scope(self, stage: str):
@@ -142,7 +181,7 @@ class MicrobatchTrace:
                 self._exchange_nodes.add(id(node))
                 self._watch(node, "C2")
 
-    def watch_backward(self, loss) -> None:
+    def watch_backward(self, loss, default_stage: str = "IntermediateGrad") -> None:
         """Classify reachable nodes on either side of all observed C2 cuts.
 
         Loss/render and packing backward downstream of C2 are IntermediateGrad.
@@ -185,7 +224,7 @@ class MicrobatchTrace:
             if node.name().split("::")[-1] == "AccumulateGrad":
                 stage = "AccumulateGrad"
             else:
-                stage = "FinalGrad" if identity in final else "IntermediateGrad"
+                stage = "FinalGrad" if identity in final else default_stage
             self._watch(node, stage)
 
     def snapshot(self) -> list[dict[str, Any]]:
@@ -203,4 +242,20 @@ class MicrobatchTrace:
         self._exchange_nodes.clear()
 
     def close(self) -> None:
+        self.abort()
+
+    def abort(self) -> None:
+        """End failed-node NVTX IDs without recording/synchronizing CUDA.
+
+        This must never pop a scope owned by a different CPU thread. Healthy
+        scopes always close in their own finally block; node ranges use IDs.
+        """
+        with self._lock:
+            unfinished = [interval for interval in self._intervals
+                          if "nvtx_range_id" in interval and not interval.get("nvtx_ended")]
+            for interval in unfinished:
+                interval["aborted"] = True
+                interval["host_end_ns"] = time.perf_counter_ns()
+                torch.cuda.nvtx.range_end(interval["nvtx_range_id"])
+                interval["nvtx_ended"] = True
         self.remove_hooks()

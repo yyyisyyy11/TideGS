@@ -1,4 +1,5 @@
 import os
+import math
 from typing import Any, Callable, List, Optional, Union
 
 import torch
@@ -146,8 +147,8 @@ def all_gather_tensor_list(world_size: int, tensor_list: List[Tensor]) -> List[T
         assert len(tensor) == N, "All tensors should have the same first dimension size"
 
     # concatenate tensors and record their sizes
-    data = torch.cat([t.reshape(N, -1) for t in tensor_list], dim=-1)
-    sizes = [t.numel() // N for t in tensor_list]
+    sizes = [math.prod(t.shape[1:]) for t in tensor_list]
+    data = torch.cat([t.reshape(N, width) for t, width in zip(tensor_list, sizes)], dim=-1)
 
     if data.requires_grad:
         # differentiable gather
@@ -230,8 +231,8 @@ def all_to_all_tensor_list(
     ), "The length of splits should be equal to world_size"
 
     # concatenate tensors and record their sizes
-    data = torch.cat([t.reshape(N, -1) for t in tensor_list], dim=-1)
-    sizes = [t.numel() // N for t in tensor_list]
+    sizes = [math.prod(t.shape[1:]) for t in tensor_list]
+    data = torch.cat([t.reshape(N, width) for t, width in zip(tensor_list, sizes)], dim=-1)
 
     # all_to_all
     if output_splits is not None:
