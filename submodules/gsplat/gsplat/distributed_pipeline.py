@@ -141,20 +141,22 @@ def prepare_batch_camera_layout(
 
     world_size = torch.distributed.get_world_size()
     device = means.device
-    N_world = [int(value) for value in all_gather_int32(
-        world_size, int(means.shape[0]), device=device
-    )]
-    C_world = [int(value) for value in all_gather_int32(
-        world_size, local_camera_count, device=device
-    )]
+    with _nvtx_range("tide.comm.micro.layout.counts"):
+        N_world = [int(value) for value in all_gather_int32(
+            world_size, int(means.shape[0]), device=device
+        )]
+        C_world = [int(value) for value in all_gather_int32(
+            world_size, local_camera_count, device=device
+        )]
     if any(count != local_camera_count for count in C_world):
         raise ValueError(
             "Micro Pipeline requires the same number of local cameras on every rank; "
             f"got {C_world}"
         )
-    viewmats_global, Ks_global = all_gather_tensor_list(
-        world_size, [viewmats, Ks]
-    )
+    with _nvtx_range("tide.comm.micro.layout.cameras"):
+        viewmats_global, Ks_global = all_gather_tensor_list(
+            world_size, [viewmats, Ks]
+        )
     return BatchCameraLayout(
         N_world=N_world,
         C_world=C_world,

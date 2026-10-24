@@ -686,61 +686,62 @@ class GPUWorkingSet:
                 (0,), dtype=torch.long, device=self.device
             )
 
-        target_set = set(sorted_visible)
-        current_set = set(self._persistent_block_to_slot)
-        retained_set = current_set & target_set if enable_retention else set()
-        evicted_set = current_set - retained_set
-        incoming_blocks = sorted(target_set - retained_set)
+        with tide_range("tide.cpu.resident.slot_map"):
+            target_set = set(sorted_visible)
+            current_set = set(self._persistent_block_to_slot)
+            retained_set = current_set & target_set if enable_retention else set()
+            evicted_set = current_set - retained_set
+            incoming_blocks = sorted(target_set - retained_set)
 
-        # Any evicted slot may still be a source for a queued D2H writeback.
-        with tide_range("tide.wait.gpu_writeback"):
-            torch.cuda.current_stream(self.device).wait_stream(self._writeback_stream)
-        growth_blocks = self._ensure_persistent_slot_capacity(len(target_set))
+            # Any evicted slot may still be a source for a queued D2H writeback.
+            with tide_range("tide.wait.gpu_writeback"):
+                torch.cuda.current_stream(self.device).wait_stream(self._writeback_stream)
+            growth_blocks = self._ensure_persistent_slot_capacity(len(target_set))
 
-        for block_id in sorted(evicted_set):
-            slot = self._persistent_block_to_slot.pop(block_id)
-            self._persistent_free_slots.append(slot)
-            self.block_to_gpu_slice.pop(block_id, None)
-        self._persistent_free_slots = sorted(
-            set(self._persistent_free_slots),
-            reverse=True,
-        )
-
-        assigned_slots = {}
-        for block_id in incoming_blocks:
-            if not self._persistent_free_slots:
-                raise RuntimeError("Persistent GPU slot allocator exhausted")
-            slot = self._persistent_free_slots.pop()
-            self._persistent_block_to_slot[block_id] = slot
-            assigned_slots[block_id] = slot
-
-        self.block_to_gpu_slice = {}
-        num_gaussians = 0
-        for block_id, slot in self._persistent_block_to_slot.items():
-            global_start = block_id * self.block_size
-            row_count = min(self.block_size, self.num_total - global_start)
-            local_start = slot * self.block_size
-            self.block_to_gpu_slice[block_id] = slice(
-                local_start,
-                local_start + row_count,
+            for block_id in sorted(evicted_set):
+                slot = self._persistent_block_to_slot.pop(block_id)
+                self._persistent_free_slots.append(slot)
+                self.block_to_gpu_slice.pop(block_id, None)
+            self._persistent_free_slots = sorted(
+                set(self._persistent_free_slots),
+                reverse=True,
             )
-            num_gaussians += row_count
 
-        changed_slots = sorted(
-            set(assigned_slots.values()).union(
-                self._persistent_free_slots
+            assigned_slots = {}
+            for block_id in incoming_blocks:
+                if not self._persistent_free_slots:
+                    raise RuntimeError("Persistent GPU slot allocator exhausted")
+                slot = self._persistent_free_slots.pop()
+                self._persistent_block_to_slot[block_id] = slot
+                assigned_slots[block_id] = slot
+
+            self.block_to_gpu_slice = {}
+            num_gaussians = 0
+            for block_id, slot in self._persistent_block_to_slot.items():
+                global_start = block_id * self.block_size
+                row_count = min(self.block_size, self.num_total - global_start)
+                local_start = slot * self.block_size
+                self.block_to_gpu_slice[block_id] = slice(
+                    local_start,
+                    local_start + row_count,
+                )
+                num_gaussians += row_count
+
+            changed_slots = sorted(
+                set(assigned_slots.values()).union(
+                    self._persistent_free_slots
+                )
             )
-        )
-        if changed_slots:
-            slot_ids = torch.tensor(
-                changed_slots,
-                dtype=torch.long,
-                device=self.device,
-            )
-            self.local_to_global_idx.view(
-                self._persistent_slot_capacity,
-                self.block_size,
-            ).index_fill_(0, slot_ids, -1)
+            if changed_slots:
+                slot_ids = torch.tensor(
+                    changed_slots,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                self.local_to_global_idx.view(
+                    self._persistent_slot_capacity,
+                    self.block_size,
+                ).index_fill_(0, slot_ids, -1)
 
         foreground_read_ms = 0.0
         block_batch = None
@@ -764,7 +765,7 @@ class GPUWorkingSet:
                     dtype=torch.float32,
                 )
             read_start = time.perf_counter()
-            with tide_range("tide.io.ssd.read.service"):
+            with tide_range("tide.cpu.resident.read_batch"):
                 block_batch = block_reader.read_batch(
                     incoming_blocks,
                     out=packed_out,
@@ -793,93 +794,96 @@ class GPUWorkingSet:
                     f"device={packed_cpu.device}"
                 )
             h2d_bytes = int(packed_cpu.numel()) * int(packed_cpu.element_size())
-            with tide_range("tide.gpu.transfer.h2d"):
-                packed_gpu = packed_cpu.to(
-                    self.device,
-                    non_blocking=bool(packed_cpu.is_pinned()),
-                )
-            source_starts = []
-            target_starts = []
-            row_counts = []
-            for block_id in incoming_blocks:
-                source_slice = block_batch.block_slices.get(block_id)
-                target_slice = self.block_to_gpu_slice[block_id]
-                expected_rows = int(target_slice.stop - target_slice.start)
-                if (
-                    source_slice is None
-                    or int(source_slice.stop - source_slice.start) != expected_rows
-                ):
-                    raise ValueError(
-                        f"Invalid persistent block slice for {block_id}: "
-                        f"source={source_slice}, expected_rows={expected_rows}"
+            with tide_range("tide.cpu.resident.h2d.submit"):
+                with tide_range("tide.gpu.transfer.h2d"):
+                    packed_gpu = packed_cpu.to(
+                        self.device,
+                        non_blocking=bool(packed_cpu.is_pinned()),
                     )
-                source_starts.append(int(source_slice.start))
-                target_starts.append(int(target_slice.start))
-                row_counts.append(expected_rows)
-
-            source_starts_gpu = torch.tensor(
-                source_starts,
-                dtype=torch.long,
-                device=self.device,
-            )
-            target_starts_gpu = torch.tensor(
-                target_starts,
-                dtype=torch.long,
-                device=self.device,
-            )
-            row_counts_gpu = torch.tensor(
-                row_counts,
-                dtype=torch.long,
-                device=self.device,
-            )
-            block_ids_gpu = torch.tensor(
-                incoming_blocks,
-                dtype=torch.long,
-                device=self.device,
-            )
-            if triton is not None:
-                from storage.block_reader import BlockLayout
-
-                grid = (
-                    len(incoming_blocks),
-                    triton.cdiv(self.block_size * 59, 256),
-                )
-                _unpack_persistent_blocks_kernel[grid](
-                    packed_gpu,
-                    source_starts_gpu,
-                    target_starts_gpu,
-                    row_counts_gpu,
-                    block_ids_gpu,
-                    self.gpu_xyz,
-                    self.gpu_scaling,
-                    self.gpu_rotation,
-                    self.gpu_opacity,
-                    self.gpu_features_dc,
-                    self.gpu_features_rest,
-                    self.local_to_global_idx,
-                    SOURCE_UNIFIED=block_batch.layout == BlockLayout.UNIFIED,
-                    BLOCK_ROWS=self.block_size,
-                    COPY_BLOCK_SIZE=256,
-                    num_warps=4,
-                )
-            else:  # pragma: no cover
-                columns = self._block_layout_columns(block_batch.layout)
-                with torch.no_grad():
-                    for block_id in incoming_blocks:
-                        source_slice = block_batch.block_slices[block_id]
-                        target_slice = self.block_to_gpu_slice[block_id]
-                        source = packed_gpu[source_slice]
-                        for name, column_slice in columns.items():
-                            self._persistent_component_tensors()[name][
-                                target_slice
-                            ].copy_(source[:, column_slice])
-                        row_count = int(target_slice.stop - target_slice.start)
-                        self.local_to_global_idx[target_slice] = torch.arange(
-                            block_id * self.block_size,
-                            block_id * self.block_size + row_count,
-                            dtype=torch.long,
-                            device=self.device,
+            with tide_range("tide.cpu.resident.unpack.prepare"):
+                source_starts = []
+                target_starts = []
+                row_counts = []
+                for block_id in incoming_blocks:
+                    source_slice = block_batch.block_slices.get(block_id)
+                    target_slice = self.block_to_gpu_slice[block_id]
+                    expected_rows = int(target_slice.stop - target_slice.start)
+                    if (
+                        source_slice is None
+                        or int(source_slice.stop - source_slice.start) != expected_rows
+                    ):
+                        raise ValueError(
+                            f"Invalid persistent block slice for {block_id}: "
+                            f"source={source_slice}, expected_rows={expected_rows}"
                         )
+                    source_starts.append(int(source_slice.start))
+                    target_starts.append(int(target_slice.start))
+                    row_counts.append(expected_rows)
+
+                source_starts_gpu = torch.tensor(
+                    source_starts,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                target_starts_gpu = torch.tensor(
+                    target_starts,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                row_counts_gpu = torch.tensor(
+                    row_counts,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                block_ids_gpu = torch.tensor(
+                    incoming_blocks,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+            with tide_range("tide.cpu.resident.unpack.submit"):
+                if triton is not None:
+                    from storage.block_reader import BlockLayout
+
+                    grid = (
+                        len(incoming_blocks),
+                        triton.cdiv(self.block_size * 59, 256),
+                    )
+                    _unpack_persistent_blocks_kernel[grid](
+                        packed_gpu,
+                        source_starts_gpu,
+                        target_starts_gpu,
+                        row_counts_gpu,
+                        block_ids_gpu,
+                        self.gpu_xyz,
+                        self.gpu_scaling,
+                        self.gpu_rotation,
+                        self.gpu_opacity,
+                        self.gpu_features_dc,
+                        self.gpu_features_rest,
+                        self.local_to_global_idx,
+                        SOURCE_UNIFIED=block_batch.layout == BlockLayout.UNIFIED,
+                        BLOCK_ROWS=self.block_size,
+                        COPY_BLOCK_SIZE=256,
+                        num_warps=4,
+                    )
+                else:  # pragma: no cover
+                    columns = self._block_layout_columns(block_batch.layout)
+                    with torch.no_grad():
+                        for block_id in incoming_blocks:
+                            source_slice = block_batch.block_slices[block_id]
+                            target_slice = self.block_to_gpu_slice[block_id]
+                            source = packed_gpu[source_slice]
+                            for name, column_slice in columns.items():
+                                self._persistent_component_tensors()[name][
+                                    target_slice
+                                ].copy_(source[:, column_slice])
+                            row_count = int(target_slice.stop - target_slice.start)
+                            self.local_to_global_idx[target_slice] = torch.arange(
+                                block_id * self.block_size,
+                                block_id * self.block_size + row_count,
+                                dtype=torch.long,
+                                device=self.device,
+                            )
         h2d_end_event.record()
 
         self.loaded_blocks = sorted_visible
@@ -1106,7 +1110,7 @@ class GPUWorkingSet:
                 if not (can_use_gpu_hotspots and bid in old_block_to_gpu_slice)
             ]
             read_start = time.perf_counter()
-            with tide_range("tide.io.ssd.read.service"):
+            with tide_range("tide.cpu.resident.cache_fetch"):
                 cold_blocks_source = block_reader.read_blocks(cold_ids_for_reader)
             foreground_read_ms = (time.perf_counter() - read_start) * 1000.0
 

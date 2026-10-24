@@ -31,6 +31,8 @@ from typing import Callable, Dict, List, Optional, Protocol, Sequence, runtime_c
 
 import torch
 
+from utils.tide_trace import tide_range
+
 
 class BlockLayout(Enum):
     """Column order of a 59-wide block tensor.
@@ -228,7 +230,10 @@ class TieredCacheBlockReader:
         out: Optional[torch.Tensor] = None,
     ) -> BlockBatch:
         valid_ids = [int(b) for b in block_ids if 0 <= int(b) < self.num_blocks]
-        return _pack_block_batch(self.read_blocks(valid_ids), valid_ids, self.layout, out)
+        with tide_range("tide.cpu.resident.cache_fetch"):
+            blocks = self.read_blocks(valid_ids)
+        with tide_range("tide.cpu.resident.pack"):
+            return _pack_block_batch(blocks, valid_ids, self.layout, out)
 
     def hint_future(
         self,

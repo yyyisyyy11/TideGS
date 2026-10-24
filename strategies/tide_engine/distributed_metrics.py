@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Dict, Iterable, List
 from utils.pipeline_mode import normalize_pipeline_mode
+from utils.tide_trace import tide_range
 
 from .gradient_schema import (
     GRADIENT_COMPONENTS,
@@ -489,7 +490,8 @@ class DistributedMetricsWriter:
         rank_row = dict(row)
         rank_row["rank"] = self.context.rank
         _append_tsv(self.grad_zero_rank_path, GRAD_ZERO_FIELDS, rank_row)
-        rank_rows: List[Dict[str, object]] = self.context.all_gather_object(rank_row)
+        with tide_range("tide.comm.metrics.gather"):
+            rank_rows: List[Dict[str, object]] = self.context.all_gather_object(rank_row)
         if not self.context.is_rank0:
             return
         global_row: Dict[str, object] = {
