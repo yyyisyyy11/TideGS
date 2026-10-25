@@ -8,6 +8,8 @@
 
 实验人员可先读 [200 字简介](micro_pipeline_experiment_brief.md)，本轮本地回归见 [验证记录](micro_pipeline_validation.md)。
 
+分布式规划的默认 active 刷新、`--finalize_plan` 开关与自动回退见 [可选 Finalize Plan](optional_finalize_plan.md)。
+
 ## 定义
 
 | 阶段 | 执行者 | 内容 |

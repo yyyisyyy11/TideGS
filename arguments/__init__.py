@@ -237,6 +237,7 @@ class AuxiliaryParams(ParamGroup):
         self.paper_debug_logging = False  # Enable verbose TideGS diagnostics for development runs
         self.tide_distributed_mode = "off"  # {off, gaussian_sharded}; explicit torchrun mode
         self.tide_camera_assignment = "equal"  # {equal, gaussian_balanced}; camera identity placement
+        self.finalize_plan = False  # Re-run full distributed planning when preview visibility changes
         self.tide_camera_microbatch = 4  # Cameras rendered per distributed gsplat call
         self.tide_owner_balance_samples = 256  # Legacy compatibility; stable round-robin ignores it
         self.tide_detailed_metrics = False  # Write per-rank/global batch and I/O metrics

@@ -1955,9 +1955,10 @@ def train_distributed_tide_batch(
             set(plan.global_active_blocks).intersection(plan.global_resident_blocks)
         ),
         "predicted_stream_in_blocks": int(plan.predicted_stream_in_blocks),
-        "prediction_missing_blocks": int(plan.prediction_missing_blocks),
-        "prediction_extra_blocks": int(plan.prediction_extra_blocks),
+        "prediction_missing_blocks": plan.prediction_missing_blocks,
+        "prediction_extra_blocks": plan.prediction_extra_blocks,
         "prediction_replanned": int(plan.prediction_replanned),
+        "plan_resolution": plan.plan_resolution,
         "prediction_repair_ms": float(plan.prediction_repair_ms),
         "prediction_exact_plan_ms": float(plan.prediction_exact_plan_ms),
         "rank_active_blocks": len(active_blocks),

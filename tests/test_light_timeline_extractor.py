@@ -69,6 +69,9 @@ def _rank_fixture(run_dir, rank):
                   main_thread, "tide.cpu.gradient.sparse_prepare")
             _nvtx(connection, base + 800_000_000, base + 820_000_000,
                   main_thread, "tide.cpu.plan.finalize.total")
+            if rank == 0:
+                _nvtx(connection, base + 805_000_000, base + 815_000_000,
+                      main_thread, "tide.cpu.plan.active_refresh")
             connection.execute(
                 "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES(?,?,?,?,?,?)",
                 (base + 150_000_000, base + 400_000_000, global_pid, rank, 1, 1),
@@ -171,6 +174,9 @@ class LightTimelineExtractorTest(unittest.TestCase):
                                  {"urgent", "prefetch"})
                 self.assertEqual([item["number"] for item in timeline["batches"]],
                                  [10, 11])
+                if rank == 0:
+                    self.assertTrue(any(item["name"] == "Plan active refresh (host call)"
+                                        for item in timeline["cpu_phases"]))
             with (output / "batch_metrics.csv").open(newline="") as handle:
                 rows = list(csv.DictReader(handle))
             self.assertEqual(rows[0]["metrics_intermediate_grad_ms"], "")

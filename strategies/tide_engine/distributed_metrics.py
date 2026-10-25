@@ -35,6 +35,7 @@ BATCH_FIELDS = [
     "prediction_missing_blocks",
     "prediction_extra_blocks",
     "prediction_replanned",
+    "plan_resolution",
     "prediction_repair_ms",
     "prediction_exact_plan_ms",
     "rank_active_blocks",
@@ -268,6 +269,7 @@ GLOBAL_ONCE_FIELDS = {
 }
 GLOBAL_TEXT_ONCE_FIELDS = {
     "optimizer_algorithm",
+    "plan_resolution",
     "block_cull_backend",
     "pipeline_mode",
 }
@@ -752,8 +754,11 @@ class DistributedMetricsWriter:
         for field in SUM_FIELDS:
             global_row[field] = sum(float(value.get(field, 0)) for value in rank_rows)
         for field in GLOBAL_ONCE_FIELDS:
-            values = [float(value.get(field, 0)) for value in rank_rows]
-            global_row[field] = max(values, default=0.0)
+            raw_values = [value.get(field, 0) for value in rank_rows]
+            global_row[field] = (
+                None if any(value is None or value == "" for value in raw_values)
+                else max((float(value) for value in raw_values), default=0.0)
+            )
         for field in GLOBAL_TEXT_ONCE_FIELDS:
             values = {str(value.get(field, "")) for value in rank_rows}
             global_row[field] = values.pop() if len(values) == 1 else "mixed"

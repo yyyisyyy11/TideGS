@@ -37,6 +37,7 @@ CPU_NAMES = {
     "tide.cpu.plan.preview": "Plan preview",
     "tide.cpu.plan.preview.total": "Plan preview (full host call)",
     "tide.cpu.plan.finalize": "Plan finalize",
+    "tide.cpu.plan.active_refresh": "Plan active refresh (host call)",
     "tide.cpu.plan.finalize.total": "Plan finalize (full host call)",
     "tide.comm.plan.broadcast": "Plan broadcast (host call)",
     "tide.io.ssd.prefetch.submit": "SSD prefetch submission",
@@ -277,7 +278,7 @@ def host_gap_stage(label):
     """Classify specific main-thread host spans; generic parents stay unclassified."""
     if label in {SCHEDULE, "tide.cpu.plan.initial", "tide.cpu.plan.preview.total",
                  "tide.cpu.plan.preview", "tide.cpu.plan.finalize.total",
-                 "tide.cpu.plan.finalize", "tide.comm.plan.broadcast",
+                 "tide.cpu.plan.finalize", "tide.cpu.plan.active_refresh", "tide.comm.plan.broadcast",
                  "tide.io.ssd.prefetch.submit", "tide.cpu.camera.prefetch.submit",
                  "tide.cpu.plan.consume", "tide.cpu.cache.hint"} or label.startswith("tide.cpu.order."):
         return "plan_prefetch"

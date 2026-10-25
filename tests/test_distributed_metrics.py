@@ -74,6 +74,32 @@ def _read_rows(path):
 
 
 class DistributedMetricsTest(unittest.TestCase):
+    def test_unmeasured_plan_differences_stay_blank_in_rank_and_global_tsv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = DistributedMetricsWriter(
+                args=SimpleNamespace(log_folder=directory, tide_light_timeline=True,
+                                     tide_detailed_metrics=False), context=_Context())
+            writer.write_batch({
+                "iteration": 65, "optimizer_step": 2, "plan_resolution": "active_refresh",
+                "prediction_missing_blocks": None, "prediction_extra_blocks": None,
+                "prediction_replanned": 0,
+            })
+            for filename in ("metrics_batch_rank0.tsv", "metrics_batch_global.tsv"):
+                row = _read_rows(Path(directory) / filename)[0]
+                self.assertEqual(row["plan_resolution"], "active_refresh")
+                self.assertEqual(row["prediction_missing_blocks"], "")
+                self.assertEqual(row["prediction_extra_blocks"], "")
+                self.assertEqual(float(row["prediction_replanned"]), 0)
+            writer.write_batch({
+                "iteration": 129, "optimizer_step": 3, "plan_resolution": "full_requested",
+                "prediction_missing_blocks": 2, "prediction_extra_blocks": 1,
+                "prediction_replanned": 1,
+            })
+            row = _read_rows(Path(directory) / "metrics_batch_global.tsv")[1]
+            self.assertEqual(row["plan_resolution"], "full_requested")
+            self.assertEqual(row["prediction_missing_blocks"], "2.0")
+            self.assertEqual(row["prediction_extra_blocks"], "1.0")
+
     def test_light_and_detailed_timeline_flags_are_exclusive(self):
         with tempfile.TemporaryDirectory() as directory:
             args = SimpleNamespace(

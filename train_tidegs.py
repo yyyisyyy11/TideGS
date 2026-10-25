@@ -491,6 +491,7 @@ def _finalize_distributed_plan(
     predicted_plan,
     rank0_preview,
     curvature_camera_ids=None,
+    finalize_plan=False,
 ):
     schedule_info = get_camera_batch_schedule(
         training_schedule=training_schedule,
@@ -535,23 +536,39 @@ def _finalize_distributed_plan(
         prediction_changed = (
             union_camera_blocks != rank0_preview["union_camera_blocks"]
         )
-        exact_plan_ms = 0.0
-        if prediction_changed:
-            camera_blocks = _split_camera_blocks(
+        camera_blocks = _split_camera_blocks(
+            union_camera_blocks,
+            schedule_info.batch_indices,
+        )
+        curvature_camera_blocks = (
+            _split_camera_blocks(
                 union_camera_blocks,
-                schedule_info.batch_indices,
+                rank0_curvature_camera_ids,
             )
-            curvature_camera_blocks = (
-                _split_camera_blocks(
-                    union_camera_blocks,
-                    rank0_curvature_camera_ids,
+            if rank0_curvature_camera_ids
+            else None
+        )
+        exact_plan_ms = 0.0
+        active_refresh_ms = 0.0
+        replanned = False
+        resolved_plan = None
+        resolution = "full_requested"
+        if not finalize_plan:
+            refresh_start = time.perf_counter()
+            with tide_range("tide.cpu.plan.active_refresh"):
+                resolved_plan, fallback_reason = planner.refresh_active(
+                    predicted_plan=predicted_plan,
+                    predicted_state=rank0_preview["predicted_state"],
+                    camera_blocks=camera_blocks,
+                    curvature_camera_blocks=curvature_camera_blocks,
                 )
-                if rank0_curvature_camera_ids
-                else None
-            )
+            active_refresh_ms = (time.perf_counter() - refresh_start) * 1000.0
+            resolution = fallback_reason or "active_refresh"
+
+        if resolved_plan is None and (prediction_changed or not finalize_plan):
             plan_start = time.perf_counter()
             with tide_range("tide.cpu.plan.finalize"):
-                exact_plan = planner.plan(
+                resolved_plan = planner.plan(
                     iteration=iteration,
                     epoch=schedule_info.epoch,
                     camera_ids=schedule_info.batch_indices,
@@ -560,15 +577,18 @@ def _finalize_distributed_plan(
                     curvature_camera_blocks=curvature_camera_blocks,
                 )
             exact_plan_ms = (time.perf_counter() - plan_start) * 1000.0
-        else:
+            replanned = True
+        elif resolved_plan is None:
             planner.restore_state(rank0_preview["predicted_state"])
-            exact_plan = predicted_plan
+            resolved_plan = predicted_plan
 
         predicted_stream_in = set(predicted_plan.stream_in_blocks)
-        exact_stream_in = set(exact_plan.stream_in_blocks)
-        payload = exact_plan.to_dict()
+        resolved_stream_in = set(resolved_plan.stream_in_blocks)
+        payload = resolved_plan.to_dict()
         payload["block_cull_ms"] = float(predicted_plan.block_cull_ms) + repair_ms
-        payload["plan_ms"] = float(predicted_plan.plan_ms) + exact_plan_ms
+        payload["plan_ms"] = (
+            float(predicted_plan.plan_ms) + active_refresh_ms + exact_plan_ms
+        )
         payload.update(
             {
                 field: getattr(predicted_plan, field)
@@ -593,13 +613,16 @@ def _finalize_distributed_plan(
                     getattr(predicted_plan, field) + repair_cull_metrics[field]
                 )
         payload["predicted_stream_in_blocks"] = len(predicted_stream_in)
-        payload["prediction_missing_blocks"] = len(
-            exact_stream_in - predicted_stream_in
+        payload["prediction_missing_blocks"] = (
+            None if resolution == "active_refresh"
+            else len(resolved_stream_in - predicted_stream_in)
         )
-        payload["prediction_extra_blocks"] = len(
-            predicted_stream_in - exact_stream_in
+        payload["prediction_extra_blocks"] = (
+            None if resolution == "active_refresh"
+            else len(predicted_stream_in - resolved_stream_in)
         )
-        payload["prediction_replanned"] = int(prediction_changed)
+        payload["plan_resolution"] = resolution
+        payload["prediction_replanned"] = int(replanned)
         payload["prediction_repair_ms"] = repair_ms
         payload["prediction_exact_plan_ms"] = exact_plan_ms
         return payload
@@ -1727,6 +1750,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                             predicted_plan=next_distributed_prediction,
                             rank0_preview=next_distributed_rank0_preview,
                             curvature_camera_ids=next_curvature_camera_ids,
+                            finalize_plan=getattr(args, "finalize_plan", False),
                         )
                     finalize_end_ns = time.perf_counter_ns()
                     if timeline_writer is not None:

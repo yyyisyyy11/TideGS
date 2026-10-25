@@ -134,9 +134,10 @@ class DistributedBatchPlan:
     block_cull_output_blocks: int = 0
     plan_ms: float = 0.0
     predicted_stream_in_blocks: int = 0
-    prediction_missing_blocks: int = 0
-    prediction_extra_blocks: int = 0
+    prediction_missing_blocks: Optional[int] = 0
+    prediction_extra_blocks: Optional[int] = 0
     prediction_replanned: int = 0
+    plan_resolution: str = "initial"
     prediction_repair_ms: float = 0.0
     prediction_exact_plan_ms: float = 0.0
     global_s2_camera_ids: List[int] = field(default_factory=list)
@@ -382,13 +383,16 @@ class DistributedBatchPlan:
             predicted_stream_in_blocks=int(
                 value.get("predicted_stream_in_blocks", 0)
             ),
-            prediction_missing_blocks=int(
-                value.get("prediction_missing_blocks", 0)
+            prediction_missing_blocks=(
+                None if value.get("prediction_missing_blocks", 0) is None
+                else int(value.get("prediction_missing_blocks", 0))
             ),
-            prediction_extra_blocks=int(
-                value.get("prediction_extra_blocks", 0)
+            prediction_extra_blocks=(
+                None if value.get("prediction_extra_blocks", 0) is None
+                else int(value.get("prediction_extra_blocks", 0))
             ),
             prediction_replanned=int(value.get("prediction_replanned", 0)),
+            plan_resolution=str(value.get("plan_resolution", "initial")),
             prediction_repair_ms=float(value.get("prediction_repair_ms", 0.0)),
             prediction_exact_plan_ms=float(
                 value.get("prediction_exact_plan_ms", 0.0)
@@ -401,6 +405,19 @@ class DistributedPlannerState:
     resident: Tuple[int, ...]
     active: Tuple[int, ...]
     recency: Dict[int, float]
+
+
+@dataclass(frozen=True)
+class _ActiveLayout:
+    global_camera_ids: List[int]
+    rank_camera_ids: List[List[int]]
+    global_s2_camera_ids: List[int]
+    rank_s2_camera_ids: List[List[int]]
+    global_gradient_active: List[int]
+    global_curvature_active: List[int]
+    global_active: List[int]
+    union_camera_ids: List[int]
+    union_camera_blocks: Dict[int, List[int]]
 
 
 class DistributedBatchPlanner:
@@ -490,16 +507,14 @@ class DistributedBatchPlanner:
             self.restore_state(baseline)
         return plan, predicted_state
 
-    def plan(
+    def _prepare_active_layout(
         self,
         *,
-        iteration: int,
-        epoch: int,
         camera_ids: Sequence[int],
         camera_blocks: Mapping[int, Sequence[int]],
         curvature_camera_ids: Optional[Sequence[int]] = None,
         curvature_camera_blocks: Optional[Mapping[int, Sequence[int]]] = None,
-    ) -> DistributedBatchPlan:
+    ) -> _ActiveLayout:
         global_camera_ids = [int(camera_id) for camera_id in camera_ids]
         if len(global_camera_ids) % self.world_size != 0:
             raise ValueError("Global camera count must be divisible by world_size")
@@ -611,12 +626,40 @@ class DistributedBatchPlanner:
             )
             for camera_id in union_camera_ids
         }
+        return _ActiveLayout(
+            global_camera_ids=global_camera_ids,
+            rank_camera_ids=rank_camera_ids,
+            global_s2_camera_ids=global_s2_camera_ids,
+            rank_s2_camera_ids=rank_s2_camera_ids,
+            global_gradient_active=global_gradient_active,
+            global_curvature_active=global_curvature_active,
+            global_active=global_active,
+            union_camera_ids=union_camera_ids,
+            union_camera_blocks=normalized_union_camera_blocks,
+        )
+
+    def plan(
+        self,
+        *,
+        iteration: int,
+        epoch: int,
+        camera_ids: Sequence[int],
+        camera_blocks: Mapping[int, Sequence[int]],
+        curvature_camera_ids: Optional[Sequence[int]] = None,
+        curvature_camera_blocks: Optional[Mapping[int, Sequence[int]]] = None,
+    ) -> DistributedBatchPlan:
+        layout = self._prepare_active_layout(
+            camera_ids=camera_ids,
+            camera_blocks=camera_blocks,
+            curvature_camera_ids=curvature_camera_ids,
+            curvature_camera_blocks=curvature_camera_blocks,
+        )
         transition = compute_topc_resident_transition(
             current_active_blocks=self._active,
-            next_active_blocks=global_active,
+            next_active_blocks=layout.global_active,
             current_resident_blocks=self._resident,
-            next_camera_ids=union_camera_ids,
-            next_camera_blocks=normalized_union_camera_blocks,
+            next_camera_ids=layout.union_camera_ids,
+            next_camera_blocks=layout.union_camera_blocks,
             previous_recency_scores=self._recency,
             lambda_weight=self.resident_lambda,
             recency_decay=self.recency_decay,
@@ -626,10 +669,77 @@ class DistributedBatchPlanner:
             enforce_next_active_coverage=self.enforce_next_active_coverage,
         )
         global_resident = list(transition.next_resident_blocks)
-        self._active = global_active
+        plan = self._build_plan(
+            iteration=iteration,
+            epoch=epoch,
+            layout=layout,
+            global_resident=global_resident,
+            stream_in_blocks=list(transition.stream_in_blocks),
+            evict_blocks=list(transition.evict_blocks),
+        )
+        self._active = list(layout.global_active)
         self._resident = global_resident
         self._recency = dict(transition.updated_recency_scores or {})
+        return plan
 
+    def refresh_active(
+        self,
+        *,
+        predicted_plan: DistributedBatchPlan,
+        predicted_state: DistributedPlannerState,
+        camera_blocks: Mapping[int, Sequence[int]],
+        curvature_camera_blocks: Optional[Mapping[int, Sequence[int]]] = None,
+    ) -> Tuple[Optional[DistributedBatchPlan], Optional[str]]:
+        """Commit fresh active/layout with preview residency, or leave state untouched.
+
+        A rejected refresh returns a resolution reason. The caller can then run
+        plan() from the original state, with the same already-culled visibility.
+        Recency is committed exactly once, from the preview, on the fast path.
+        """
+        if not self.enforce_next_active_coverage:
+            return None, "fallback_policy"
+        if self.capacity >= 0 and len(predicted_plan.global_active_blocks) > self.capacity:
+            return None, "fallback_preview_capacity"
+        layout = self._prepare_active_layout(
+            camera_ids=predicted_plan.global_camera_ids,
+            camera_blocks=camera_blocks,
+            curvature_camera_ids=(predicted_plan.global_s2_camera_ids or None),
+            curvature_camera_blocks=curvature_camera_blocks,
+        )
+        if self.capacity >= 0 and len(layout.global_active) > self.capacity:
+            return None, "fallback_active_capacity"
+        if not set(layout.global_active).issubset(predicted_plan.global_resident_blocks):
+            return None, "fallback_resident_coverage"
+        if list(predicted_state.resident) != predicted_plan.global_resident_blocks:
+            raise ValueError("Preview plan and state have different resident blocks")
+        plan = self._build_plan(
+            iteration=predicted_plan.iteration,
+            epoch=predicted_plan.epoch,
+            layout=layout,
+            global_resident=list(predicted_plan.global_resident_blocks),
+            stream_in_blocks=list(predicted_plan.stream_in_blocks),
+            evict_blocks=list(predicted_plan.evict_blocks),
+        )
+        self.restore_state(DistributedPlannerState(
+            resident=predicted_state.resident,
+            active=tuple(layout.global_active),
+            recency=dict(predicted_state.recency),
+        ))
+        return plan, None
+
+    def _build_plan(
+        self,
+        *,
+        iteration: int,
+        epoch: int,
+        layout: _ActiveLayout,
+        global_resident: List[int],
+        stream_in_blocks: List[int],
+        evict_blocks: List[int],
+    ) -> DistributedBatchPlan:
+        global_active = layout.global_active
+        global_gradient_active = layout.global_gradient_active
+        global_curvature_active = layout.global_curvature_active
         rank_active_blocks = [
             [block_id for block_id in global_active if self.block_owner[block_id] == rank]
             for rank in range(self.world_size)
@@ -675,20 +785,20 @@ class DistributedBatchPlanner:
         return DistributedBatchPlan(
             iteration=int(iteration),
             epoch=int(epoch),
-            global_camera_ids=global_camera_ids,
-            rank_camera_ids=rank_camera_ids,
+            global_camera_ids=layout.global_camera_ids,
+            rank_camera_ids=layout.rank_camera_ids,
             rank_resident_blocks=rank_resident_blocks,
             rank_active_blocks=rank_active_blocks,
             global_active_blocks=global_active,
             global_resident_blocks=global_resident,
-            global_s2_camera_ids=global_s2_camera_ids,
-            rank_s2_camera_ids=rank_s2_camera_ids,
+            global_s2_camera_ids=layout.global_s2_camera_ids,
+            rank_s2_camera_ids=layout.rank_s2_camera_ids,
             rank_gradient_active_blocks=rank_gradient_active_blocks,
             rank_curvature_active_blocks=rank_curvature_active_blocks,
             global_gradient_active_blocks=global_gradient_active,
             global_curvature_active_blocks=global_curvature_active,
             rank_owner_active_rows=rank_owner_active_rows,
             rank_participation_rows=rank_participation_rows,
-            stream_in_blocks=list(transition.stream_in_blocks),
-            evict_blocks=list(transition.evict_blocks),
+            stream_in_blocks=stream_in_blocks,
+            evict_blocks=evict_blocks,
         )
