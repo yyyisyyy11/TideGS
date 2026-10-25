@@ -240,6 +240,7 @@ class AuxiliaryParams(ParamGroup):
         self.tide_camera_microbatch = 4  # Cameras rendered per distributed gsplat call
         self.tide_owner_balance_samples = 256  # Legacy compatibility; stable round-robin ignores it
         self.tide_detailed_metrics = False  # Write per-rank/global batch and I/O metrics
+        self.tide_light_timeline = False  # Keep batch/I/O metrics without per-stage GPU timeline events
         self.tide_grad_zero_metrics = False  # Profile exact/near-zero gradients after projection cull
         self.tide_grad_zero_metrics_interval = 1  # Profile every N optimizer steps; 1 means every batch
         self.tide_grad_near_zero_threshold = 1e-8  # Primary threshold for per-Gaussian near-zero histograms
@@ -515,6 +516,8 @@ def _apply_tide_aliases(args):
 
 
 def init_args(args):
+    if getattr(args, "tide_light_timeline", False) and getattr(args, "tide_detailed_metrics", False):
+        raise ValueError("--tide_light_timeline and --tide_detailed_metrics are mutually exclusive")
     args.tide_forward_pipeline = normalize_pipeline_mode(getattr(args, "tide_forward_pipeline", "off"))
     _apply_tide_aliases(args)
     _apply_pure_ssd_release_defaults(args)

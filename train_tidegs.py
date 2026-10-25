@@ -754,6 +754,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 
     distributed_context = get_distributed_context(args)
     distributed_enabled = distributed_context.enabled
+    metrics_enabled = bool(
+        args.tide_detailed_metrics or getattr(args, "tide_light_timeline", False)
+    )
 
     # ============================================================================
     # STAGE 1: INITIALIZATION
@@ -773,7 +776,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     if distributed_enabled:
         prepare_distributed_gsplat(
             distributed_context,
-            enable_timing=bool(args.tide_detailed_metrics),
+            enable_timing=metrics_enabled,
             enable_grad_zero_metrics=bool(args.tide_grad_zero_metrics),
             tile_contribution_mode=str(args.tide_tile_contribution_mode),
             tile_alpha_threshold=float(args.tide_tile_alpha_threshold),
@@ -1244,7 +1247,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     )
     timeline_writer = (
         get_distributed_metrics_writer(gaussians, distributed_context)
-        if args.tide_detailed_metrics
+        if metrics_enabled
         else None
     )
     if timeline_writer is not None:
@@ -1991,7 +1994,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         from strategies.tide_engine.engine import shutdown_double_buffer_gpu
 
         distributed_context.barrier()
-        if args.tide_detailed_metrics:
+        if metrics_enabled:
             legacy_collector = getattr(
                 gaussians, "_tide_legacy_cuda_metrics_collector", None
             )
@@ -2040,7 +2043,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 compact_storage=False
             ),
         )
-        if args.tide_detailed_metrics:
+        if metrics_enabled:
             def finalize_distributed_metrics():
                 metrics_writer = get_distributed_metrics_writer(
                     gaussians,

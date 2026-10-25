@@ -594,7 +594,7 @@ def train_distributed_tide_batch(
     iteration = int(plan.iteration)
     batch_start = time.perf_counter()
     metrics_writer = get_distributed_metrics_writer(gaussians, context)
-    timeline_enabled = bool(metrics_writer.enabled)
+    timeline_enabled = bool(metrics_writer.detailed_timeline_enabled)
     (
         optimizer_algorithm,
         optimizer_step,
@@ -1687,6 +1687,10 @@ def train_distributed_tide_batch(
                 "FinalGrad": ("final_start", "backward_done"),
             }
             for stage in backward_stage_ms:
+                if stage == "AccumulateGrad" and not timeline_enabled:
+                    # This stage has no standalone event outside MicrobatchTrace.
+                    backward_stage_ms[stage] = None
+                    continue
                 explicit = explicit_stages.get(stage)
                 backward_stage_ms[stage] = cuda_interval_union_ms(
                     gpu_anchor,

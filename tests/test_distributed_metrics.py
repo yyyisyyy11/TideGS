@@ -74,6 +74,157 @@ def _read_rows(path):
 
 
 class DistributedMetricsTest(unittest.TestCase):
+    def test_light_and_detailed_timeline_flags_are_exclusive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = SimpleNamespace(
+                log_folder=directory,
+                tide_light_timeline=True,
+                tide_detailed_metrics=True,
+            )
+            with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                DistributedMetricsWriter(args=args, context=_SingleRankContext())
+
+    def test_light_timeline_keeps_batch_identity_and_batches_io_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = DistributedMetricsWriter(
+                args=SimpleNamespace(
+                    log_folder=directory,
+                    tide_light_timeline=True,
+                    tide_detailed_metrics=False,
+                ),
+                context=_SingleRankContext(),
+            )
+            self.assertTrue(writer.enabled)
+            self.assertFalse(writer.detailed_timeline_enabled)
+            writer.write_memory_point(iteration=1, phase="batch_start")
+            writer.write_batch({
+                "iteration": 1,
+                "optimizer_step": 1,
+                "local_cameras": 16,
+                "pipeline_mode": "micro",
+                "grad_accumulate_ms": None,
+            })
+            with open(Path(directory) / "timeline_events_rank0.jsonl", encoding="utf-8") as handle:
+                identity = json.loads(handle.readline())
+                self.assertEqual(handle.readline(), "")
+            self.assertEqual(identity["name"], "batch_identity")
+            self.assertEqual(identity["rank"], 0)
+            self.assertGreater(identity["pid"], 0)
+            self.assertEqual(identity["optimizer_step"], 1)
+            writer.write_timeline_event(
+                name="Tide:S1:MB0:C2", lane="nccl",
+                start_ns=100, end_ns=120, iteration=1,
+            )
+            writer.write_timeline_event(
+                name="finalize_plan", lane="cpu",
+                start_ns=120, end_ns=130, iteration=1,
+            )
+            self.assertEqual(
+                _read_rows(Path(directory) / "metrics_batch_rank0.tsv")[0]["grad_accumulate_ms"],
+                "",
+            )
+            self.assertEqual(
+                _read_rows(Path(directory) / "metrics_batch_global.tsv")[0]["grad_accumulate_ms_max"],
+                "",
+            )
+
+            rows = [
+                {
+                    "operation": "ssd_read_future",
+                    "tier": "ssd",
+                    "lane": "ssd",
+                    "origin_iteration": 1,
+                    "target_iteration": 65,
+                    "blocks": 2,
+                    "bytes": 200,
+                    "service_ms": 0.02,
+                    "start_ns": 2_000,
+                    "end_ns": 2_020,
+                    "thread_id": 99,
+                },
+                {
+                    "operation": "prefetch_end_to_end",
+                    "tier": "ssd_to_ram",
+                    "lane": "cpu",
+                    "origin_iteration": 1,
+                    "target_iteration": 65,
+                    "blocks": 2,
+                    "bytes": 0,
+                    "service_ms": 0.04,
+                    "start_ns": 1_990,
+                    "end_ns": 2_030,
+                    "thread_id": 99,
+                    "status": "cache_ready",
+                },
+            ]
+            with mock.patch("builtins.open", wraps=open) as opened:
+                writer.write_io_events(rows)
+            self.assertEqual(opened.call_count, 2)
+            io_rows = _read_rows(Path(directory) / "metrics_io_rank0.tsv")
+            self.assertEqual([row["operation"] for row in io_rows], [
+                "ssd_read_future", "prefetch_end_to_end",
+            ])
+            with open(Path(directory) / "timeline_events_rank0.jsonl", encoding="utf-8") as handle:
+                events = [json.loads(line) for line in handle]
+            self.assertEqual([event["name"] for event in events], [
+                "batch_identity", "finalize_plan", "ssd_read_future",
+                "prefetch_end_to_end",
+            ])
+            self.assertEqual(events[2]["target_iteration"], 65)
+            self.assertEqual(events[2]["thread_id"], 99)
+            self.assertEqual(events[2]["bytes"], 200)
+            self.assertEqual(events[3]["status"], "cache_ready")
+            writer.finalize_async_metrics()
+            async_rows = _read_rows(
+                Path(directory) / "metrics_async_iteration_rank0.tsv"
+            )
+            self.assertEqual(async_rows[0]["iteration"], "65")
+            self.assertEqual(async_rows[0]["ssd_future_read_blocks"], "2.0")
+            with self.assertRaisesRegex(RuntimeError, "after metrics finalization"):
+                writer.write_io_events(rows)
+
+    def test_light_collector_keeps_batch_metric_without_gpu_stage_event(self):
+        class Event:
+            def __init__(self, ms):
+                self.ms = ms
+
+            def query(self):
+                return True
+
+            def elapsed_time(self, other):
+                return other.ms - self.ms
+
+        with tempfile.TemporaryDirectory() as directory:
+            writer = DistributedMetricsWriter(
+                args=SimpleNamespace(
+                    log_folder=directory,
+                    tide_light_timeline=True,
+                    tide_detailed_metrics=False,
+                ),
+                context=_SingleRankContext(),
+            )
+            collector = LegacyCudaMetricsCollector(writer)
+            collector.enqueue(
+                {"iteration": 1, "pipeline_mode": "micro",
+                 "grad_accumulate_ms": None, "train_ms": 3.0},
+                {"gsplat_forward_ms": [{
+                    "start": Event(0.0), "end": Event(3.0),
+                    "start_ns": 1_000, "name": "projection",
+                }]},
+            )
+            row = _read_rows(Path(directory) / "metrics_batch_rank0.tsv")[0]
+            self.assertEqual(row["gsplat_forward_ms"], "3.0")
+            self.assertEqual(row["grad_accumulate_ms"], "")
+            self.assertEqual(
+                _read_rows(Path(directory) / "metrics_batch_global.tsv")[0]
+                ["grad_accumulate_ms_max"],
+                "",
+            )
+            with open(Path(directory) / "timeline_events_rank0.jsonl", encoding="utf-8") as handle:
+                self.assertEqual([json.loads(line)["name"] for line in handle], [
+                    "batch_identity",
+                ])
+
     def test_deferred_writer_preserves_resolved_micro_pipeline_training_union(self):
         for mode in ("micro", "pc1"):
             with self.subTest(mode=mode):
