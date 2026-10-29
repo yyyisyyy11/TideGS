@@ -413,7 +413,6 @@ def main():
         execution_mode="paper",
         max_patch_files=32,
         max_patch_gb=64.0,
-        min_free_gb=64.0,
     )
     model._block_reader = TieredCacheBlockReader(
         cache_manager=storage.cache, total_gaussians=int(manifest["total_points"]),
@@ -534,7 +533,7 @@ def main():
         status["end_time"] = _now_iso()
         _write_json_atomic(status_path, status)
         try:
-            storage.shutdown()
+            storage.shutdown(compact_storage=False)
         except Exception as exc:  # do not mask the primary error
             print(f"[WARN] storage shutdown: {exc}")
         log.close()

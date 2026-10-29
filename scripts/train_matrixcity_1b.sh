@@ -44,6 +44,7 @@ CHECKPOINT_KEEP_LAST=2
 MAX_PATCH_FILES=32
 MAX_PATCH_GB=64
 OPTIMIZER_ALGORITHM="${OPTIMIZER_ALGORITHM:-adam}"
+OPTIMIZER_STATE_MODE="${OPTIMIZER_STATE_MODE:-resident_blocks}"
 SOPHIA_BETA1="${SOPHIA_BETA1:-0.9}"
 SOPHIA_BETA2="${SOPHIA_BETA2:-0.999}"
 SOPHIA_CURVATURE_INTERVAL="${SOPHIA_CURVATURE_INTERVAL:-10}"
@@ -113,6 +114,7 @@ Options:
   --max-patch-files N         Compact at this active patch count (default: ${MAX_PATCH_FILES})
   --max-patch-gb N            Compact at this stale patch size in GiB (default: ${MAX_PATCH_GB})
   --optimizer NAME            adam|3dgs2_tr (default: ${OPTIMIZER_ALGORITHM})
+  --optimizer-state-mode MODE resident_blocks|resident_cpu_cache (Adam only for resident_cpu_cache)
   --sophia-beta1 VALUE        Gradient EMA beta (default: ${SOPHIA_BETA1})
   --sophia-beta2 VALUE        Curvature EMA beta (default: ${SOPHIA_BETA2})
   --curvature-interval N      Curvature update interval in optimizer steps (default: ${SOPHIA_CURVATURE_INTERVAL})
@@ -150,7 +152,7 @@ Environment overrides:
   PYTHON_BIN, GPU, GPUS, DISTRIBUTED_MODE, CAMERA_ASSIGNMENT, DETAILED_METRICS,
   CAMERA_MICROBATCH, OWNER_BALANCE_SAMPLES, ROOT, SRC, PLY, MANIFEST, MATRIXCITY_SCENE_DIR,
   TIDEGS_DENSE_PLY, TIDEGS_PREBUILT_MANIFEST, SCHED_CACHE, OUT_ROOT,
-  CACHE_ROOT, RUN_TAG, OPTIMIZER_ALGORITHM, SOPHIA_BETA1, SOPHIA_BETA2,
+  CACHE_ROOT, RUN_TAG, OPTIMIZER_ALGORITHM, OPTIMIZER_STATE_MODE, SOPHIA_BETA1, SOPHIA_BETA2,
   SOPHIA_CURVATURE_INTERVAL, SOPHIA_HUTCHINSON_SAMPLES, SOPHIA_CURVATURE_SEED,
   SOPHIA_GAMMA, SOPHIA_EPSILON, TR_EPSILON_INIT, TR_EPSILON_FINAL
 USAGE
@@ -197,6 +199,7 @@ while [[ $# -gt 0 ]]; do
     --max-patch-files) MAX_PATCH_FILES="$2"; shift 2 ;;
     --max-patch-gb) MAX_PATCH_GB="$2"; shift 2 ;;
     --optimizer) OPTIMIZER_ALGORITHM="$2"; shift 2 ;;
+    --optimizer-state-mode) OPTIMIZER_STATE_MODE="$2"; shift 2 ;;
     --sophia-beta1) SOPHIA_BETA1="$2"; shift 2 ;;
     --sophia-beta2) SOPHIA_BETA2="$2"; shift 2 ;;
     --curvature-interval) SOPHIA_CURVATURE_INTERVAL="$2"; shift 2 ;;
@@ -236,6 +239,14 @@ case "${OPTIMIZER_ALGORITHM}" in
   adam|3dgs2_tr) ;;
   *) echo "Invalid --optimizer '${OPTIMIZER_ALGORITHM}'" >&2; exit 1 ;;
 esac
+case "${OPTIMIZER_STATE_MODE}" in
+  resident_blocks|resident_cpu_cache) ;;
+  *) echo "Invalid --optimizer-state-mode '${OPTIMIZER_STATE_MODE}'" >&2; exit 1 ;;
+esac
+if [[ "${OPTIMIZER_STATE_MODE}" == "resident_cpu_cache" && "${OPTIMIZER_ALGORITHM}" != "adam" ]]; then
+  echo "--optimizer-state-mode resident_cpu_cache currently requires --optimizer adam" >&2
+  exit 1
+fi
 
 if [[ "${MODE}" != "summary" ]]; then
   if [[ -z "${SRC}" ]]; then
@@ -318,6 +329,10 @@ if [[ "${DISTRIBUTED_MODE}" == "gaussian_sharded" ]]; then
   DISTRIBUTED_TAG="_dist${GPU_COUNT}_${CAMERA_ASSIGNMENT}"
 fi
 OPTIMIZER_TAG="_${OPTIMIZER_ALGORITHM}"
+STATE_TAG=""
+if [[ "${OPTIMIZER_STATE_MODE}" != "resident_blocks" ]]; then
+  STATE_TAG="_state_${OPTIMIZER_STATE_MODE}"
+fi
 
 RUN_ROOT="${OUT_ROOT}/${RUN_TAG}"
 COMMANDS="${RUN_ROOT}/commands.sh"
@@ -436,7 +451,7 @@ append_train_command() {
     printf '  --tide_resident_recency_decay %q \\\n' "${resident_decay}"
     printf '  --tide_balanced_seed_fraction %q \\\n' "${balanced_seed_fraction}"
     printf '  --tide_resident_capacity_blocks %q \\\n' "${capacity}"
-    printf '  --tide_optimizer_state_mode resident_blocks \\\n'
+    printf '  --tide_optimizer_state_mode %q \\\n' "${OPTIMIZER_STATE_MODE}"
     printf '  --tide_distributed_mode %q \\\n' "${DISTRIBUTED_MODE}"
     if [[ "${DISTRIBUTED_MODE}" == "gaussian_sharded" ]]; then
       printf '  --tide_camera_assignment %q \\\n' "${CAMERA_ASSIGNMENT}"
@@ -482,7 +497,7 @@ if [[ "${MODE}" == "train" ]]; then
             decay_tag="${resident_decay//./p}"
             append_train_command \
               "train" \
-              "train_bsz${bsz}_cap${capacity}_lam${lambda_tag}_decay${decay_tag}_seed${fraction_tag}${OPTIMIZER_TAG}_iter${ITERATIONS}${DISTRIBUTED_TAG}" \
+              "train_bsz${bsz}_cap${capacity}_lam${lambda_tag}_decay${decay_tag}_seed${fraction_tag}${OPTIMIZER_TAG}${STATE_TAG}_iter${ITERATIONS}${DISTRIBUTED_TAG}" \
               "${bsz}" "${capacity}" "${resident_lambda}" "${resident_decay}" "${balanced_seed_fraction}" "${ITERATIONS}" "${train_checkpoint_iter}" ""
           done
         done
@@ -500,7 +515,7 @@ elif [[ "${MODE}" == "checkpoint" ]]; then
   decay_tag="${resident_decay//./p}"
   append_train_command \
     "checkpoint" \
-    "ckpt_bsz${bsz}_cap${capacity}_lam${lambda_tag}_decay${decay_tag}_seed${fraction_tag}${OPTIMIZER_TAG}_iter1000_ckpt${CHECKPOINT_ITER}${DISTRIBUTED_TAG}" \
+    "ckpt_bsz${bsz}_cap${capacity}_lam${lambda_tag}_decay${decay_tag}_seed${fraction_tag}${OPTIMIZER_TAG}${STATE_TAG}_iter1000_ckpt${CHECKPOINT_ITER}${DISTRIBUTED_TAG}" \
     "${bsz}" "${capacity}" "${resident_lambda}" "${resident_decay}" "${balanced_seed_fraction}" "1000" "${CHECKPOINT_ITER}" ""
 elif [[ "${MODE}" == "resume" ]]; then
   if [[ -z "${START_CHECKPOINT}" ]]; then
@@ -521,7 +536,7 @@ elif [[ "${MODE}" == "resume" ]]; then
   decay_tag="${resident_decay//./p}"
   append_train_command \
     "resume" \
-    "resume_bsz${bsz}_cap${capacity}_lam${lambda_tag}_decay${decay_tag}_seed${fraction_tag}${OPTIMIZER_TAG}_to${RESUME_TO_ITER}${DISTRIBUTED_TAG}" \
+    "resume_bsz${bsz}_cap${capacity}_lam${lambda_tag}_decay${decay_tag}_seed${fraction_tag}${OPTIMIZER_TAG}${STATE_TAG}_to${RESUME_TO_ITER}${DISTRIBUTED_TAG}" \
     "${bsz}" "${capacity}" "${resident_lambda}" "${resident_decay}" "${balanced_seed_fraction}" "${RESUME_TO_ITER}" "${resume_checkpoint_iter}" "${START_CHECKPOINT}"
 fi
 

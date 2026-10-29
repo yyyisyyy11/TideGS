@@ -39,6 +39,7 @@ _ACTIVE_FIRST_RESIDENT_POLICIES = {
     "topc_strict_active_first",
     "topc_balanced_active_first",
 }
+_GPU_RESIDENT_STATE_MODES = {"resident_blocks", "resident_cpu_cache"}
 
 
 def _require_attr(args: Any, name: str, expected: Any) -> None:
@@ -68,7 +69,18 @@ def validate_tide_runtime_args(args: Any) -> None:
     _require_lower(args, "ssd_execution_mode", "paper")
     _require_lower(args, "paper_block_reader_backend", "tiered_cache")
     _require_lower(args, "paper_optimizer_backend", "gpu_resident")
-    _require_lower(args, "paper_optimizer_state_mode", "resident_blocks")
+    state_mode = str(getattr(args, "paper_optimizer_state_mode", "")).lower()
+    if state_mode not in _GPU_RESIDENT_STATE_MODES:
+        raise RuntimeError(
+            "Pure SSD/Tide release path requires a resident optimizer state mode; "
+            f"got {state_mode!r}."
+        )
+    if state_mode == "resident_cpu_cache" and str(
+        getattr(args, "paper_optimizer_algorithm", "adam")
+    ).lower() != "adam":
+        raise RuntimeError(
+            "paper_optimizer_state_mode=resident_cpu_cache currently supports Adam only"
+        )
     _require_lower(args, "paper_optimizer_deferred_mode", "off")
     _require_attr(args, "paper_free_unified_params", True)
     _require_attr(args, "disable_auto_densification", True)
@@ -750,8 +762,10 @@ def initialize_paper_mode_runtime_state(
     paper_optimizer_state_mode = str(
         getattr(args, "paper_optimizer_state_mode", "resident_blocks")
     ).lower()
-    if paper_optimizer_state_mode != "resident_blocks":
-        raise RuntimeError("Paper SSD release path requires --paper_optimizer_state_mode resident_blocks.")
+    if paper_optimizer_state_mode not in _GPU_RESIDENT_STATE_MODES:
+        raise RuntimeError(
+            "Paper SSD release path requires a resident optimizer state mode."
+        )
 
     gaussians._paper_optimizer_state_mode = paper_optimizer_state_mode
     gaussians._paper_optimizer_block_size = int(getattr(args, "gaussian_block_size", 4096))
@@ -1979,7 +1993,7 @@ def configure_gpu_resident_optimizer_state(
     get_gpu_resident_optimizer_fn: Callable,
     log_file=None,
 ) -> None:
-    if getattr(gaussians, "_paper_optimizer_state_mode", "full_cpu") != "resident_blocks":
+    if getattr(gaussians, "_paper_optimizer_state_mode", "full_cpu") not in _GPU_RESIDENT_STATE_MODES:
         return
     if args.stop_update_param:
         return
@@ -1993,9 +2007,15 @@ def configure_gpu_resident_optimizer_state(
             == "3dgs2_tr"
             else "Adam"
         )
+        state_message = (
+            "evicted Adam state is retained in the CPU cache."
+            if getattr(gaussians, "_paper_optimizer_state_mode", "")
+            == "resident_cpu_cache"
+            else "optimizer state exists only for resident blocks on GPU and cold-restarts on block re-admission."
+        )
         write_paper_phase1_log(
-            f"[PAPER OPTIMIZER STATE] gpu_resident {optimizer_label} enabled: optimizer state "
-            "exist only for resident blocks on GPU and cold-restart on block re-admission.\n",
+            f"[PAPER OPTIMIZER STATE] gpu_resident {optimizer_label} enabled: "
+            f"{state_message}\n",
             log_file=log_file,
         )
 

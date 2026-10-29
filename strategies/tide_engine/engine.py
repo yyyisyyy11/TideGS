@@ -35,6 +35,17 @@ def get_gpu_resident_optimizer(gaussians, batch_size):
         optimizer_type = GPUResidentAdam
     else:
         raise RuntimeError(f"Unsupported resident optimizer algorithm: {algorithm!r}")
+    state_mode = str(
+        getattr(
+            getattr(gaussians, "args", None),
+            "paper_optimizer_state_mode",
+            "resident_blocks",
+        )
+    ).lower()
+    if state_mode == "resident_cpu_cache" and algorithm != "adam":
+        raise RuntimeError(
+            "resident_cpu_cache is currently implemented only for the Adam optimizer"
+        )
     desired_block_size = int(
         getattr(
             gaussians,
@@ -43,6 +54,15 @@ def get_gpu_resident_optimizer(gaussians, batch_size):
         )
     )
     current_optimizer = getattr(gaussians, '_paper_gpu_resident_optimizer', None)
+    if current_optimizer is not None:
+        current_state_mode = str(
+            getattr(current_optimizer, "state_mode", "resident_blocks")
+        ).lower()
+        if current_state_mode != state_mode:
+            raise RuntimeError(
+                "Cannot change the resident optimizer state mode after the optimizer "
+                f"has been created: current={current_state_mode!r}, requested={state_mode!r}"
+            )
     needs_recreate = (
         current_optimizer is None
         or getattr(current_optimizer, '_paper_optimizer_algorithm', None) != algorithm
@@ -59,6 +79,8 @@ def get_gpu_resident_optimizer(gaussians, batch_size):
             device='cuda',
         )
         resident_optimizer._paper_optimizer_algorithm = algorithm
+        if state_mode == "resident_cpu_cache":
+            resident_optimizer.enable_cpu_state_cache()
         gaussians._paper_gpu_resident_optimizer = resident_optimizer
     return gaussians._paper_gpu_resident_optimizer
 

@@ -111,12 +111,13 @@ if triton is not None:
 
 
 class GPUResidentAdam:
-    """Adam with moments stored only for the current resident block set.
+    """Adam with moments stored for the current resident block set.
 
-    Blocks keep stable state slots while resident. Eviction releases the slot and
-    discards its moments; a later admission starts from zero. The update itself is
-    vectorized over every touched row, avoiding the former block-by-component
-    Python loop and its hundreds of thousands of tiny CUDA kernels.
+    The default ``resident_blocks`` mode keeps state only in GPU slots. The
+    experimental ``resident_cpu_cache`` mode snapshots evicted Adam state to CPU
+    memory and restores it on a later admission. The update itself is vectorized
+    over every touched row, avoiding the former block-by-component Python loop and
+    its hundreds of thousands of tiny CUDA kernels.
     """
 
     COMPONENT_SPECS = (
@@ -164,6 +165,9 @@ class GPUResidentAdam:
         self._exp_avg_sq: Dict[str, torch.Tensor] = {}
         self._bias_correction1: Optional[torch.Tensor] = None
         self._denom_scale: Optional[torch.Tensor] = None
+        self._persistent_state_enabled = False
+        self._cpu_state_cache: Dict[int, Dict[str, Any]] = {}
+        self._cpu_state_cache_bytes = 0
 
         self._logical_state_blocks = 0
         self._logical_state_bytes = 0
@@ -179,7 +183,89 @@ class GPUResidentAdam:
             "optimizer_rows_touched_total": 0,
             "cold_restarted_rows_touched_total": 0,
             "mean_resident_streak": 0.0,
+            "persistent_state_blocks": 0,
+            "persistent_state_bytes": 0,
+            "persistent_state_hits": 0,
+            "persistent_state_misses": 0,
+            "persistent_state_saves": 0,
+            "persistent_state_restores": 0,
         }
+
+    def enable_cpu_state_cache(self) -> None:
+        """Keep evicted Adam state in CPU memory for an A/B quality experiment."""
+
+        if self._resident_blocks:
+            raise RuntimeError(
+                "[GPUResidentAdam] CPU state cache must be enabled before residency "
+                "is initialized"
+            )
+        self._persistent_state_enabled = True
+        self.state_mode = "resident_cpu_cache"
+        self._stats["state_mode"] = self.state_mode
+
+    def _state_cache_entry_bytes(self, state: Dict[str, Any]) -> int:
+        row_count = int(state["row_count"])
+        return int(row_count * self._logical_state_bytes_per_row() + 8)
+
+    def _snapshot_slot_state(self, block_id: int, slot: int) -> Dict[str, Any]:
+        row_count = int(self._slot_row_counts[slot])
+        if row_count <= 0 or row_count > self.block_size:
+            raise RuntimeError(
+                f"[GPUResidentAdam] invalid state row count for block {block_id}: "
+                f"{row_count}"
+            )
+        state = {
+            "row_count": row_count,
+            "step": int(self._slot_steps[slot]),
+            "exp_avg": {},
+            "exp_avg_sq": {},
+        }
+        for name, _, width, _ in self.COMPONENT_SPECS:
+            view = self._exp_avg[name].view(
+                self._allocated_slots, self.block_size, width
+            )
+            view_sq = self._exp_avg_sq[name].view(
+                self._allocated_slots, self.block_size, width
+            )
+            state["exp_avg"][name] = view[slot, :row_count].detach().cpu().clone()
+            state["exp_avg_sq"][name] = (
+                view_sq[slot, :row_count].detach().cpu().clone()
+            )
+        return state
+
+    def _restore_slot_state(self, block_id: int, slot: int, state: Dict[str, Any]) -> None:
+        row_count = int(state["row_count"])
+        if row_count <= 0 or row_count > self.block_size:
+            raise RuntimeError(
+                f"[GPUResidentAdam] invalid cached state row count for block "
+                f"{block_id}: {row_count}"
+            )
+        for name, _, width, _ in self.COMPONENT_SPECS:
+            cached_avg = state["exp_avg"].get(name)
+            cached_avg_sq = state["exp_avg_sq"].get(name)
+            expected_shape = (row_count, width)
+            if (
+                not torch.is_tensor(cached_avg)
+                or not torch.is_tensor(cached_avg_sq)
+                or tuple(cached_avg.shape) != expected_shape
+                or tuple(cached_avg_sq.shape) != expected_shape
+            ):
+                raise RuntimeError(
+                    f"[GPUResidentAdam] cached state shape mismatch for block "
+                    f"{block_id}, component={name}"
+                )
+            avg_view = self._exp_avg[name].view(
+                self._allocated_slots, self.block_size, width
+            )
+            avg_sq_view = self._exp_avg_sq[name].view(
+                self._allocated_slots, self.block_size, width
+            )
+            avg_view[slot, :row_count].copy_(cached_avg, non_blocking=False)
+            avg_sq_view[slot, :row_count].copy_(cached_avg_sq, non_blocking=False)
+
+    def _update_persistent_state_stats(self) -> None:
+        self._stats["persistent_state_blocks"] = len(self._cpu_state_cache)
+        self._stats["persistent_state_bytes"] = int(self._cpu_state_cache_bytes)
 
     def _physical_state_bytes(self) -> int:
         moment_bytes = self._allocated_slots * self.block_size * self.TOTAL_WIDTH * 2 * 4
@@ -193,6 +279,7 @@ class GPUResidentAdam:
         self._stats["resident_state_blocks"] = int(self._logical_state_blocks)
         self._stats["resident_state_bytes"] = int(self._logical_state_bytes)
         self._stats["allocated_state_bytes"] = self._physical_state_bytes()
+        self._update_persistent_state_stats()
         streak_total = self._completed_streak_total + sum(self._resident_streaks.values())
         streak_count = self._completed_streak_count + len(self._resident_streaks)
         self._stats["mean_resident_streak"] = float(streak_total) / max(1, streak_count)
@@ -296,6 +383,8 @@ class GPUResidentAdam:
         next_logical_state_blocks = self._logical_state_blocks
         next_logical_state_bytes = self._logical_state_bytes
         next_stats = dict(self._stats)
+        next_cpu_state_cache = dict(self._cpu_state_cache)
+        next_cpu_state_cache_bytes = int(self._cpu_state_cache_bytes)
 
         for block_id in evicted:
             streak = int(next_resident_streaks.pop(block_id, 0))
@@ -304,6 +393,18 @@ class GPUResidentAdam:
                 next_completed_streak_count += 1
             slot = next_block_to_slot.pop(block_id)
             if next_slot_initialized[slot]:
+                if self._persistent_state_enabled:
+                    cached_state = self._snapshot_slot_state(block_id, slot)
+                    previous_state = next_cpu_state_cache.get(block_id)
+                    if previous_state is not None:
+                        next_cpu_state_cache_bytes -= self._state_cache_entry_bytes(
+                            previous_state
+                        )
+                    next_cpu_state_cache[block_id] = cached_state
+                    next_cpu_state_cache_bytes += self._state_cache_entry_bytes(
+                        cached_state
+                    )
+                    next_stats["persistent_state_saves"] += 1
                 next_stats["state_evictions"] += 1
                 next_logical_state_blocks -= 1
                 next_logical_state_bytes -= (
@@ -334,6 +435,24 @@ class GPUResidentAdam:
 
         try:
             self._clear_slots(incoming_slots)
+            if self._persistent_state_enabled:
+                for block_id in sorted(incoming):
+                    slot = next_block_to_slot[block_id]
+                    cached_state = next_cpu_state_cache.get(block_id)
+                    if cached_state is None:
+                        next_stats["persistent_state_misses"] += 1
+                        continue
+                    self._restore_slot_state(block_id, slot, cached_state)
+                    next_slot_steps[slot] = int(cached_state["step"])
+                    next_slot_initialized[slot] = True
+                    row_count = int(cached_state["row_count"])
+                    next_slot_row_counts[slot] = row_count
+                    next_logical_state_blocks += 1
+                    next_logical_state_bytes += (
+                        row_count * self._logical_state_bytes_per_row()
+                    )
+                    next_stats["persistent_state_hits"] += 1
+                    next_stats["persistent_state_restores"] += 1
             if incoming_slots and self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
         except BaseException as error:
@@ -357,6 +476,8 @@ class GPUResidentAdam:
         self._logical_state_blocks = next_logical_state_blocks
         self._logical_state_bytes = next_logical_state_bytes
         self._stats = next_stats
+        self._cpu_state_cache = next_cpu_state_cache
+        self._cpu_state_cache_bytes = next_cpu_state_cache_bytes
         self._resident_blocks = next_resident
         self._update_state_stats()
 
@@ -699,6 +820,11 @@ class GPUResidentSophiaTR(GPUResidentAdam):
                 "step is pending"
             )
         super().set_resident_blocks(block_ids)
+
+    def enable_cpu_state_cache(self) -> None:
+        raise RuntimeError(
+            "[GPUResidentSophiaTR] resident_cpu_cache currently supports Adam only"
+        )
 
     def _physical_state_bytes(self) -> int:
         moment_bytes = super()._physical_state_bytes()

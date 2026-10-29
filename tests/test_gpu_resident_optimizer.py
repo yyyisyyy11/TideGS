@@ -5,7 +5,7 @@ from unittest import mock
 
 import torch
 
-from strategies.tide_engine.gpu_resident_optimizer import GPUResidentAdam
+from strategies.tide_engine.gpu_resident_optimizer import GPUResidentAdam, GPUResidentSophiaTR
 
 
 COMPONENT_SPECS = GPUResidentAdam.COMPONENT_SPECS
@@ -153,6 +153,102 @@ class GPUResidentAdamAllocationTest(unittest.TestCase):
 
         self.assertIs(first, second)
         optimizer_cls.assert_called_once()
+
+
+class _CpuManager:
+    def __init__(self, block_layout):
+        self.set_layout(block_layout)
+
+    def set_layout(self, block_layout):
+        self.loaded_blocks = [block_id for block_id, _ in block_layout]
+        self.block_to_gpu_slice = {
+            block_id: block_slice for block_id, block_slice in block_layout
+        }
+        total_rows = max(block_slice.stop for _, block_slice in block_layout)
+        self.local_to_global_idx = torch.arange(total_rows, device="cpu")
+
+
+class GPUResidentAdamPersistentStateTest(unittest.TestCase):
+    def test_cpu_state_cache_restores_evicted_block_state(self):
+        block_size = 4
+        manager = _CpuManager([(10, slice(0, block_size))])
+        params = {
+            name: torch.zeros((block_size, width), dtype=torch.float32)
+            for name, _, width, _ in COMPONENT_SPECS
+        }
+        gaussians = _Gaussians(
+            manager,
+            params,
+            columns_lr=[0.01, 0.01, 0.01, 0.01, 0.01, 0.01],
+        )
+        optimizer = GPUResidentAdam(
+            batch_size=1,
+            block_size=block_size,
+            capacity_blocks=1,
+            device="cpu",
+        )
+        optimizer.enable_cpu_state_cache()
+        optimizer.set_resident_blocks([10])
+
+        local_ids = torch.arange(block_size, dtype=torch.long)
+        gradients = {
+            name: torch.ones((block_size, width), dtype=torch.float32)
+            for name, _, width, _ in COMPONENT_SPECS
+        }
+        first = optimizer.step(
+            iteration=1,
+            gaussians=gaussians,
+            sparse_grad_local_ids=local_ids,
+            sparse_grad_components=gradients,
+        )
+        self.assertEqual(first["cold_rows"], block_size)
+
+        first_slot = optimizer._block_to_slot[10]
+        first_avg = {
+            name: optimizer._exp_avg[name]
+            .view(optimizer._allocated_slots, block_size, width)[first_slot, :]
+            .clone()
+            for name, _, width, _ in COMPONENT_SPECS
+        }
+
+        manager.set_layout([(20, slice(0, block_size))])
+        optimizer.set_resident_blocks([20])
+        stats_after_eviction = optimizer.get_stats()
+        self.assertEqual(stats_after_eviction["persistent_state_saves"], 1)
+        self.assertEqual(stats_after_eviction["persistent_state_misses"], 2)
+
+        manager.set_layout([(10, slice(0, block_size))])
+        optimizer.set_resident_blocks([10])
+        restored = optimizer.get_stats()
+        self.assertEqual(restored["persistent_state_hits"], 1)
+        self.assertEqual(restored["persistent_state_restores"], 1)
+        self.assertGreater(restored["persistent_state_bytes"], 0)
+        self.assertEqual(optimizer._slot_steps[optimizer._block_to_slot[10]], 1)
+
+        second = optimizer.step(
+            iteration=2,
+            gaussians=gaussians,
+            sparse_grad_local_ids=local_ids,
+            sparse_grad_components=gradients,
+        )
+        self.assertEqual(second["cold_rows"], 0)
+        second_slot = optimizer._block_to_slot[10]
+        self.assertEqual(optimizer._slot_steps[second_slot], 2)
+        for name, _, width, _ in COMPONENT_SPECS:
+            actual = optimizer._exp_avg[name].view(
+                optimizer._allocated_slots, block_size, width
+            )[second_slot, :]
+            torch.testing.assert_close(actual, first_avg[name] * 0.9 + 0.1)
+
+    def test_sophia_rejects_adam_cpu_state_cache(self):
+        optimizer = GPUResidentSophiaTR(
+            batch_size=1,
+            block_size=4,
+            capacity_blocks=1,
+            device="cpu",
+        )
+        with self.assertRaisesRegex(RuntimeError, "supports Adam only"):
+            optimizer.enable_cpu_state_cache()
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")

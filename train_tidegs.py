@@ -674,8 +674,11 @@ def _validate_pure_ssd_runtime(args, gaussians, storage_adapter, resolved_backen
         raise RuntimeError("[PURE SSD CHECK] _paper_unified_params_freed marker is missing")
     if getattr(args, "paper_optimizer_backend", "cpu") != "gpu_resident":
         raise RuntimeError("[PURE SSD CHECK] optimizer backend must be gpu_resident")
-    if getattr(args, "paper_optimizer_state_mode", "full_cpu") != "resident_blocks":
-        raise RuntimeError("[PURE SSD CHECK] optimizer state mode must be resident_blocks")
+    if getattr(args, "paper_optimizer_state_mode", "full_cpu") not in {
+        "resident_blocks",
+        "resident_cpu_cache",
+    }:
+        raise RuntimeError("[PURE SSD CHECK] optimizer state mode must be resident_blocks or resident_cpu_cache")
 
     total_gaussians = getattr(gaussians, "_paper_unified_params_num_total", None)
     total_desc = f"{int(total_gaussians):,}" if total_gaussians is not None else "unknown"
@@ -696,7 +699,8 @@ def _validate_pure_ssd_runtime(args, gaussians, storage_adapter, resolved_backen
         "[PURE SSD CHECK] Runtime path verified: "
         f"gaussians={total_desc} blocks={num_blocks} "
         f"block_reader=TieredCacheBlockReader optimizer={optimizer_label} "
-        f"state=resident_blocks init={init_state} ram_cache_limit={cache_limit_gb:.2f}GB\n"
+        f"state={getattr(args, 'paper_optimizer_state_mode', 'resident_blocks')} "
+        f"init={init_state} ram_cache_limit={cache_limit_gb:.2f}GB\n"
     )
     log_file.write(message)
     utils.print_rank_0(message.strip())
@@ -1166,6 +1170,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         'last_cold_rows_total': 0,
         'last_cold_restarts_total': 0,
         'last_state_evictions_total': 0,
+        'last_persistent_state_hits_total': 0,
+        'last_persistent_state_misses_total': 0,
+        'last_persistent_state_saves_total': 0,
     }
 
     def _snapshot_optimizer_churn_counters():
@@ -1173,7 +1180,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         if gpu_resident_optimizer is None:
             return None
         stats = gpu_resident_optimizer.get_stats()
-        if stats.get('state_mode', 'full_cpu') != 'resident_blocks':
+        if stats.get('state_mode', 'full_cpu') not in {'resident_blocks', 'resident_cpu_cache'}:
             return None
         return {
             'optimizer_rows_touched_total': int(stats.get('optimizer_rows_touched_total', 0)),
@@ -1181,6 +1188,10 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             'cold_restarts_total': int(stats.get('cold_restarts', 0)),
             'state_evictions_total': int(stats.get('state_evictions', 0)),
             'mean_resident_streak': float(stats.get('mean_resident_streak', 0.0)),
+            'persistent_state_hits_total': int(stats.get('persistent_state_hits', 0)),
+            'persistent_state_misses_total': int(stats.get('persistent_state_misses', 0)),
+            'persistent_state_saves_total': int(stats.get('persistent_state_saves', 0)),
+            'persistent_state_bytes': int(stats.get('persistent_state_bytes', 0)),
         }
 
     def _write_optimizer_churn_epoch(epoch_zero_based: int, iteration_end: int):
@@ -1194,24 +1205,33 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         epoch_cold_rows = max(0, stats['cold_restarted_rows_touched_total'] - optimizer_churn_state['last_cold_rows_total'])
         epoch_cold_restarts = max(0, stats['cold_restarts_total'] - optimizer_churn_state['last_cold_restarts_total'])
         epoch_state_evictions = max(0, stats['state_evictions_total'] - optimizer_churn_state['last_state_evictions_total'])
+        epoch_state_hits = max(0, stats['persistent_state_hits_total'] - optimizer_churn_state['last_persistent_state_hits_total'])
+        epoch_state_misses = max(0, stats['persistent_state_misses_total'] - optimizer_churn_state['last_persistent_state_misses_total'])
+        epoch_state_saves = max(0, stats['persistent_state_saves_total'] - optimizer_churn_state['last_persistent_state_saves_total'])
         epoch_cold_ratio_pct = 100.0 * epoch_cold_rows / max(1, epoch_optimizer_rows)
 
         optimizer_churn_tsv.write(
             f"{epoch_zero_based + 1}\t{iteration_end}\t{epoch_optimizer_rows}\t{epoch_cold_rows}\t"
             f"{epoch_cold_ratio_pct:.6f}\t{epoch_cold_restarts}\t{epoch_state_evictions}\t"
-            f"{stats['mean_resident_streak']:.6f}\n"
+            f"{stats['mean_resident_streak']:.6f}\t{epoch_state_hits}\t{epoch_state_misses}\t"
+            f"{epoch_state_saves}\t{stats['persistent_state_bytes']}\n"
         )
         log_file.write(
             f"[OPTIMIZER CHURN] Epoch {epoch_zero_based + 1}: rows={epoch_optimizer_rows}, "
             f"cold_rows={epoch_cold_rows}, cold_ratio={epoch_cold_ratio_pct:.4f}%, "
             f"cold_restarts={epoch_cold_restarts}, state_evictions={epoch_state_evictions}, "
-            f"mean_streak={stats['mean_resident_streak']:.4f}\n"
+            f"mean_streak={stats['mean_resident_streak']:.4f}, "
+            f"state_hits={epoch_state_hits}, state_misses={epoch_state_misses}, "
+            f"state_saves={epoch_state_saves}, state_cache_bytes={stats['persistent_state_bytes']}\n"
         )
 
         optimizer_churn_state['last_optimizer_rows_total'] = stats['optimizer_rows_touched_total']
         optimizer_churn_state['last_cold_rows_total'] = stats['cold_restarted_rows_touched_total']
         optimizer_churn_state['last_cold_restarts_total'] = stats['cold_restarts_total']
         optimizer_churn_state['last_state_evictions_total'] = stats['state_evictions_total']
+        optimizer_churn_state['last_persistent_state_hits_total'] = stats['persistent_state_hits_total']
+        optimizer_churn_state['last_persistent_state_misses_total'] = stats['persistent_state_misses_total']
+        optimizer_churn_state['last_persistent_state_saves_total'] = stats['persistent_state_saves_total']
 
     def _enable_optimizer_churn_logging(reason: str):
         nonlocal optimizer_churn_tsv
@@ -1221,7 +1241,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         optimizer_churn_tsv = open(churn_tsv_path, 'w', buffering=1)
         optimizer_churn_tsv.write(
             'epoch\titeration_end\toptimizer_rows_updated\tcold_restarted_rows_updated\t'
-            'cold_restarted_row_ratio_pct\tcold_restarts\tstate_evictions\tmean_resident_streak\n'
+            'cold_restarted_row_ratio_pct\tcold_restarts\tstate_evictions\tmean_resident_streak\t'
+            'persistent_state_hits\tpersistent_state_misses\tpersistent_state_saves\t'
+            'persistent_state_bytes\n'
         )
         log_file.write(f"[OPTIMIZER CHURN] Per-epoch churn logging enabled: {churn_tsv_path} ({reason})\n")
         log_file.flush()
@@ -1402,7 +1424,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 optimizer_churn_tsv is None
                 and getattr(args, 'pure_ssd_offload', False)
                 and str(getattr(args, 'paper_optimizer_backend', '')).lower() == 'gpu_resident'
-                and str(getattr(args, 'paper_optimizer_state_mode', '')).lower() == 'resident_blocks'
+                and str(getattr(args, 'paper_optimizer_state_mode', '')).lower()
+                in {'resident_blocks', 'resident_cpu_cache'}
             ):
                 _enable_optimizer_churn_logging("pure_ssd_gpu_resident")
 

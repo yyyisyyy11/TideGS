@@ -241,6 +241,22 @@ The runner also exposes `--sophia-beta1`, `--sophia-beta2`,
 3DGS2-TR rejects incompatible runtime or resume settings and never falls back
 to Adam.
 
+### Experimental CPU Optimizer State Cache
+
+For an Adam quality A/B run, retain evicted block moments in process-local CPU
+memory:
+
+```bash
+bash scripts/train_matrixcity_1b.sh \
+  --optimizer adam \
+  --optimizer-state-mode resident_cpu_cache
+```
+
+This mode restores `exp_avg`, `exp_avg_sq`, and the per-block Adam step after a
+GPU resident-set eviction. It is intentionally not serialized into checkpoints,
+has no CPU cache size limit yet, and currently rejects 3DGS2-TR. Use a small scene
+or a short run first because CPU state costs about 472 bytes per Gaussian.
+
 ### Multi-GPU Gaussian Sharding
 
 Use one process per GPU. `--bsz` and `--capacity` are global; RAM cache limits
