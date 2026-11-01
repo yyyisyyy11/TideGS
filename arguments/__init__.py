@@ -229,6 +229,7 @@ class AuxiliaryParams(ParamGroup):
         self.paper_free_unified_params = False  # release _unified_params after init to unlock >100GB scenes; requires paper_block_reader_backend != unified_params and paper_optimizer_backend=gpu_resident
         self.paper_debug_logging = False  # Enable verbose TideGS diagnostics for development runs
         self.tide_distributed_mode = "off"  # {off, gaussian_sharded}; explicit torchrun mode
+        self.tide_async_plan = False  # overlap distributed N+1 plan/SSD hint with current training
         self.tide_camera_assignment = "equal"  # {equal, gaussian_balanced}; camera identity placement
         self.tide_camera_microbatch = 4  # Cameras rendered per distributed gsplat call
         self.tide_owner_balance_samples = 256  # Legacy compatibility; stable round-robin ignores it

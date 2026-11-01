@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any, List
 
@@ -29,6 +29,10 @@ class DistributedContext:
     rank: int = 0
     local_rank: int = 0
     world_size: int = 1
+    # The plan-control group is deliberately separate from NCCL.  It carries
+    # only small CPU Python payloads, so predictive planning can publish while
+    # the training process group is executing NCCL collectives.
+    plan_group: Any = field(default=None, repr=False, compare=False)
 
     @property
     def enabled(self) -> bool:
@@ -70,6 +74,12 @@ class DistributedContext:
             raise RuntimeError("gaussian_sharded mode requires CUDA")
 
         torch.cuda.set_device(local_rank)
+        # Use one timeout for both the NCCL training group and the CPU plan
+        # group.  A long SSD maintenance burst may legitimately exceed the
+        # usual ten-minute default.
+        pg_timeout = timedelta(
+            seconds=int(os.environ.get("TIDE_PG_TIMEOUT_SEC", 3600))
+        )
         if not dist.is_initialized():
             # NCCL's built-in collective timeout is 10 minutes, and a compaction burst can
             # legitimately exceed it: the compaction barrier is an all-gather that the other
@@ -78,9 +88,6 @@ class DistributedContext:
             # "Watchdog caught collective operation timeout: ... OpType=ALLGATHER ...
             #  Timeout(ms)=600000".  Raise it so a long maintenance burst cannot kill the job;
             # TIDE_PG_TIMEOUT_SEC overrides without another code edit.
-            pg_timeout = timedelta(
-                seconds=int(os.environ.get("TIDE_PG_TIMEOUT_SEC", 3600))
-            )
             dist.init_process_group(
                 backend="nccl", init_method="env://", timeout=pg_timeout
             )
@@ -88,7 +95,18 @@ class DistributedContext:
             raise RuntimeError("torch.distributed process-group metadata does not match torchrun")
 
         args.gpu = local_rank
-        context = cls(mode=mode, rank=rank, local_rank=local_rank, world_size=world_size)
+        plan_group = dist.new_group(
+            ranks=list(range(world_size)),
+            backend="gloo",
+            timeout=pg_timeout,
+        )
+        context = cls(
+            mode=mode,
+            rank=rank,
+            local_rank=local_rank,
+            world_size=world_size,
+            plan_group=plan_group,
+        )
         setattr(args, "_tide_distributed_context", context)
         return context
 
@@ -105,6 +123,41 @@ class DistributedContext:
             dist.broadcast_object_list(payload, src=src, device=torch.device("cuda", self.local_rank))
         return payload[0]
 
+    def broadcast_plan_object(
+        self,
+        value: Any,
+        src: int = 0,
+        group: Any = None,
+    ) -> Any:
+        """Broadcast a CPU-only plan payload through the independent Gloo group."""
+
+        if not self.enabled:
+            return value
+        plan_group = self.plan_group if group is None else group
+        if plan_group is None:
+            raise RuntimeError("Distributed plan group is not initialized")
+        payload = [value if self.rank == src else None]
+        with tide_range("tide.comm.plan_publish"):
+            dist.broadcast_object_list(
+                payload,
+                src=src,
+                group=plan_group,
+                device=torch.device("cpu"),
+            )
+        return payload[0]
+
+    def all_gather_plan_object(self, value: Any) -> List[Any]:
+        """Gather small CPU plan-worker statuses through the Gloo group."""
+
+        if not self.enabled:
+            return [value]
+        if self.plan_group is None:
+            raise RuntimeError("Distributed plan group is not initialized")
+        gathered: List[Any] = [None for _ in range(self.world_size)]
+        with tide_range("tide.comm.plan_status"):
+            dist.all_gather_object(gathered, value, group=self.plan_group)
+        return gathered
+
     def all_gather_object(self, value: Any) -> List[Any]:
         if not self.enabled:
             return [value]
@@ -115,6 +168,8 @@ class DistributedContext:
 
     def close(self) -> None:
         if self.enabled and dist.is_initialized():
+            if self.plan_group is not None:
+                dist.destroy_process_group(self.plan_group)
             dist.destroy_process_group()
 
 
