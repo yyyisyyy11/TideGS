@@ -1,6 +1,7 @@
 import math
 import types
 import unittest
+import tempfile
 from unittest import mock
 
 import torch
@@ -249,6 +250,61 @@ class GPUResidentAdamPersistentStateTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "supports Adam only"):
             optimizer.enable_cpu_state_cache()
+
+    def test_ssd_state_cache_restores_evicted_block_state(self):
+        block_size = 4
+        manager = _CpuManager([(10, slice(0, block_size))])
+        params = {
+            name: torch.zeros((block_size, width), dtype=torch.float32)
+            for name, _, width, _ in COMPONENT_SPECS
+        }
+        gaussians = _Gaussians(
+            manager,
+            params,
+            columns_lr=[0.01, 0.01, 0.01, 0.01, 0.01, 0.01],
+        )
+        gradients = {
+            name: torch.ones((block_size, width), dtype=torch.float32)
+            for name, _, width, _ in COMPONENT_SPECS
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            optimizer = GPUResidentAdam(
+                batch_size=1,
+                block_size=block_size,
+                capacity_blocks=1,
+                device="cpu",
+            )
+            optimizer.enable_ssd_state_cache(temporary)
+            optimizer.set_resident_blocks([10])
+            optimizer.step(
+                iteration=1,
+                gaussians=gaussians,
+                sparse_grad_local_ids=torch.arange(block_size, dtype=torch.long),
+                sparse_grad_components=gradients,
+            )
+            first_slot = optimizer._block_to_slot[10]
+            first_avg = {
+                name: optimizer._exp_avg[name]
+                .view(optimizer._allocated_slots, block_size, width)[first_slot, :]
+                .clone()
+                for name, _, width, _ in COMPONENT_SPECS
+            }
+
+            manager.set_layout([(20, slice(0, block_size))])
+            optimizer.set_resident_blocks([20])
+            optimizer.flush_persistent_state()
+            self.assertEqual(optimizer.get_stats()["persistent_state_saves"], 1)
+
+            manager.set_layout([(10, slice(0, block_size))])
+            optimizer.set_resident_blocks([10])
+            self.assertEqual(optimizer.get_stats()["persistent_state_hits"], 1)
+            self.assertEqual(optimizer._slot_steps[optimizer._block_to_slot[10]], 1)
+            for name, _, width, _ in COMPONENT_SPECS:
+                actual = optimizer._exp_avg[name].view(
+                    optimizer._allocated_slots, block_size, width
+                )[optimizer._block_to_slot[10], :]
+                torch.testing.assert_close(actual, first_avg[name])
+            optimizer.close()
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")

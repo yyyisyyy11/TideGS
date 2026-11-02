@@ -257,6 +257,23 @@ GPU resident-set eviction. It is intentionally not serialized into checkpoints,
 has no CPU cache size limit yet, and currently rejects 3DGS2-TR. Use a small scene
 or a short run first because CPU state costs about 472 bytes per Gaussian.
 
+### Experimental SSD Optimizer State Cache (Single Card)
+
+For a single-card run that keeps evicted Adam moments durable on SSD, use:
+
+```bash
+bash scripts/train_matrixcity_1b.sh \
+  --optimizer adam \
+  --optimizer-state-mode resident_ssd_cache
+```
+
+Evicted blocks are written asynchronously under
+`<model_path>/optimizer_state_ssd/`. Checkpoint writes drain pending state
+writes and include a complete `optimizer_state_ssd/` snapshot, so resuming from
+that checkpoint restores Adam moments and block steps. Missing or checksum-invalid
+state is logged and cold-started. This mode currently supports single-card Adam
+only and rejects distributed or 3DGS2-TR runs.
+
 ### Multi-GPU Gaussian Sharding
 
 Use one process per GPU. `--bsz` and `--capacity` are global; RAM cache limits

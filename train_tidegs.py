@@ -677,8 +677,12 @@ def _validate_pure_ssd_runtime(args, gaussians, storage_adapter, resolved_backen
     if getattr(args, "paper_optimizer_state_mode", "full_cpu") not in {
         "resident_blocks",
         "resident_cpu_cache",
+        "resident_ssd_cache",
     }:
-        raise RuntimeError("[PURE SSD CHECK] optimizer state mode must be resident_blocks or resident_cpu_cache")
+        raise RuntimeError(
+            "[PURE SSD CHECK] optimizer state mode must be resident_blocks, "
+            "resident_cpu_cache, or resident_ssd_cache"
+        )
 
     total_gaussians = getattr(gaussians, "_paper_unified_params_num_total", None)
     total_desc = f"{int(total_gaussians):,}" if total_gaussians is not None else "unknown"
@@ -1180,7 +1184,11 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         if gpu_resident_optimizer is None:
             return None
         stats = gpu_resident_optimizer.get_stats()
-        if stats.get('state_mode', 'full_cpu') not in {'resident_blocks', 'resident_cpu_cache'}:
+        if stats.get('state_mode', 'full_cpu') not in {
+            'resident_blocks',
+            'resident_cpu_cache',
+            'resident_ssd_cache',
+        }:
             return None
         return {
             'optimizer_rows_touched_total': int(stats.get('optimizer_rows_touched_total', 0)),
@@ -1425,7 +1433,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 and getattr(args, 'pure_ssd_offload', False)
                 and str(getattr(args, 'paper_optimizer_backend', '')).lower() == 'gpu_resident'
                 and str(getattr(args, 'paper_optimizer_state_mode', '')).lower()
-                in {'resident_blocks', 'resident_cpu_cache'}
+                in {'resident_blocks', 'resident_cpu_cache', 'resident_ssd_cache'}
             ):
                 _enable_optimizer_churn_logging("pure_ssd_gpu_resident")
 
@@ -1866,6 +1874,44 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                         phase="checkpoint writeback drain",
                         operation=storage_adapter.drain_cache_writebacks,
                     )
+                    optimizer_state_checkpoint = None
+                    if (
+                        not distributed_enabled
+                        and str(
+                            getattr(args, "paper_optimizer_state_mode", "")
+                        ).lower()
+                        == "resident_ssd_cache"
+                    ):
+                        resident_optimizer = getattr(
+                            gaussians,
+                            "_paper_gpu_resident_optimizer",
+                            None,
+                        )
+                        if resident_optimizer is None:
+                            raise RuntimeError(
+                                "resident_ssd_cache checkpoint requires an initialized optimizer"
+                            )
+                        exported_state = resident_optimizer.export_persistent_state(
+                            save_folder
+                        )
+                        if exported_state is None:
+                            raise RuntimeError(
+                                "resident_ssd_cache optimizer did not export state"
+                            )
+                        log_file.write(
+                            "[PURE SSD CHECKPOINT] Exported optimizer state: "
+                            f"blocks={int(exported_state.get('state_block_count', 0))} "
+                            f"manifest={exported_state['manifest']}\n"
+                        )
+                        optimizer_state_checkpoint = {
+                            "optimizer_state_mode": "resident_ssd_cache",
+                            "optimizer_state_saved": True,
+                            "adam_moments_saved": True,
+                            "optimizer_state_format_version": int(
+                                exported_state.get("state_format_version", 1)
+                            ),
+                            "optimizer_state_manifest": exported_state["manifest"],
+                        }
                     pure_ssd_checkpoint_mode = str(
                         getattr(args, "pure_ssd_checkpoint_mode", "incremental")
                     ).lower()
@@ -1892,6 +1938,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                             next_iteration=iteration + args.bsz,
                             args=args,
                             chunk_blocks=getattr(args, "pure_ssd_checkpoint_chunk_blocks", 256),
+                            optimizer_state_manifest=optimizer_state_checkpoint,
                             log_file=log_file,
                         )
                     else:
@@ -1902,6 +1949,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                             iteration=checkpoint_iteration,
                             next_iteration=iteration + args.bsz,
                             args=args,
+                            optimizer_state_manifest=optimizer_state_checkpoint,
                             log_file=log_file,
                         )
                     prune_operation = None
@@ -2085,6 +2133,20 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             operation=shutdown_double_buffer_gpu,
         )
         distributed_context.barrier()
+
+    if (
+        not distributed_enabled
+        and str(getattr(args, "paper_optimizer_state_mode", "")).lower()
+        == "resident_ssd_cache"
+    ):
+        resident_optimizer = getattr(
+            gaussians,
+            "_paper_gpu_resident_optimizer",
+            None,
+        )
+        if resident_optimizer is not None:
+            resident_optimizer.flush_persistent_state()
+            resident_optimizer.close()
 
     scene.clean_up()
 

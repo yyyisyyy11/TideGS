@@ -120,6 +120,11 @@ def load_pure_ssd_checkpoint_manifest(path: str | Path) -> Dict[str, Any]:
         manifest.get("training_state", "training_state.pth"),
         checkpoint_dir,
     )
+    if manifest.get("optimizer_state_manifest"):
+        manifest["optimizer_state_manifest"] = _resolve_path(
+            manifest["optimizer_state_manifest"],
+            checkpoint_dir,
+        )
 
     for key in ("total_points", "num_blocks", "block_size", "param_dim", "next_iteration"):
         if key not in manifest:
@@ -217,6 +222,46 @@ def _optimizer_manifest_args(args) -> Dict[str, Any]:
     return {name: getattr(args, name, None) for name in names}
 
 
+def _optimizer_state_checkpoint_fields(
+    optimizer_state_manifest: Dict[str, Any] | None,
+    checkpoint_dir: Path,
+) -> Dict[str, Any]:
+    """Normalize optional persisted optimizer metadata for the main manifest."""
+
+    if not optimizer_state_manifest:
+        return {
+            "optimizer_state_mode": "cold_start",
+            "optimizer_state_saved": False,
+            "adam_moments_saved": False,
+        }
+    fields = {
+        "optimizer_state_mode": str(
+            optimizer_state_manifest.get("optimizer_state_mode", "resident_ssd_cache")
+        ),
+        "optimizer_state_saved": bool(
+            optimizer_state_manifest.get("optimizer_state_saved", True)
+        ),
+        "adam_moments_saved": bool(
+            optimizer_state_manifest.get("adam_moments_saved", True)
+        ),
+        "optimizer_state_format_version": int(
+            optimizer_state_manifest.get("optimizer_state_format_version", 1)
+        ),
+    }
+    manifest_path = optimizer_state_manifest.get(
+        "optimizer_state_manifest",
+        optimizer_state_manifest.get("manifest"),
+    )
+    if manifest_path:
+        path = Path(str(manifest_path))
+        try:
+            path = path.relative_to(checkpoint_dir)
+        except ValueError:
+            pass
+        fields["optimizer_state_manifest"] = str(path)
+    return fields
+
+
 def write_pure_ssd_snapshot_checkpoint(
     *,
     storage_adapter,
@@ -226,6 +271,7 @@ def write_pure_ssd_snapshot_checkpoint(
     next_iteration: int,
     args,
     chunk_blocks: int = 256,
+    optimizer_state_manifest: Dict[str, Any] | None = None,
     log_file=None,
 ) -> Dict[str, Any]:
     """Write a block-wise pure SSD snapshot checkpoint.
@@ -315,6 +361,10 @@ def write_pure_ssd_snapshot_checkpoint(
     base_manifest = _manifest_base(storage_adapter, gaussians)
     scene_min = getattr(storage_adapter, "scene_min", base_manifest.get("scene_min", [0.0, 0.0, 0.0]))
     scene_max = getattr(storage_adapter, "scene_max", base_manifest.get("scene_max", [0.0, 0.0, 0.0]))
+    optimizer_state_fields = _optimizer_state_checkpoint_fields(
+        optimizer_state_manifest,
+        checkpoint_dir,
+    )
     manifest = {
         **base_manifest,
         "checkpoint_version": 1,
@@ -323,7 +373,7 @@ def write_pure_ssd_snapshot_checkpoint(
         "checkpoint_iter": int(iteration),
         "next_iteration": int(next_iteration),
         "active_sh_degree": int(getattr(gaussians, "active_sh_degree", 0)),
-        "optimizer_state_mode": "cold_start",
+        **optimizer_state_fields,
         "total_points": total_points,
         "num_blocks": num_blocks,
         "block_size": block_size,
@@ -345,10 +395,8 @@ def write_pure_ssd_snapshot_checkpoint(
         {
             "next_iteration": int(next_iteration),
             "active_sh_degree": int(getattr(gaussians, "active_sh_degree", 0)),
-            "optimizer_state_mode": "cold_start",
+            **optimizer_state_fields,
             "optimizer_algorithm": getattr(args, "paper_optimizer_algorithm", "adam"),
-            "optimizer_state_saved": False,
-            "adam_moments_saved": False,
         },
         training_state_file,
     )
@@ -370,6 +418,7 @@ def write_pure_ssd_incremental_checkpoint(
     iteration: int,
     next_iteration: int,
     args,
+    optimizer_state_manifest: Dict[str, Any] | None = None,
     log_file=None,
 ) -> Dict[str, Any]:
     """Write an incremental pure SSD checkpoint.
@@ -444,6 +493,10 @@ def write_pure_ssd_incremental_checkpoint(
     base_manifest = _manifest_base(storage_adapter, gaussians)
     scene_min = getattr(storage_adapter, "scene_min", base_manifest.get("scene_min", [0.0, 0.0, 0.0]))
     scene_max = getattr(storage_adapter, "scene_max", base_manifest.get("scene_max", [0.0, 0.0, 0.0]))
+    optimizer_state_fields = _optimizer_state_checkpoint_fields(
+        optimizer_state_manifest,
+        checkpoint_dir,
+    )
     manifest = {
         **base_manifest,
         "checkpoint_version": 1,
@@ -452,7 +505,7 @@ def write_pure_ssd_incremental_checkpoint(
         "checkpoint_iter": int(iteration),
         "next_iteration": int(next_iteration),
         "active_sh_degree": int(getattr(gaussians, "active_sh_degree", 0)),
-        "optimizer_state_mode": "cold_start",
+        **optimizer_state_fields,
         "total_points": total_points,
         "num_blocks": num_blocks,
         "block_size": block_size,
@@ -515,10 +568,8 @@ def write_pure_ssd_incremental_checkpoint(
         {
             "next_iteration": int(next_iteration),
             "active_sh_degree": int(getattr(gaussians, "active_sh_degree", 0)),
-            "optimizer_state_mode": "cold_start",
+            **optimizer_state_fields,
             "optimizer_algorithm": getattr(args, "paper_optimizer_algorithm", "adam"),
-            "optimizer_state_saved": False,
-            "adam_moments_saved": False,
             "storage_index": str(storage_index_file.resolve()),
         },
         training_state_file,

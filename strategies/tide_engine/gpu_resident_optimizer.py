@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
+from storage.optimizer_state_ssd import SSDOptimizerStateStore
+
 
 @dataclass
 class SophiaTRPreparedStep:
@@ -115,7 +117,9 @@ class GPUResidentAdam:
 
     The default ``resident_blocks`` mode keeps state only in GPU slots. The
     experimental ``resident_cpu_cache`` mode snapshots evicted Adam state to CPU
-    memory and restores it on a later admission. The update itself is vectorized
+    memory and restores it on a later admission. The ``resident_ssd_cache`` mode
+    uses the same transitions with SSD as the durable backing store. The update
+    itself is vectorized
     over every touched row, avoiding the former block-by-component Python loop and
     its hundreds of thousands of tiny CUDA kernels.
     """
@@ -168,6 +172,7 @@ class GPUResidentAdam:
         self._persistent_state_enabled = False
         self._cpu_state_cache: Dict[int, Dict[str, Any]] = {}
         self._cpu_state_cache_bytes = 0
+        self._ssd_state_store: Optional[SSDOptimizerStateStore] = None
 
         self._logical_state_blocks = 0
         self._logical_state_bytes = 0
@@ -189,6 +194,7 @@ class GPUResidentAdam:
             "persistent_state_misses": 0,
             "persistent_state_saves": 0,
             "persistent_state_restores": 0,
+            "persistent_state_warnings": 0,
         }
 
     def enable_cpu_state_cache(self) -> None:
@@ -201,6 +207,45 @@ class GPUResidentAdam:
             )
         self._persistent_state_enabled = True
         self.state_mode = "resident_cpu_cache"
+        self._stats["state_mode"] = self.state_mode
+
+    def enable_ssd_state_cache(
+        self,
+        state_dir: str,
+        *,
+        resume_manifest: Optional[str] = None,
+        allow_cold_start: bool = True,
+    ) -> None:
+        """Persist evicted Adam state to SSD and optionally import a checkpoint."""
+
+        if self._resident_blocks:
+            raise RuntimeError(
+                "[GPUResidentAdam] SSD state cache must be enabled before residency "
+                "is initialized"
+            )
+        if self._ssd_state_store is not None:
+            raise RuntimeError("[GPUResidentAdam] SSD state cache is already enabled")
+        self._persistent_state_enabled = True
+        self.state_mode = "resident_ssd_cache"
+        self._ssd_state_store = SSDOptimizerStateStore(
+            state_dir,
+            reset=resume_manifest is None,
+            allow_cold_start=allow_cold_start,
+            component_widths={
+                name: width for name, _, width, _ in self.COMPONENT_SPECS
+            },
+        )
+        if resume_manifest:
+            try:
+                self._ssd_state_store.import_checkpoint(resume_manifest)
+            except Exception as error:
+                if not allow_cold_start:
+                    raise
+                self._ssd_state_store.record_warning()
+                print(
+                    "[GPUResidentAdam] WARNING: optimizer SSD state manifest could not "
+                    f"be loaded; using cold-start: {error}"
+                )
         self._stats["state_mode"] = self.state_mode
 
     def _state_cache_entry_bytes(self, state: Dict[str, Any]) -> int:
@@ -264,6 +309,12 @@ class GPUResidentAdam:
             avg_sq_view[slot, :row_count].copy_(cached_avg_sq, non_blocking=False)
 
     def _update_persistent_state_stats(self) -> None:
+        if self.state_mode == "resident_ssd_cache" and self._ssd_state_store is not None:
+            store_stats = self._ssd_state_store.stats()
+            self._stats["persistent_state_blocks"] = int(store_stats["blocks"])
+            self._stats["persistent_state_bytes"] = int(store_stats["bytes"])
+            self._stats["persistent_state_warnings"] = int(store_stats["warnings"])
+            return
         self._stats["persistent_state_blocks"] = len(self._cpu_state_cache)
         self._stats["persistent_state_bytes"] = int(self._cpu_state_cache_bytes)
 
@@ -395,15 +446,22 @@ class GPUResidentAdam:
             if next_slot_initialized[slot]:
                 if self._persistent_state_enabled:
                     cached_state = self._snapshot_slot_state(block_id, slot)
-                    previous_state = next_cpu_state_cache.get(block_id)
-                    if previous_state is not None:
-                        next_cpu_state_cache_bytes -= self._state_cache_entry_bytes(
-                            previous_state
+                    if self.state_mode == "resident_ssd_cache":
+                        if self._ssd_state_store is None:
+                            raise RuntimeError(
+                                "[GPUResidentAdam] SSD state cache is not initialized"
+                            )
+                        self._ssd_state_store.save_async(block_id, cached_state)
+                    else:
+                        previous_state = next_cpu_state_cache.get(block_id)
+                        if previous_state is not None:
+                            next_cpu_state_cache_bytes -= self._state_cache_entry_bytes(
+                                previous_state
+                            )
+                        next_cpu_state_cache[block_id] = cached_state
+                        next_cpu_state_cache_bytes += self._state_cache_entry_bytes(
+                            cached_state
                         )
-                    next_cpu_state_cache[block_id] = cached_state
-                    next_cpu_state_cache_bytes += self._state_cache_entry_bytes(
-                        cached_state
-                    )
                     next_stats["persistent_state_saves"] += 1
                 next_stats["state_evictions"] += 1
                 next_logical_state_blocks -= 1
@@ -438,7 +496,14 @@ class GPUResidentAdam:
             if self._persistent_state_enabled:
                 for block_id in sorted(incoming):
                     slot = next_block_to_slot[block_id]
-                    cached_state = next_cpu_state_cache.get(block_id)
+                    if self.state_mode == "resident_ssd_cache":
+                        if self._ssd_state_store is None:
+                            raise RuntimeError(
+                                "[GPUResidentAdam] SSD state cache is not initialized"
+                            )
+                        cached_state = self._ssd_state_store.load(block_id)
+                    else:
+                        cached_state = next_cpu_state_cache.get(block_id)
                     if cached_state is None:
                         next_stats["persistent_state_misses"] += 1
                         continue
@@ -480,6 +545,37 @@ class GPUResidentAdam:
         self._cpu_state_cache_bytes = next_cpu_state_cache_bytes
         self._resident_blocks = next_resident
         self._update_state_stats()
+
+    def flush_persistent_state(self) -> None:
+        """Wait until all asynchronous SSD state writes are durable."""
+
+        if self._ssd_state_store is not None:
+            self._ssd_state_store.flush()
+
+    def export_persistent_state(self, checkpoint_dir: str) -> Optional[Dict[str, Any]]:
+        """Write a complete optimizer state snapshot into a checkpoint."""
+
+        if self.state_mode != "resident_ssd_cache" or self._ssd_state_store is None:
+            return None
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        resident_states = {}
+        for block_id, slot in self._block_to_slot.items():
+            if self._slot_initialized[slot]:
+                resident_states[int(block_id)] = self._snapshot_slot_state(block_id, slot)
+        manifest = self._ssd_state_store.export_checkpoint(
+            checkpoint_dir,
+            resident_states,
+            block_size=self.block_size,
+            optimizer_algorithm="adam",
+        )
+        self._update_state_stats()
+        return manifest
+
+    def close(self) -> None:
+        if self._ssd_state_store is not None:
+            self._ssd_state_store.close()
+            self._ssd_state_store = None
 
     def _working_set_state_rows(
         self,
@@ -824,6 +920,11 @@ class GPUResidentSophiaTR(GPUResidentAdam):
     def enable_cpu_state_cache(self) -> None:
         raise RuntimeError(
             "[GPUResidentSophiaTR] resident_cpu_cache currently supports Adam only"
+        )
+
+    def enable_ssd_state_cache(self, *args, **kwargs) -> None:
+        raise RuntimeError(
+            "[GPUResidentSophiaTR] resident_ssd_cache currently supports Adam only"
         )
 
     def _physical_state_bytes(self) -> int:
