@@ -133,7 +133,9 @@ class SSDOptimizerStateStoreTest(unittest.TestCase):
             try:
                 store.save_async(4, _state(step=7))
                 store.flush()
-                exported = store.export_checkpoint(root / "checkpoint", {})
+                exported = store.export_checkpoint(
+                    root / "checkpoint", {}, block_size=4096
+                )
                 shutil.rmtree(root / "checkpoint")
                 self.assertEqual(store.load(4)["step"], 7)
                 self.assertTrue(Path(exported["manifest"]).is_relative_to(root / "checkpoint"))

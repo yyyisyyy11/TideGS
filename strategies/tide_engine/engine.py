@@ -54,6 +54,10 @@ def get_gpu_resident_optimizer(gaussians, batch_size):
         )
     )
     current_optimizer = getattr(gaussians, '_paper_gpu_resident_optimizer', None)
+    # Reuse the existing object in the rebinding path below.  Without this
+    # alias, the resident_ssd_cache branch references the local constructor
+    # variable before it is assigned whenever no recreation is needed.
+    resident_optimizer = current_optimizer
     if current_optimizer is not None:
         current_state_mode = str(
             getattr(current_optimizer, "state_mode", "resident_blocks")
