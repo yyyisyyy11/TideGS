@@ -211,7 +211,7 @@ class AuxiliaryParams(ParamGroup):
         self.paper_resident_recency_decay = 0.95  # multiplicative aging factor for resident recency
         self.paper_balanced_seed_fraction = 0.25  # topc_balanced camera-seed capacity fraction
         self.paper_resident_capacity_blocks = 2048  # Global cap in distributed mode
-        self.paper_optimizer_state_mode = "full_cpu"  # {full_cpu, resident_blocks, resident_cpu_cache}; optimizer-state placement
+        self.paper_optimizer_state_mode = "full_cpu"  # {full_cpu, resident_blocks, resident_cpu_cache, resident_ssd_cache}; optimizer-state placement
         self.paper_optimizer_backend = "cpu"  # {cpu, gpu_resident}; optimizer update backend
         self.paper_optimizer_algorithm = "adam"  # {adam, 3dgs2_tr}; Adam remains the default
         self.paper_sophia_beta1 = 0.9
@@ -635,11 +635,16 @@ def init_args(args):
             "full_cpu",
             "resident_blocks",
             "resident_cpu_cache",
+            "resident_ssd_cache",
         }, (
             "Invalid paper_optimizer_state_mode="
-            f"{args.paper_optimizer_state_mode!r}; expected one of full_cpu, resident_blocks, resident_cpu_cache"
+            f"{args.paper_optimizer_state_mode!r}; expected one of full_cpu, resident_blocks, resident_cpu_cache, resident_ssd_cache"
         )
-        if args.paper_optimizer_state_mode in {"resident_blocks", "resident_cpu_cache"}:
+        if args.paper_optimizer_state_mode in {
+            "resident_blocks",
+            "resident_cpu_cache",
+            "resident_ssd_cache",
+        }:
             assert getattr(args, "sparse_adam", False), (
                 "resident optimizer state mode currently requires --sparse_adam"
             )
@@ -737,6 +742,7 @@ def init_args(args):
             assert getattr(args, "paper_optimizer_state_mode", "full_cpu") in {
                 "resident_blocks",
                 "resident_cpu_cache",
+                "resident_ssd_cache",
             }, (
                 "paper_optimizer_backend=gpu_resident requires a resident optimizer "
                 "state mode"
@@ -879,6 +885,7 @@ def init_args(args):
         assert getattr(args, "paper_optimizer_state_mode", "full_cpu") in {
             "resident_blocks",
             "resident_cpu_cache",
+            "resident_ssd_cache",
         }, (
             "pure SSD offload requires a resident optimizer state mode"
         )
@@ -935,6 +942,9 @@ def init_args(args):
             )
 
     if getattr(args, "tide_distributed_mode", "off") == "gaussian_sharded":
+        assert getattr(args, "paper_optimizer_state_mode", "full_cpu") != "resident_ssd_cache", (
+            "resident_ssd_cache currently supports single-card training only"
+        )
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         assert world_size > 1, (
             "gaussian_sharded mode must be launched with torchrun and WORLD_SIZE > 1"

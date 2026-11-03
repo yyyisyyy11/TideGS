@@ -39,7 +39,11 @@ _ACTIVE_FIRST_RESIDENT_POLICIES = {
     "topc_strict_active_first",
     "topc_balanced_active_first",
 }
-_GPU_RESIDENT_STATE_MODES = {"resident_blocks", "resident_cpu_cache"}
+_GPU_RESIDENT_STATE_MODES = {
+    "resident_blocks",
+    "resident_cpu_cache",
+    "resident_ssd_cache",
+}
 
 
 def _require_attr(args: Any, name: str, expected: Any) -> None:
@@ -75,11 +79,20 @@ def validate_tide_runtime_args(args: Any) -> None:
             "Pure SSD/Tide release path requires a resident optimizer state mode; "
             f"got {state_mode!r}."
         )
-    if state_mode == "resident_cpu_cache" and str(
+    if (
+        state_mode == "resident_ssd_cache"
+        and str(getattr(args, "tide_distributed_mode", "off")).lower()
+        == "gaussian_sharded"
+    ):
+        raise RuntimeError(
+            "paper_optimizer_state_mode=resident_ssd_cache currently supports "
+            "single-card training only"
+        )
+    if state_mode in {"resident_cpu_cache", "resident_ssd_cache"} and str(
         getattr(args, "paper_optimizer_algorithm", "adam")
     ).lower() != "adam":
         raise RuntimeError(
-            "paper_optimizer_state_mode=resident_cpu_cache currently supports Adam only"
+            f"paper_optimizer_state_mode={state_mode} currently supports Adam only"
         )
     _require_lower(args, "paper_optimizer_deferred_mode", "off")
     _require_attr(args, "paper_free_unified_params", True)
@@ -770,6 +783,17 @@ def initialize_paper_mode_runtime_state(
     gaussians._paper_optimizer_state_mode = paper_optimizer_state_mode
     gaussians._paper_optimizer_block_size = int(getattr(args, "gaussian_block_size", 4096))
     gaussians._paper_optimizer_backend = paper_optimizer_backend
+    if paper_optimizer_state_mode == "resident_ssd_cache":
+        gaussians._paper_optimizer_state_dir = os.path.join(
+            str(getattr(args, "model_path", "")),
+            "optimizer_state_ssd",
+        )
+        resume_manifest = getattr(args, "_pure_ssd_resume_manifest", None)
+        gaussians._paper_optimizer_state_resume_manifest = (
+            resume_manifest.get("optimizer_state_manifest")
+            if isinstance(resume_manifest, dict)
+            else None
+        )
     if not hasattr(gaussians, "_paper_pending_writeback"):
         gaussians._paper_pending_writeback = None
     if not hasattr(gaussians, "_paper_ab_runtime_stats"):
@@ -2007,11 +2031,12 @@ def configure_gpu_resident_optimizer_state(
             == "3dgs2_tr"
             else "Adam"
         )
-        state_message = (
-            "evicted Adam state is retained in the CPU cache."
-            if getattr(gaussians, "_paper_optimizer_state_mode", "")
-            == "resident_cpu_cache"
-            else "optimizer state exists only for resident blocks on GPU and cold-restarts on block re-admission."
+        state_message = {
+            "resident_cpu_cache": "evicted Adam state is retained in the CPU cache.",
+            "resident_ssd_cache": "evicted Adam state follows the Gaussian CPU cache and writes to SSD only after CPU eviction.",
+        }.get(
+            getattr(gaussians, "_paper_optimizer_state_mode", ""),
+            "optimizer state exists only for resident blocks on GPU and cold-restarts on block re-admission.",
         )
         write_paper_phase1_log(
             f"[PAPER OPTIMIZER STATE] gpu_resident {optimizer_label} enabled: "

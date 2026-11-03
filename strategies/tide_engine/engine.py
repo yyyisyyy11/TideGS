@@ -42,9 +42,9 @@ def get_gpu_resident_optimizer(gaussians, batch_size):
             "resident_blocks",
         )
     ).lower()
-    if state_mode == "resident_cpu_cache" and algorithm != "adam":
+    if state_mode in {"resident_cpu_cache", "resident_ssd_cache"} and algorithm != "adam":
         raise RuntimeError(
-            "resident_cpu_cache is currently implemented only for the Adam optimizer"
+            f"{state_mode} is currently implemented only for the Adam optimizer"
         )
     desired_block_size = int(
         getattr(
@@ -81,13 +81,44 @@ def get_gpu_resident_optimizer(gaussians, batch_size):
         resident_optimizer._paper_optimizer_algorithm = algorithm
         if state_mode == "resident_cpu_cache":
             resident_optimizer.enable_cpu_state_cache()
+        elif state_mode == "resident_ssd_cache":
+            state_dir = getattr(gaussians, "_paper_optimizer_state_dir", None)
+            if not state_dir:
+                raise RuntimeError(
+                    "resident_ssd_cache requires gaussians._paper_optimizer_state_dir"
+                )
+            resident_optimizer.enable_ssd_state_cache(
+                state_dir,
+                resume_manifest=getattr(
+                    gaussians,
+                    "_paper_optimizer_state_resume_manifest",
+                    None,
+                ),
+                allow_cold_start=True,
+            )
+            block_reader = getattr(gaussians, "_block_reader", None)
+            cache_manager = getattr(block_reader, "_cache", None)
+            if cache_manager is not None:
+                resident_optimizer.bind_gaussian_cache(cache_manager)
         gaussians._paper_gpu_resident_optimizer = resident_optimizer
+    elif state_mode == "resident_ssd_cache":
+        # The block reader can be constructed after the optimizer object on a
+        # resume path.  Bind once it becomes available rather than silently
+        # falling back to GPU-eviction-driven SSD writeback.
+        if getattr(resident_optimizer, "_gaussian_cache", None) is None:
+            block_reader = getattr(gaussians, "_block_reader", None)
+            cache_manager = getattr(block_reader, "_cache", None)
+            if cache_manager is not None:
+                resident_optimizer.bind_gaussian_cache(cache_manager)
     return gaussians._paper_gpu_resident_optimizer
 
 
 def shutdown_gpu_resident_optimizer(gaussians=None):
     if gaussians is None:
         return
+    optimizer = getattr(gaussians, '_paper_gpu_resident_optimizer', None)
+    if optimizer is not None and hasattr(optimizer, "close"):
+        optimizer.close()
     if hasattr(gaussians, '_paper_gpu_resident_optimizer'):
         gaussians._paper_gpu_resident_optimizer = None
 

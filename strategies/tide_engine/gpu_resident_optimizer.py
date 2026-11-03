@@ -1,8 +1,12 @@
 import math
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+
+from storage.optimizer_state_ssd import SSDOptimizerStateStore
 
 
 @dataclass
@@ -114,10 +118,11 @@ class GPUResidentAdam:
     """Adam with moments stored for the current resident block set.
 
     The default ``resident_blocks`` mode keeps state only in GPU slots. The
-    experimental ``resident_cpu_cache`` mode snapshots evicted Adam state to CPU
-    memory and restores it on a later admission. The update itself is vectorized
-    over every touched row, avoiding the former block-by-component Python loop and
-    its hundreds of thousands of tiny CUDA kernels.
+    ``resident_cpu_cache`` snapshots evicted Adam state to CPU memory, while
+    ``resident_ssd_cache`` adds an SSD tier that follows the Gaussian RAM cache
+    lifecycle. Both modes restore state on a later admission. The update itself
+    is vectorized over every touched row, avoiding the former block-by-component
+    Python loop and its hundreds of thousands of tiny CUDA kernels.
     """
 
     COMPONENT_SPECS = (
@@ -167,7 +172,13 @@ class GPUResidentAdam:
         self._denom_scale: Optional[torch.Tensor] = None
         self._persistent_state_enabled = False
         self._cpu_state_cache: Dict[int, Dict[str, Any]] = {}
+        self._cpu_state_lru: "OrderedDict[int, None]" = OrderedDict()
         self._cpu_state_cache_bytes = 0
+        self._state_versions: Dict[int, int] = {}
+        self._cpu_blocks_unavailable = set()
+        self._state_lock = threading.RLock()
+        self._ssd_state_store: Optional[SSDOptimizerStateStore] = None
+        self._gaussian_cache = None
 
         self._logical_state_blocks = 0
         self._logical_state_bytes = 0
@@ -189,6 +200,11 @@ class GPUResidentAdam:
             "persistent_state_misses": 0,
             "persistent_state_saves": 0,
             "persistent_state_restores": 0,
+            "persistent_state_ssd_writebacks": 0,
+            "persistent_state_ssd_hits": 0,
+            "persistent_state_cpu_hits": 0,
+            "persistent_state_index_writes": 0,
+            "persistent_state_warnings": 0,
         }
 
     def enable_cpu_state_cache(self) -> None:
@@ -202,6 +218,151 @@ class GPUResidentAdam:
         self._persistent_state_enabled = True
         self.state_mode = "resident_cpu_cache"
         self._stats["state_mode"] = self.state_mode
+
+    def enable_ssd_state_cache(
+        self,
+        state_dir: str,
+        *,
+        resume_manifest: Optional[str] = None,
+        allow_cold_start: bool = True,
+    ) -> None:
+        """Enable the CPU Adam tier with SSD as its Gaussian-cache backing tier."""
+
+        if self._resident_blocks:
+            raise RuntimeError(
+                "[GPUResidentAdam] SSD state cache must be enabled before residency "
+                "is initialized"
+            )
+        if self._ssd_state_store is not None:
+            raise RuntimeError("[GPUResidentAdam] SSD state cache is already enabled")
+        self._persistent_state_enabled = True
+        self.state_mode = "resident_ssd_cache"
+        self._ssd_state_store = SSDOptimizerStateStore(
+            state_dir,
+            reset=resume_manifest is None,
+            allow_cold_start=allow_cold_start,
+            component_widths={name: width for name, _, width, _ in self.COMPONENT_SPECS},
+        )
+        if resume_manifest:
+            try:
+                self._ssd_state_store.import_checkpoint(resume_manifest)
+            except Exception as error:
+                if not allow_cold_start:
+                    raise
+                self._ssd_state_store.close()
+                self._ssd_state_store = SSDOptimizerStateStore(
+                    state_dir,
+                    reset=True,
+                    allow_cold_start=allow_cold_start,
+                    component_widths={
+                        name: width for name, _, width, _ in self.COMPONENT_SPECS
+                    },
+                )
+                self._ssd_state_store.record_warning()
+                print(
+                    "[GPUResidentAdam] WARNING: optimizer SSD state manifest could not "
+                    f"be loaded; using cold-start: {error}"
+                )
+        self._stats["state_mode"] = self.state_mode
+
+    def bind_gaussian_cache(self, cache_manager) -> None:
+        """Bind state residency to the Gaussian CPU cache lifecycle."""
+
+        self._gaussian_cache = cache_manager
+        register_eviction = getattr(cache_manager, "register_state_eviction_listener", None)
+        register_flush = getattr(cache_manager, "register_state_flush_complete_listener", None)
+        register_admission = getattr(cache_manager, "register_state_admission_listener", None)
+        if callable(register_eviction):
+            register_eviction(self.on_cpu_block_evicted)
+        if callable(register_flush):
+            register_flush(self.on_cpu_block_flush_complete)
+        if callable(register_admission):
+            register_admission(self.on_cpu_block_available)
+
+    def _next_state_version(self, block_id: int) -> int:
+        block_id = int(block_id)
+        version = int(self._state_versions.get(block_id, 0)) + 1
+        self._state_versions[block_id] = version
+        return version
+
+    def _queue_ssd_state(
+        self,
+        block_id: int,
+        state: Dict[str, Any],
+        *,
+        stats: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if self._ssd_state_store is None:
+            return
+        self._ssd_state_store.save_async(
+            int(block_id),
+            state,
+            state_version=int(self._state_versions.get(int(block_id), 0)),
+        )
+        (self._stats if stats is None else stats)["persistent_state_ssd_writebacks"] += 1
+
+    def _drop_cpu_state(self, block_id: int, *, writeback: bool) -> None:
+        block_id = int(block_id)
+        with self._state_lock:
+            if writeback and self._ssd_state_store is None:
+                # A late cache callback after optimizer shutdown must not
+                # discard the last in-memory copy merely because the SSD
+                # worker is gone.
+                return
+            state = self._cpu_state_cache.pop(block_id, None)
+            self._cpu_state_lru.pop(block_id, None)
+            if state is not None:
+                self._cpu_state_cache_bytes -= self._state_cache_entry_bytes(state)
+                if writeback:
+                    self._queue_ssd_state(block_id, state)
+
+    def _put_cpu_state(self, block_id: int, state: Dict[str, Any]) -> None:
+        block_id = int(block_id)
+        with self._state_lock:
+            previous = self._cpu_state_cache.get(block_id)
+            if previous is not None:
+                self._cpu_state_cache_bytes -= self._state_cache_entry_bytes(previous)
+            self._cpu_state_cache[block_id] = state
+            self._cpu_state_lru.pop(block_id, None)
+            self._cpu_state_lru[block_id] = None
+            self._cpu_state_cache_bytes += self._state_cache_entry_bytes(state)
+            unavailable = block_id in self._cpu_blocks_unavailable
+            if unavailable:
+                self._cpu_blocks_unavailable.discard(block_id)
+        if unavailable and self.state_mode == "resident_ssd_cache":
+            self._drop_cpu_state(block_id, writeback=True)
+
+    def on_cpu_block_evicted(self, block_id: int, version: int = 0) -> None:
+        """Mark a clean Gaussian block absent from RAM."""
+
+        _ = version
+        block_id = int(block_id)
+        with self._state_lock:
+            self._cpu_blocks_unavailable.add(block_id)
+            has_state = block_id in self._cpu_state_cache
+        # A clean Gaussian eviction means the CPU Adam tier has lost its
+        # matching RAM anchor.  Move an already cached state to SSD now; this
+        # remains asynchronous and never blocks the Gaussian eviction path.
+        if has_state and self.state_mode == "resident_ssd_cache":
+            self._drop_cpu_state(block_id, writeback=True)
+
+    def on_cpu_block_available(self, block_id: int, version: int = 0) -> None:
+        """Clear a prior absence mark when Gaussian data returns to RAM."""
+
+        _ = version
+        with self._state_lock:
+            self._cpu_blocks_unavailable.discard(int(block_id))
+
+    def on_cpu_block_flush_complete(self, block_id: int, version: int = 0) -> None:
+        """Move state to SSD once Gaussian RAM and flushing data are gone."""
+
+        _ = version
+        block_id = int(block_id)
+        with self._state_lock:
+            self._cpu_blocks_unavailable.add(block_id)
+            present = block_id in self._cpu_state_cache
+        if present and self.state_mode == "resident_ssd_cache":
+            self._drop_cpu_state(block_id, writeback=True)
 
     def _state_cache_entry_bytes(self, state: Dict[str, Any]) -> int:
         row_count = int(state["row_count"])
@@ -264,8 +425,17 @@ class GPUResidentAdam:
             avg_sq_view[slot, :row_count].copy_(cached_avg_sq, non_blocking=False)
 
     def _update_persistent_state_stats(self) -> None:
-        self._stats["persistent_state_blocks"] = len(self._cpu_state_cache)
-        self._stats["persistent_state_bytes"] = int(self._cpu_state_cache_bytes)
+        cpu_blocks = len(self._cpu_state_cache)
+        cpu_bytes = int(self._cpu_state_cache_bytes)
+        if self._ssd_state_store is None:
+            self._stats["persistent_state_blocks"] = cpu_blocks
+            self._stats["persistent_state_bytes"] = cpu_bytes
+            return
+        store_stats = self._ssd_state_store.stats()
+        self._stats["persistent_state_blocks"] = cpu_blocks + int(store_stats["blocks"])
+        self._stats["persistent_state_bytes"] = cpu_bytes + int(store_stats["bytes"])
+        self._stats["persistent_state_index_writes"] = int(store_stats["index_writes"])
+        self._stats["persistent_state_warnings"] = int(store_stats["warnings"])
 
     def _physical_state_bytes(self) -> int:
         moment_bytes = self._allocated_slots * self.block_size * self.TOTAL_WIDTH * 2 * 4
@@ -358,6 +528,14 @@ class GPUResidentAdam:
             ).index_fill_(0, slot_ids, 0.0)
 
     def set_resident_blocks(self, block_ids: List[int]) -> None:
+        # Gaussian cache callbacks can run on a worker thread while a new
+        # resident set is being committed.  Serialize the state transaction so
+        # a callback cannot observe or mutate its temporary copies halfway
+        # through admission/eviction.
+        with self._state_lock:
+            self._set_resident_blocks_impl(block_ids)
+
+    def _set_resident_blocks_impl(self, block_ids: List[int]) -> None:
         if self._residency_corrupted:
             raise RuntimeError(
                 "[GPUResidentAdam] optimizer is unusable after a failed resident "
@@ -384,6 +562,7 @@ class GPUResidentAdam:
         next_logical_state_bytes = self._logical_state_bytes
         next_stats = dict(self._stats)
         next_cpu_state_cache = dict(self._cpu_state_cache)
+        next_cpu_state_lru = OrderedDict(self._cpu_state_lru)
         next_cpu_state_cache_bytes = int(self._cpu_state_cache_bytes)
 
         for block_id in evicted:
@@ -395,16 +574,33 @@ class GPUResidentAdam:
             if next_slot_initialized[slot]:
                 if self._persistent_state_enabled:
                     cached_state = self._snapshot_slot_state(block_id, slot)
+                    self._next_state_version(block_id)
                     previous_state = next_cpu_state_cache.get(block_id)
                     if previous_state is not None:
                         next_cpu_state_cache_bytes -= self._state_cache_entry_bytes(
                             previous_state
                         )
                     next_cpu_state_cache[block_id] = cached_state
+                    next_cpu_state_lru.pop(block_id, None)
+                    next_cpu_state_lru[block_id] = None
                     next_cpu_state_cache_bytes += self._state_cache_entry_bytes(
                         cached_state
                     )
                     next_stats["persistent_state_saves"] += 1
+                    if (
+                        self.state_mode == "resident_ssd_cache"
+                        and block_id in self._cpu_blocks_unavailable
+                    ):
+                        next_cpu_state_cache.pop(block_id, None)
+                        next_cpu_state_lru.pop(block_id, None)
+                        next_cpu_state_cache_bytes -= self._state_cache_entry_bytes(
+                            cached_state
+                        )
+                        self._queue_ssd_state(
+                            block_id,
+                            cached_state,
+                            stats=next_stats,
+                        )
                 next_stats["state_evictions"] += 1
                 next_logical_state_blocks -= 1
                 next_logical_state_bytes -= (
@@ -439,6 +635,32 @@ class GPUResidentAdam:
                 for block_id in sorted(incoming):
                     slot = next_block_to_slot[block_id]
                     cached_state = next_cpu_state_cache.get(block_id)
+                    if cached_state is not None:
+                        next_cpu_state_lru.pop(block_id, None)
+                        next_cpu_state_lru[block_id] = None
+                        next_stats["persistent_state_cpu_hits"] += 1
+                    elif (
+                        self.state_mode == "resident_ssd_cache"
+                        and self._ssd_state_store is not None
+                    ):
+                        cached_state = self._ssd_state_store.load(block_id)
+                        if cached_state is not None:
+                            next_stats["persistent_state_ssd_hits"] += 1
+                            previous_state = next_cpu_state_cache.get(block_id)
+                            if previous_state is not None:
+                                next_cpu_state_cache_bytes -= self._state_cache_entry_bytes(
+                                    previous_state
+                                )
+                            next_cpu_state_cache[block_id] = cached_state
+                            next_cpu_state_lru.pop(block_id, None)
+                            next_cpu_state_lru[block_id] = None
+                            next_cpu_state_cache_bytes += self._state_cache_entry_bytes(
+                                cached_state
+                            )
+                            self._state_versions[block_id] = max(
+                                int(self._state_versions.get(block_id, 0)),
+                                int(self._ssd_state_store.state_version(block_id)),
+                            )
                     if cached_state is None:
                         next_stats["persistent_state_misses"] += 1
                         continue
@@ -477,9 +699,48 @@ class GPUResidentAdam:
         self._logical_state_bytes = next_logical_state_bytes
         self._stats = next_stats
         self._cpu_state_cache = next_cpu_state_cache
+        self._cpu_state_lru = next_cpu_state_lru
         self._cpu_state_cache_bytes = next_cpu_state_cache_bytes
         self._resident_blocks = next_resident
         self._update_state_stats()
+
+    def flush_persistent_state(self) -> None:
+        """Drain asynchronous SSD writes and publish a complete index."""
+
+        with self._state_lock:
+            if self._ssd_state_store is not None:
+                self._ssd_state_store.flush()
+                self._update_state_stats()
+
+    def export_persistent_state(self, checkpoint_dir: str) -> Optional[Dict[str, Any]]:
+        """Export resident GPU, CPU, and SSD states into a checkpoint."""
+
+        with self._state_lock:
+            if self._ssd_state_store is None:
+                return None
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            resident_states = {}
+            for block_id, slot in self._block_to_slot.items():
+                if self._slot_initialized[slot]:
+                    resident_states[int(block_id)] = self._snapshot_slot_state(block_id, slot)
+            state_versions = dict(self._state_versions)
+            manifest = self._ssd_state_store.export_checkpoint(
+                checkpoint_dir,
+                resident_states,
+                state_overrides=dict(self._cpu_state_cache),
+                state_versions=state_versions,
+                block_size=self.block_size,
+                optimizer_algorithm="adam",
+            )
+            self._update_state_stats()
+            return manifest
+
+    def close(self) -> None:
+        with self._state_lock:
+            if self._ssd_state_store is not None:
+                self._ssd_state_store.close()
+                self._ssd_state_store = None
 
     def _working_set_state_rows(
         self,
@@ -765,8 +1026,9 @@ class GPUResidentAdam:
         }
 
     def get_stats(self) -> Dict[str, Any]:
-        self._update_state_stats()
-        return dict(self._stats)
+        with self._state_lock:
+            self._update_state_stats()
+            return dict(self._stats)
 
 
 class GPUResidentSophiaTR(GPUResidentAdam):
@@ -824,6 +1086,11 @@ class GPUResidentSophiaTR(GPUResidentAdam):
     def enable_cpu_state_cache(self) -> None:
         raise RuntimeError(
             "[GPUResidentSophiaTR] resident_cpu_cache currently supports Adam only"
+        )
+
+    def enable_ssd_state_cache(self, *args, **kwargs) -> None:
+        raise RuntimeError(
+            "[GPUResidentSophiaTR] resident_ssd_cache currently supports Adam only"
         )
 
     def _physical_state_bytes(self) -> int:

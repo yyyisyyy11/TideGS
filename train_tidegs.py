@@ -677,8 +677,12 @@ def _validate_pure_ssd_runtime(args, gaussians, storage_adapter, resolved_backen
     if getattr(args, "paper_optimizer_state_mode", "full_cpu") not in {
         "resident_blocks",
         "resident_cpu_cache",
+        "resident_ssd_cache",
     }:
-        raise RuntimeError("[PURE SSD CHECK] optimizer state mode must be resident_blocks or resident_cpu_cache")
+        raise RuntimeError(
+            "[PURE SSD CHECK] optimizer state mode must be resident_blocks, "
+            "resident_cpu_cache, or resident_ssd_cache"
+        )
 
     total_gaussians = getattr(gaussians, "_paper_unified_params_num_total", None)
     total_desc = f"{int(total_gaussians):,}" if total_gaussians is not None else "unknown"
@@ -1180,7 +1184,11 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         if gpu_resident_optimizer is None:
             return None
         stats = gpu_resident_optimizer.get_stats()
-        if stats.get('state_mode', 'full_cpu') not in {'resident_blocks', 'resident_cpu_cache'}:
+        if stats.get('state_mode', 'full_cpu') not in {
+            'resident_blocks',
+            'resident_cpu_cache',
+            'resident_ssd_cache',
+        }:
             return None
         return {
             'optimizer_rows_touched_total': int(stats.get('optimizer_rows_touched_total', 0)),
@@ -1425,7 +1433,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 and getattr(args, 'pure_ssd_offload', False)
                 and str(getattr(args, 'paper_optimizer_backend', '')).lower() == 'gpu_resident'
                 and str(getattr(args, 'paper_optimizer_state_mode', '')).lower()
-                in {'resident_blocks', 'resident_cpu_cache'}
+                in {'resident_blocks', 'resident_cpu_cache', 'resident_ssd_cache'}
             ):
                 _enable_optimizer_churn_logging("pure_ssd_gpu_resident")
 
@@ -2048,6 +2056,15 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             operation=lambda: storage_adapter.shutdown(
                 compact_storage=False
             ),
+        )
+        _run_synchronized_training_phase(
+            distributed_context,
+            phase="optimizer state shutdown",
+            operation=lambda: getattr(
+                getattr(gaussians, "_paper_gpu_resident_optimizer", None),
+                "close",
+                lambda: None,
+            )(),
         )
         if args.tide_detailed_metrics:
             def finalize_distributed_metrics():
