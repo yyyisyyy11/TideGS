@@ -79,15 +79,6 @@ def validate_tide_runtime_args(args: Any) -> None:
             "Pure SSD/Tide release path requires a resident optimizer state mode; "
             f"got {state_mode!r}."
         )
-    if (
-        state_mode == "resident_ssd_cache"
-        and str(getattr(args, "tide_distributed_mode", "off")).lower()
-        == "gaussian_sharded"
-    ):
-        raise RuntimeError(
-            "paper_optimizer_state_mode=resident_ssd_cache currently supports "
-            "single-card training only"
-        )
     if state_mode in {"resident_cpu_cache", "resident_ssd_cache"} and str(
         getattr(args, "paper_optimizer_algorithm", "adam")
     ).lower() != "adam":
@@ -784,10 +775,16 @@ def initialize_paper_mode_runtime_state(
     gaussians._paper_optimizer_block_size = int(getattr(args, "gaussian_block_size", 4096))
     gaussians._paper_optimizer_backend = paper_optimizer_backend
     if paper_optimizer_state_mode == "resident_ssd_cache":
-        gaussians._paper_optimizer_state_dir = os.path.join(
-            str(getattr(args, "model_path", "")),
-            "optimizer_state_ssd",
-        )
+        state_root = os.path.join(str(getattr(args, "model_path", "")), "optimizer_state_ssd")
+        distributed_context = getattr(args, "_tide_distributed_context", None)
+        if distributed_context is not None and distributed_context.enabled:
+            rank = int(distributed_context.rank)
+            state_root = os.path.join(state_root, f"rank_{rank}")
+        elif str(getattr(args, "tide_distributed_mode", "off")).lower() == "gaussian_sharded":
+            # Runtime unit tests and early initialization may not yet have a
+            # DistributedContext object; torchrun still exposes the rank.
+            state_root = os.path.join(state_root, f"rank_{int(os.environ.get('RANK', '0'))}")
+        gaussians._paper_optimizer_state_dir = state_root
         resume_manifest = getattr(args, "_pure_ssd_resume_manifest", None)
         gaussians._paper_optimizer_state_resume_manifest = (
             resume_manifest.get("optimizer_state_manifest")

@@ -1,4 +1,4 @@
-"""Single-card, block-granular Adam state backing store.
+"""Rank-local, block-granular Adam state backing store.
 
 The GPU optimizer owns the CPU tier. This module owns only the durable SSD
 tier and is independent from the Gaussian parameter cache.
@@ -510,15 +510,26 @@ class SSDOptimizerStateStore:
             "component_widths": dict(self.component_widths),
             "state_block_count": len(exported),
             "optimizer_state_mode": "resident_ssd_cache",
-            "optimizer_state_saved": bool(exported),
-            "adam_moments_saved": bool(exported),
+            # An empty state set is still a complete checkpoint: it records
+            # that no Adam moments had been initialized at this iteration.
+            "optimizer_state_saved": True,
+            "adam_moments_saved": True,
             "optimizer_state_format_version": STATE_FORMAT_VERSION,
             "state_dir": str(checkpoint_root.resolve()),
             "index": str(index_path.resolve()),
             "manifest": str(manifest_path.resolve()),
             "optimizer_state_manifest": str(manifest_path.resolve()),
         }
-        _atomic_json_dump(manifest, manifest_path)
+        # Paths inside the checkpoint are relative so the checkpoint remains
+        # portable when its history directory is moved or pruned.  The return
+        # value keeps absolute paths for the live runtime and rank manifest
+        # builder.
+        payload_manifest = dict(manifest)
+        payload_manifest["state_dir"] = "."
+        payload_manifest["index"] = "index.json"
+        payload_manifest["manifest"] = "manifest.json"
+        payload_manifest["optimizer_state_manifest"] = "manifest.json"
+        _atomic_json_dump(payload_manifest, manifest_path)
         # The checkpoint is a snapshot. Keep the live store index pointed at
         # its own state directory so later writebacks do not read from an old
         # checkpoint and runtime SSD accounting remains accurate.
@@ -536,6 +547,8 @@ class SSDOptimizerStateStore:
             payload = json.load(handle)
         if int(payload.get("state_format_version", -1)) not in _SUPPORTED_READ_VERSIONS:
             raise ValueError("unsupported optimizer state format version")
+        if str(payload.get("optimizer_state_mode", "resident_ssd_cache")) != "resident_ssd_cache":
+            raise ValueError("checkpoint does not contain resident_ssd_cache optimizer state")
         index_path = Path(str(payload["index"]))
         if not index_path.is_absolute():
             index_path = manifest_path.parent / index_path
@@ -612,6 +625,13 @@ class SSDOptimizerStateStore:
             }
             self._index_dirty = True
             self._write_index(force=True)
+            keep_names = {f"block_{block_id}.pt" for block_id in imported}
+            for path in self.blocks_dir.glob("*.pt"):
+                if path.name not in keep_names:
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
 
     def stats(self) -> Dict[str, int]:
         with self._lock:

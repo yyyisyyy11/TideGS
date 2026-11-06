@@ -590,6 +590,20 @@ def train_distributed_tide_batch(
         target_resident = set(
             int(value) for value in plan.rank_resident_blocks[context.rank]
         )
+        if str(getattr(args, "paper_optimizer_state_mode", "resident_blocks")).lower() == "resident_ssd_cache":
+            owner = np.asarray(getattr(args, "_tide_block_owner", []), dtype=np.int64)
+            non_owned = sorted(
+                block_id
+                for block_id in target_resident
+                if block_id < 0
+                or block_id >= owner.size
+                or int(owner[block_id]) != int(context.rank)
+            )
+            if non_owned:
+                raise RuntimeError(
+                    "resident_ssd_cache received non-owner resident blocks on rank "
+                    f"{context.rank}: {non_owned[:8]}"
+                )
         evicted = state.resident - target_resident
         writeback_start = time.perf_counter()
         _flush_blocks(storage_adapter, manager, state, sorted(evicted))
@@ -1270,6 +1284,10 @@ def train_distributed_tide_batch(
         else 0.0
     )
     cache_after = cache.get_stats()
+    # State-cache counters are collected only for detailed metrics.  Calling
+    # ``get_stats`` walks the rank-local SSD index and must not become a hidden
+    # per-batch cost in normal runs.
+    optimizer_state_stats = optimizer.get_stats() if timeline_enabled else {}
 
     def cache_delta(name):
         return float(cache_after.get(name, 0)) - float(cache_before.get(name, 0))
@@ -1431,6 +1449,16 @@ def train_distributed_tide_batch(
         "updated_blocks": int(step_stats.get("updated_blocks", 0)),
         "optimizer_touched_rows": int(step_stats.get("touched_rows", 0)),
         "optimizer_cold_rows": int(step_stats.get("cold_rows", 0)),
+        "persistent_state_hits": int(optimizer_state_stats.get("persistent_state_hits", 0)),
+        "persistent_state_misses": int(optimizer_state_stats.get("persistent_state_misses", 0)),
+        "persistent_state_cpu_hits": int(optimizer_state_stats.get("persistent_state_cpu_hits", 0)),
+        "persistent_state_ssd_hits": int(optimizer_state_stats.get("persistent_state_ssd_hits", 0)),
+        "persistent_state_ssd_writebacks": int(optimizer_state_stats.get("persistent_state_ssd_writebacks", 0)),
+        "persistent_state_index_writes": int(optimizer_state_stats.get("persistent_state_index_writes", 0)),
+        "persistent_state_blocks": int(optimizer_state_stats.get("persistent_state_blocks", 0)),
+        "persistent_state_bytes": int(optimizer_state_stats.get("persistent_state_bytes", 0)),
+        "state_owner_rank": int(optimizer_state_stats.get("state_owner_rank", -1)),
+        "owner_violations": int(optimizer_state_stats.get("owner_violations", 0)),
         "curvature_blocks": len(step_stats.get("curvature_block_ids", [])),
         "curvature_rows": int(step_stats.get("curvature_rows", 0)),
         "clipped_values": int(step_stats.get("clipped_values", 0)),

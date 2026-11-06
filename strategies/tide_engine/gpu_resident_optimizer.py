@@ -179,6 +179,8 @@ class GPUResidentAdam:
         self._state_lock = threading.RLock()
         self._ssd_state_store: Optional[SSDOptimizerStateStore] = None
         self._gaussian_cache = None
+        self._state_block_owner = None
+        self._state_owner_rank = None
 
         self._logical_state_blocks = 0
         self._logical_state_bytes = 0
@@ -205,6 +207,8 @@ class GPUResidentAdam:
             "persistent_state_cpu_hits": 0,
             "persistent_state_index_writes": 0,
             "persistent_state_warnings": 0,
+            "state_owner_rank": -1,
+            "owner_violations": 0,
         }
 
     def enable_cpu_state_cache(self) -> None:
@@ -264,6 +268,36 @@ class GPUResidentAdam:
                     f"be loaded; using cold-start: {error}"
                 )
         self._stats["state_mode"] = self.state_mode
+
+    def bind_block_owner(self, block_owner, owner_rank: int) -> None:
+        """Restrict distributed SSD state admission to the fixed owner rank."""
+
+        owner = torch.as_tensor(block_owner, dtype=torch.int64, device="cpu").flatten()
+        if owner.numel() == 0:
+            raise ValueError("[GPUResidentAdam] block_owner must not be empty")
+        self._state_block_owner = owner
+        self._state_owner_rank = int(owner_rank)
+        self._stats["state_owner_rank"] = int(owner_rank)
+
+    def _validate_state_ownership(self, block_ids) -> None:
+        if self.state_mode != "resident_ssd_cache" or self._state_block_owner is None:
+            return
+        invalid = []
+        owner = self._state_block_owner
+        for raw_block_id in block_ids:
+            block_id = int(raw_block_id)
+            if (
+                block_id < 0
+                or block_id >= int(owner.numel())
+                or int(owner[block_id].item()) != int(self._state_owner_rank)
+            ):
+                invalid.append(block_id)
+        if invalid:
+            self._stats["owner_violations"] += len(invalid)
+            raise RuntimeError(
+                "[GPUResidentAdam] resident_ssd_cache received non-owner blocks "
+                f"on rank {self._state_owner_rank}: {invalid[:8]}"
+            )
 
     def bind_gaussian_cache(self, cache_manager) -> None:
         """Bind state residency to the Gaussian CPU cache lifecycle."""
@@ -542,6 +576,7 @@ class GPUResidentAdam:
                 "slot clear; recreate it before changing the resident set"
             )
         next_resident = {int(block_id) for block_id in block_ids}
+        self._validate_state_ownership(next_resident)
         previous_resident = set(self._resident_blocks)
         evicted = previous_resident - next_resident
         kept = previous_resident & next_resident
