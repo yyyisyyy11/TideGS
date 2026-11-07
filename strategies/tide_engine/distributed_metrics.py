@@ -11,6 +11,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Dict, Iterable, List
+from utils.pipeline_mode import normalize_pipeline_mode
+from utils.tide_trace import tide_range
 
 from .gradient_schema import (
     GRADIENT_COMPONENTS,
@@ -33,6 +35,7 @@ BATCH_FIELDS = [
     "prediction_missing_blocks",
     "prediction_extra_blocks",
     "prediction_replanned",
+    "plan_resolution",
     "prediction_repair_ms",
     "prediction_exact_plan_ms",
     "rank_active_blocks",
@@ -86,6 +89,17 @@ BATCH_FIELDS = [
     "h2d_bytes",
     "h2d_ms",
     "gsplat_forward_ms",
+    "loss_ms",
+    "pipeline_mode",
+    "projection_c1_overlap_ms",
+    "c1_wait_ms",
+    "c1_metadata_ms",
+    "c1_payload_ms",
+    "pipeline_render_ms",
+    "intermediate_grad_ms",
+    "c2_ms",
+    "final_grad_ms",
+    "grad_accumulate_ms",
     "curvature_forward_ms",
     "curvature_vjp_ms",
     "gaussian_projection_cull_ms",
@@ -109,6 +123,27 @@ BATCH_FIELDS = [
     "next_plan_finalize_wait_ms",
     "next_plan_target_iteration",
 ]
+
+
+def cuda_interval_union_ms(anchor_event, intervals) -> float:
+    """Measure covered time, not summed latency, across CUDA streams.
+
+    All events must have completed on the same device. Negative offsets are
+    valid for stages preceding the batch anchor (for example curvature).
+    """
+    spans = sorted(
+        (float(anchor_event.elapsed_time(start)), float(anchor_event.elapsed_time(end)))
+        for start, end in intervals
+    )
+    total = 0.0
+    right = float("-inf")
+    for start, end in spans:
+        if end < start:
+            raise ValueError("CUDA interval ends before it starts")
+        total += max(0.0, end - max(start, right))
+        right = max(right, end)
+    return total
+
 
 GRAD_ZERO_COMPONENTS = GRADIENT_COMPONENTS
 GRAD_ZERO_HISTOGRAM_FIELDS = [
@@ -251,7 +286,12 @@ GLOBAL_ONCE_FIELDS = {
     "prediction_replanned",
     "next_plan_target_iteration",
 }
-GLOBAL_TEXT_ONCE_FIELDS = {"optimizer_algorithm", "block_cull_backend"}
+GLOBAL_TEXT_ONCE_FIELDS = {
+    "optimizer_algorithm",
+    "plan_resolution",
+    "block_cull_backend",
+    "pipeline_mode",
+}
 
 TIME_FIELDS = [field for field in BATCH_FIELDS if field.endswith("_ms")]
 GLOBAL_FIELDS = (
@@ -353,7 +393,12 @@ COMPACTION_GLOBAL_FIELDS = [
 ]
 
 
-def _append_tsv(path: Path, fields: Iterable[str], row: Dict[str, object]) -> None:
+def _append_tsv_rows(
+    path: Path, fields: Iterable[str], rows: Iterable[Dict[str, object]]
+) -> None:
+    rows = list(rows)
+    if not rows:
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     fields = list(fields)
     needs_header = not path.exists() or path.stat().st_size == 0
@@ -366,7 +411,12 @@ def _append_tsv(path: Path, fields: Iterable[str], row: Dict[str, object]) -> No
         )
         if needs_header:
             writer.writeheader()
-        writer.writerow({field: row.get(field, 0) for field in fields})
+        for row in rows:
+            writer.writerow({field: row.get(field, 0) for field in fields})
+
+
+def _append_tsv(path: Path, fields: Iterable[str], row: Dict[str, object]) -> None:
+    _append_tsv_rows(path, fields, [row])
 
 
 def _write_tsv(
@@ -393,7 +443,11 @@ def _write_tsv(
 class DistributedMetricsWriter:
     def __init__(self, *, args, context):
         self.context = context
-        self.enabled = bool(getattr(args, "tide_detailed_metrics", False))
+        self.detailed_timeline_enabled = bool(getattr(args, "tide_detailed_metrics", False))
+        self.light_timeline_enabled = bool(getattr(args, "tide_light_timeline", False))
+        if self.detailed_timeline_enabled and self.light_timeline_enabled:
+            raise ValueError("--tide_light_timeline and --tide_detailed_metrics are mutually exclusive")
+        self.enabled = self.detailed_timeline_enabled or self.light_timeline_enabled
         self.grad_zero_enabled = bool(
             getattr(args, "tide_grad_zero_metrics", False)
         )
@@ -471,7 +525,8 @@ class DistributedMetricsWriter:
         rank_row = dict(row)
         rank_row["rank"] = self.context.rank
         _append_tsv(self.grad_zero_rank_path, GRAD_ZERO_FIELDS, rank_row)
-        rank_rows: List[Dict[str, object]] = self.context.all_gather_object(rank_row)
+        with tide_range("tide.comm.metrics.gather"):
+            rank_rows: List[Dict[str, object]] = self.context.all_gather_object(rank_row)
         if not self.context.is_rank0:
             return
         global_row: Dict[str, object] = {
@@ -514,7 +569,7 @@ class DistributedMetricsWriter:
         os.replace(temporary, path)
         return path
 
-    def write_timeline_event(
+    def _timeline_event(
         self,
         *,
         name: str,
@@ -525,20 +580,7 @@ class DistributedMetricsWriter:
         target_iteration: int | None = None,
         timing_source: str = "host_monotonic",
         **fields,
-    ) -> None:
-        """Append one interval to this rank's JSONL timeline.
-
-        Background I/O is drained in batches, so JSONL append order is not a
-        temporal guarantee; consumers must sort events by ``start_ns``.
-
-        ``host_monotonic`` events use ``time.perf_counter_ns()`` from the
-        shared host clock.  GPU events deliberately use
-        ``host_submit_plus_cuda_event`` instead: their location is an
-        approximate host submission point while their duration comes from a
-        CUDA event.
-        """
-        if not self.enabled:
-            return
+    ) -> Dict[str, object]:
         start_ns = int(start_ns)
         end_ns = start_ns if end_ns is None else int(end_ns)
         if end_ns < start_ns:
@@ -546,7 +588,7 @@ class DistributedMetricsWriter:
                 f"Timeline event {name!r} ends before it starts: "
                 f"{end_ns} < {start_ns}"
             )
-        event = {
+        return {
             "clock": "perf_counter_ns",
             "host": self._timeline_host,
             "pid": self._timeline_pid,
@@ -563,10 +605,46 @@ class DistributedMetricsWriter:
             "timing_source": str(timing_source),
             **fields,
         }
+
+    def _append_timeline_events(self, events: Iterable[Dict[str, object]]) -> None:
+        events = list(events)
+        if not events:
+            return
         with self._timeline_lock:
             self.timeline_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.timeline_path, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(event, sort_keys=True) + "\n")
+                for event in events:
+                    handle.write(json.dumps(event, sort_keys=True) + "\n")
+
+    def write_timeline_event(
+        self,
+        *,
+        name: str,
+        lane: str,
+        start_ns: int,
+        end_ns: int | None = None,
+        iteration: int | None = None,
+        target_iteration: int | None = None,
+        timing_source: str = "host_monotonic",
+        **fields,
+    ) -> None:
+        """Append one interval; append order is not a temporal guarantee."""
+        if not self.enabled:
+            return
+        if self.light_timeline_enabled and name not in {
+            "preview_plan", "finalize_plan", "batch_identity"
+        }:
+            return
+        self._append_timeline_events([self._timeline_event(
+            name=name,
+            lane=lane,
+            start_ns=start_ns,
+            end_ns=end_ns,
+            iteration=iteration,
+            target_iteration=target_iteration,
+            timing_source=timing_source,
+            **fields,
+        )])
 
     def write_memory_point(
         self,
@@ -584,7 +662,7 @@ class DistributedMetricsWriter:
         useful when a rank OOMs before the collective batch metric can be
         emitted, and do not belong on the global critical-path timeline.
         """
-        if not self.enabled:
+        if not self.detailed_timeline_enabled:
             return
         self.write_timeline_event(
             name="cuda_memory_point",
@@ -610,13 +688,18 @@ class DistributedMetricsWriter:
             return
         if self._async_finalized:
             raise RuntimeError("Cannot record I/O events after metrics finalization")
+        light_rows = []
+        light_timeline_events = []
         for event in events:
             row = dict(event)
             row["rank"] = self.context.rank
-            _append_tsv(self.io_path, IO_FIELDS, row)
+            if self.light_timeline_enabled:
+                light_rows.append(row)
+            else:
+                _append_tsv(self.io_path, IO_FIELDS, row)
             start_ns = row.get("start_ns")
             if start_ns is not None:
-                self.write_timeline_event(
+                timeline_fields = dict(
                     name=str(row.get("operation", "io")),
                     lane=str(row.get("lane", row.get("tier", "io"))),
                     start_ns=int(start_ns),
@@ -636,6 +719,10 @@ class DistributedMetricsWriter:
                     tier=row.get("tier"),
                     status=row.get("status"),
                 )
+                if self.light_timeline_enabled:
+                    light_timeline_events.append(self._timeline_event(**timeline_fields))
+                else:
+                    self.write_timeline_event(**timeline_fields)
             operation = str(row.get("operation", ""))
             field_spec = ASYNC_OPERATION_FIELDS.get(operation)
             if field_spec is None:
@@ -656,12 +743,24 @@ class DistributedMetricsWriter:
             values[time_field] = (
                 values.get(time_field, 0.0) + float(row.get("service_ms", 0.0))
             )
+        if self.light_timeline_enabled:
+            _append_tsv_rows(self.io_path, IO_FIELDS, light_rows)
+            self._append_timeline_events(light_timeline_events)
 
     def write_batch(self, row: Dict[str, object]) -> None:
         if not self.enabled:
             return
         rank_row = dict(row)
         rank_row["rank"] = self.context.rank
+        if self.light_timeline_enabled:
+            self.write_timeline_event(
+                name="batch_identity",
+                lane="metadata",
+                start_ns=time.perf_counter_ns(),
+                iteration=int(rank_row["iteration"]),
+                optimizer_step=rank_row.get("optimizer_step"),
+                pipeline_mode=rank_row.get("pipeline_mode"),
+            )
         _append_tsv(self.rank_path, BATCH_FIELDS, rank_row)
         rank_rows: List[Dict[str, object]] = self.context.all_gather_object(rank_row)
         if not self.context.is_rank0:
@@ -674,17 +773,25 @@ class DistributedMetricsWriter:
         for field in SUM_FIELDS:
             global_row[field] = sum(float(value.get(field, 0)) for value in rank_rows)
         for field in GLOBAL_ONCE_FIELDS:
-            values = [float(value.get(field, 0)) for value in rank_rows]
-            global_row[field] = max(values, default=0.0)
+            raw_values = [value.get(field, 0) for value in rank_rows]
+            global_row[field] = (
+                None if any(value is None or value == "" for value in raw_values)
+                else max((float(value) for value in raw_values), default=0.0)
+            )
         for field in GLOBAL_TEXT_ONCE_FIELDS:
             values = {str(value.get(field, "")) for value in rank_rows}
             global_row[field] = values.pop() if len(values) == 1 else "mixed"
         for field in TIME_FIELDS:
-            values = [float(value.get(field, 0.0)) for value in rank_rows]
-            global_row[f"{field}_max"] = max(values, default=0.0)
-            global_row[f"{field}_mean"] = (
-                sum(values) / len(values) if values else 0.0
-            )
+            raw_values = [value.get(field, 0.0) for value in rank_rows]
+            if any(value is None or value == "" for value in raw_values):
+                global_row[f"{field}_max"] = None
+                global_row[f"{field}_mean"] = None
+            else:
+                values = [float(value) for value in raw_values]
+                global_row[f"{field}_max"] = max(values, default=0.0)
+                global_row[f"{field}_mean"] = (
+                    sum(values) / len(values) if values else 0.0
+                )
         _append_tsv(self.global_path, GLOBAL_FIELDS, global_row)
 
     def write_compaction(self, row: Dict[str, object]) -> None:
@@ -871,11 +978,30 @@ class LegacyCudaMetricsCollector:
                     )
             row[field] = total_ms
 
-        row["train_ms"] = (
-            float(row.get("gsplat_forward_ms", 0.0))
-            + float(row.get("backward_ms", 0.0))
-            + float(row.get("optimizer_ms", 0.0))
-        )
+        if normalize_pipeline_mode(row.get("pipeline_mode", "off")) == "micro":
+            # Micro Pipeline's forward/backward values are request latencies and overlap.
+            # Preserve the engine's resolved union when a row passes through
+            # this deferred writer. Otherwise resolve the same union directly.
+            if "train_ms" not in row:
+                intervals = [
+                    (spec["start"], spec["end"])
+                    for field in (
+                        "gsplat_forward_ms", "loss_ms", "backward_ms",
+                        "optimizer_ms", "curvature_forward_ms", "curvature_vjp_ms",
+                    )
+                    for spec in cuda_ranges.get(field, [])
+                ]
+                row["train_ms"] = (
+                    cuda_interval_union_ms(intervals[0][0], intervals)
+                    if intervals else 0.0
+                )
+        else:
+            row["train_ms"] = (
+                float(row.get("gsplat_forward_ms", 0.0))
+                + float(row.get("loss_ms", 0.0))
+                + float(row.get("backward_ms", 0.0))
+                + float(row.get("optimizer_ms", 0.0))
+            )
         self.writer.write_batch(row)
 
 

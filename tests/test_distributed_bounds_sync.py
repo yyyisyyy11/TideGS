@@ -1,4 +1,5 @@
 import ast
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Sequence
 import unittest
@@ -54,15 +55,28 @@ def _load_sync_bounds():
     ]
     module = ast.Module(body=nodes, type_ignores=[])
     ast.fix_missing_locations(module)
+    ranges = []
+
+    @contextmanager
+    def tide_range(name):
+        ranges.append(("begin", name))
+        try:
+            yield
+        finally:
+            ranges.append(("end", name))
+
     namespace = {
         "DistributedContext": object,
         "Optional": Optional,
         "Sequence": Sequence,
         "np": _NumpyStub,
         "torch": _TorchStub,
+        "tide_range": tide_range,
     }
     exec(compile(module, str(ENGINE_PATH), "exec"), namespace)
-    return namespace["_sync_bounds"]
+    sync_bounds = namespace["_sync_bounds"]
+    sync_bounds.test_ranges = ranges
+    return sync_bounds
 
 
 class _PendingBounds:
@@ -144,6 +158,10 @@ class DistributedBoundsSyncTest(unittest.TestCase):
 
                 self.assertEqual(len(context.gathered), 3)
                 self.assertEqual(len(adapter.updates), 1)
+                self.assertEqual(
+                    [name for action, name in sync_bounds.test_ranges if action == "begin"],
+                    [name for action, name in sync_bounds.test_ranges if action == "end"],
+                )
                 if rank == 0:
                     self.assertIsInstance(raised.exception.__cause__, OSError)
                     self.assertEqual(
@@ -167,6 +185,10 @@ class DistributedBoundsSyncTest(unittest.TestCase):
         )
 
         self.assertEqual(len(context.gathered), 3)
+        self.assertEqual(
+            [name for action, name in sync_bounds.test_ranges if action == "begin"],
+            [name for action, name in sync_bounds.test_ranges if action == "end"],
+        )
         self.assertEqual(context.gathered[2], {"rank": 0, "error": None})
         self.assertEqual(
             adapter.updates,

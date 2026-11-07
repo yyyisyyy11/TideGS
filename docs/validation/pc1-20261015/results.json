@@ -1,0 +1,138 @@
+{
+  "validation_date": "2026-10-15",
+  "baseline_commit": "31675ed4d1e80627220e739d69238be1dddeea72",
+  "worktree": "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline",
+  "python_executable": "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3",
+  "python_version": "3.12.14 (main, Aug 25 2026, 13:50:33) [Clang 22.1.3 ]",
+  "dependencies": {
+    "numpy": true,
+    "torch": false,
+    "pytest": false,
+    "psutil": false
+  },
+  "nvcc": null,
+  "nvidia_smi": null,
+  "focused": {
+    "total": 125,
+    "passed": 110,
+    "errors": 0,
+    "failures": 0,
+    "skipped": 15,
+    "modules": [
+      "tests.test_distributed_error_control",
+      "tests.test_distributed_metrics",
+      "tests.test_distributed_pipeline_background",
+      "tests.test_distributed_pipeline_contract",
+      "tests.test_distributed_pipeline_cuda",
+      "tests.test_distributed_pipeline_cuda_faults",
+      "tests.test_distributed_trace",
+      "tests.test_pc1_render_timing",
+      "tests.test_pc1_comm_worker",
+      "tests.test_pc1_context_lifecycle",
+      "tests.test_pc1_native_capabilities",
+      "tests.test_pc1_native_cuda",
+      "tests.test_pc1_overlap_analysis",
+      "tests.test_pc1_paired_benchmark",
+      "tests.test_pc1_schedule",
+      "tests.test_pc1_segmented_transport",
+      "tests.test_pc1_engine_error_checkpoint"
+    ]
+  },
+  "full": {
+    "total": 362,
+    "passed": 301,
+    "errors": 23,
+    "failures": 0,
+    "skipped": 38
+  },
+  "baseline": {
+    "total": 291,
+    "passed": 242,
+    "errors": 23,
+    "failures": 0,
+    "skipped": 26
+  },
+  "baseline_error_comparison": {
+    "identical_error_test_sets": true,
+    "new_errors": [],
+    "resolved_errors": [],
+    "existing_error_tests": [
+      "test_async_cache_commit (unittest.loader._FailedTest.test_async_cache_commit)",
+      "test_bounds_generation (unittest.loader._FailedTest.test_bounds_generation)",
+      "test_compaction_scheduler (unittest.loader._FailedTest.test_compaction_scheduler)",
+      "test_distributed_checkpoint_compat (unittest.loader._FailedTest.test_distributed_checkpoint_compat)",
+      "test_distributed_checkpoint_v3 (unittest.loader._FailedTest.test_distributed_checkpoint_v3)",
+      "test_distributed_versions (unittest.loader._FailedTest.test_distributed_versions)",
+      "test_double_buffer_materialization (unittest.loader._FailedTest.test_double_buffer_materialization)",
+      "test_future_queue_preserves_target_iteration_for_worker (test_async_prefetch_target.AsyncPrefetchTargetTest.test_future_queue_preserves_target_iteration_for_worker)",
+      "test_gpu_block_culler (unittest.loader._FailedTest.test_gpu_block_culler)",
+      "test_gpu_resident_optimizer (unittest.loader._FailedTest.test_gpu_resident_optimizer)",
+      "test_gpu_resident_sophia_tr (unittest.loader._FailedTest.test_gpu_resident_sophia_tr)",
+      "test_gpu_working_set_retention (unittest.loader._FailedTest.test_gpu_working_set_retention)",
+      "test_log_storage_lifecycle (unittest.loader._FailedTest.test_log_storage_lifecycle)",
+      "test_mem_monitor (unittest.loader._FailedTest.test_mem_monitor)",
+      "test_next_curvature_union_uses_one_cull_and_existing_handoff (test_single_rank_sophia_engine.SingleRankSophiaBatchContractTest.test_next_curvature_union_uses_one_cull_and_existing_handoff)",
+      "test_optimizer_algorithm_defaults (unittest.loader._FailedTest.test_optimizer_algorithm_defaults)",
+      "test_rank0_directory_failure_stops_all_ranks_before_barrier (test_distributed_checkpoint_setup.DistributedCheckpointSetupContractTest.test_rank0_directory_failure_stops_all_ranks_before_barrier)",
+      "test_resident_policy_active_first (unittest.loader._FailedTest.test_resident_policy_active_first)",
+      "test_sophia_tr_math (unittest.loader._FailedTest.test_sophia_tr_math)",
+      "test_sophia_tr_sampling (unittest.loader._FailedTest.test_sophia_tr_sampling)",
+      "test_sophia_tr_shared_curvature (unittest.loader._FailedTest.test_sophia_tr_shared_curvature)",
+      "test_tide_trace (unittest.loader._FailedTest.test_tide_trace)",
+      "test_tiered_cache_singleflight (unittest.loader._FailedTest.test_tiered_cache_singleflight)"
+    ]
+  },
+  "other_checks": {
+    "bundled_analysis_tests": 13,
+    "build_adapter_tests": 7,
+    "analysis_self_test": "passed",
+    "build_inputs_check": "passed (not compilation)",
+    "compileall": "passed",
+    "shared_scripts_py_compile": "passed",
+    "diff_check": "passed",
+    "snapshot_sha256": "5/5 match shared files",
+    "svg_cpu_rows": "XML parsed; all 3 CPU rows contained in CPU lane"
+  },
+  "gpu_acceptance": {
+    "native_build": "not_run",
+    "numerical_cuda_nccl": "not_run",
+    "fault_injection": "not_run",
+    "gil_nsight": "not_run",
+    "representative_target_overlap": "not_run",
+    "paired_performance": "not_run"
+  },
+  "logs": [
+    {
+      "file": "baseline-unittest.log",
+      "sha256": "7d6c757943ba11b52efe25913725b88eb9bfb0ff76e45eeac12f23a88b01d51f"
+    },
+    {
+      "file": "full-unittest.log",
+      "sha256": "f28bfb5a1fb1d5b4bcee5421cf823f9180a1901de432c07e594b3398b9eb9702"
+    },
+    {
+      "file": "focused-unittest.log",
+      "sha256": "a6bd2a2054bace064b6b31a9ee5b512a35e1bce72783af05bff978a0e1ece6f7"
+    },
+    {
+      "file": "bundled-analysis-unittest.log",
+      "sha256": "b9f7af4c8e722f7dd52ac445abbfcdc3c69f3783055419507a5d7d706aa36a98"
+    },
+    {
+      "file": "build-adapter-unittest.log",
+      "sha256": "984d05fdfc6378fbbc9bde7419af111497819d76807d681b048471fa9342acf9"
+    },
+    {
+      "file": "analysis-selftest.log",
+      "sha256": "6ccc7ca8650a1d5606515cd1fa101ba7c1c3be138a17207670da32f6bebd1e0a"
+    },
+    {
+      "file": "build-inputs.log",
+      "sha256": "7511bf52afdd41da36b7946171eb263b96d7151a458dd5ea1d4c86620b45de4c"
+    },
+    {
+      "file": "compileall.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ]
+}

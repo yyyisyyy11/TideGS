@@ -222,3 +222,46 @@ def distributed_rasterize(
         sparse_grad=False,
         distributed=True,
     )
+
+
+def distributed_rasterization_pipeline(
+    *,
+    compute_stream=None,
+    comm_stream=None,
+    buffer_count: int = 2,
+    capture_timeline: bool = False,
+    comm_worker=None,
+    batch_index: int = 0,
+    deadline=None,
+):
+    """Return the optional TideGS P/C1 pipeline from the pinned gsplat tree."""
+
+    gsplat = require_distributed_gsplat()
+    factory = getattr(gsplat, "distributed_rasterization_pipeline", None)
+    if factory is None:
+        raise RuntimeError(
+            "The pinned gsplat tree does not provide the TideGS P/C1 pipeline"
+        )
+    return factory(
+        compute_stream=compute_stream,
+        comm_stream=comm_stream,
+        buffer_count=int(buffer_count),
+        capture_timeline=bool(capture_timeline),
+        comm_worker=comm_worker,
+        batch_index=int(batch_index),
+        deadline=deadline,
+    )
+
+
+def prepare_distributed_camera_layout(*, means, viewmats, Ks, microbatch):
+    """Gather one batch of camera metadata for the Micro Pipeline."""
+
+    require_distributed_gsplat()
+    from gsplat.distributed_pipeline import prepare_batch_camera_layout
+
+    return prepare_batch_camera_layout(
+        means=means,
+        viewmats=viewmats,
+        Ks=Ks,
+        microbatch=int(microbatch),
+    )

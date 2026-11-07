@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <iostream>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAException.h>
 
 namespace cg = cooperative_groups;
 
@@ -374,7 +376,8 @@ fusedssim(
   bool train
 )
 {
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(img1));
+  const c10::cuda::CUDAGuard device_guard(img1.device());
+  const auto stream = c10::cuda::getCurrentCUDAStream(img1.get_device());
   int B = img1.size(0);
   int CH = img1.size(1);
   int H = img1.size(2);
@@ -386,7 +389,7 @@ fusedssim(
   torch::Tensor dm_dmu1 = train ? torch::empty_like(img1).contiguous() : torch::empty(0);
   torch::Tensor dm_dsigma1_sq = train ? torch::empty_like(img1).contiguous() : torch::empty(0);
   torch::Tensor dm_dsigma12 = train ? torch::empty_like(img1).contiguous() : torch::empty(0);
-  fusedssimCUDA<<<grid,block>>>(
+  fusedssimCUDA<<<grid,block,0,stream>>>(
     H,
     W,
     CH,
@@ -399,6 +402,7 @@ fusedssim(
     dm_dsigma1_sq.contiguous().data<float>(),
     dm_dsigma12.contiguous().data<float>()
   );
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   return std::make_tuple(target, dm_dmu1, dm_dsigma1_sq, dm_dsigma12);
 }
@@ -415,7 +419,8 @@ fusedssim_backward(
   torch::Tensor &dm_dsigma12
 )
 {
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(img1));
+  const c10::cuda::CUDAGuard device_guard(img1.device());
+  const auto stream = c10::cuda::getCurrentCUDAStream(img1.get_device());
   int B = img1.size(0);
   int CH = img1.size(1);
   int H = img1.size(2);
@@ -425,7 +430,7 @@ fusedssim_backward(
 
   dim3 grid((W + BX - 1) / BX, (H + BY - 1) / BY, B);
   dim3 block(BX, BY, 1);
-  fusedssim_backwardCUDA<<<grid,block>>>(
+  fusedssim_backwardCUDA<<<grid,block,0,stream>>>(
     H,
     W,
     CH,
@@ -439,6 +444,7 @@ fusedssim_backward(
     dm_dsigma1_sq.contiguous().data<float>(),
     dm_dsigma12.contiguous().data<float>()
   );
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   return dL_dimg1;
 }

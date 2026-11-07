@@ -245,6 +245,17 @@ def patch_tile_contribution_source(source: str) -> tuple[str, bool]:
 
 
 def find_rendering_path() -> Path:
+    """Find the repository-pinned rendering source before site-packages."""
+
+    repository_path = (
+        Path(__file__).resolve().parents[1]
+        / "submodules"
+        / "gsplat"
+        / "gsplat"
+        / "rendering.py"
+    )
+    if repository_path.is_file():
+        return repository_path
     spec = importlib.util.find_spec("gsplat")
     if spec is None or not spec.submodule_search_locations:
         raise RuntimeError("gsplat is not installed in the active Python environment")
@@ -255,6 +266,22 @@ def find_rendering_path() -> Path:
     return rendering_path
 
 
+def validate_rendering_source(rendering_path: Path) -> None:
+    source = rendering_path.read_text(encoding="utf-8")
+    required = (
+        BUGGY_IMAGE_IDS.replace("image_ids = batch_ids * C + camera_ids", "image_ids = camera_ids"),
+        PROJECTION_TIMING_MARKER,
+        OWNER_SURVIVOR_MARKER,
+        TILE_CONTRIBUTION_MARKER,
+    )
+    missing = [marker for marker in required if marker not in source]
+    if missing:
+        raise RuntimeError(
+            f"TideGS gsplat source is missing required fixes: {missing}; "
+            f"path={rendering_path}"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -262,9 +289,18 @@ def main() -> None:
         type=Path,
         help="Optional explicit path to gsplat/rendering.py",
     )
+    parser.add_argument(
+        "--patch",
+        action="store_true",
+        help="Patch an external gsplat installation in place (legacy compatibility)",
+    )
     args = parser.parse_args()
 
     rendering_path = (args.path.resolve() if args.path else find_rendering_path())
+    if not args.patch:
+        validate_rendering_source(rendering_path)
+        print(f"TideGS gsplat source validated: {rendering_path}")
+        return
     source = rendering_path.read_text(encoding="utf-8")
     patched_source, camera_changed = patch_rendering_source(source)
     patched_source, timing_changed = patch_projection_timing_source(patched_source)

@@ -1,0 +1,8 @@
+test_native_forward_and_backward_guard_input_device (tests.test_micro_pipeline_native_cuda.MicroPipelineNativeCudaTest.test_native_forward_and_backward_guard_input_device) ... skipped 'set TIDE_RUN_NATIVE_CUDA=1 on a CUDA host'
+test_nondefault_stream_preserves_actual_loss_and_backward (tests.test_micro_pipeline_native_cuda.MicroPipelineNativeCudaTest.test_nondefault_stream_preserves_actual_loss_and_backward) ... skipped 'set TIDE_RUN_NATIVE_CUDA=1 on a CUDA host'
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.000s
+
+OK (skipped=2)
+Micro Pipeline acceptance requires 2 passing tests and zero skips

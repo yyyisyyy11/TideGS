@@ -1,0 +1,24 @@
+test_check_only_has_no_torch_dependency (test_build_gsplat.BuildGsplatTests.test_check_only_has_no_torch_dependency) ... ok
+test_context_restores_state_after_exception (test_build_gsplat.BuildGsplatTests.test_context_restores_state_after_exception) ... ok
+test_missing_required_headers_fail_before_torch_import (test_build_gsplat.BuildGsplatTests.test_missing_required_headers_fail_before_torch_import) ... ok
+test_missing_transitive_local_header_fails (test_build_gsplat.BuildGsplatTests.test_missing_transitive_local_header_fails) ... ok
+test_real_setup_preserves_legacy_and_compiler_options (test_build_gsplat.BuildGsplatTests.test_real_setup_preserves_legacy_and_compiler_options) ... /Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/submodules/gsplat/setup.py:11: ResourceWarning: unclosed file <_io.TextIOWrapper name='gsplat/version.py' mode='r' encoding='UTF-8'>
+  exec(open("gsplat/version.py", "r").read())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/submodules/gsplat/setup.py:11: ResourceWarning: unclosed file <_io.TextIOWrapper name='gsplat/version.py' mode='r' encoding='UTF-8'>
+  exec(open("gsplat/version.py", "r").read())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+ok
+test_real_setup_uses_only_modern_binding_and_headers (test_build_gsplat.BuildGsplatTests.test_real_setup_uses_only_modern_binding_and_headers) ... /Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/submodules/gsplat/setup.py:11: ResourceWarning: unclosed file <_io.TextIOWrapper name='gsplat/version.py' mode='r' encoding='UTF-8'>
+  exec(open("gsplat/version.py", "r").read())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+ok
+test_rejects_changed_setup_source_selection (test_build_gsplat.BuildGsplatTests.test_rejects_changed_setup_source_selection) ... /Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/submodules/gsplat/setup.py:11: ResourceWarning: unclosed file <_io.TextIOWrapper name='gsplat/version.py' mode='r' encoding='UTF-8'>
+  exec(open("gsplat/version.py", "r").read())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.070s
+
+OK

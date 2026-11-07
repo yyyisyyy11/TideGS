@@ -387,7 +387,9 @@ def _build_distributed_plan(
         phase="initial distributed planning",
         operation=build_rank0_payload if context.is_rank0 else None,
     )
-    return DistributedBatchPlan.from_dict(context.broadcast_object(payload)), schedule_info
+    with tide_range("tide.comm.plan.broadcast"):
+        payload = context.broadcast_object(payload)
+    return DistributedBatchPlan.from_dict(payload), schedule_info
 
 
 def _normalize_camera_blocks(camera_blocks):
@@ -471,7 +473,9 @@ def _preview_distributed_plan(
     payload = None
     if context.is_rank0:
         payload, rank0_preview = preview_result
-    plan = DistributedBatchPlan.from_dict(context.broadcast_object(payload))
+    with tide_range("tide.comm.plan.broadcast"):
+        payload = context.broadcast_object(payload)
+    plan = DistributedBatchPlan.from_dict(payload)
     return plan, schedule_info, rank0_preview
 
 
@@ -487,6 +491,7 @@ def _finalize_distributed_plan(
     predicted_plan,
     rank0_preview,
     curvature_camera_ids=None,
+    finalize_plan=False,
 ):
     schedule_info = get_camera_batch_schedule(
         training_schedule=training_schedule,
@@ -531,23 +536,39 @@ def _finalize_distributed_plan(
         prediction_changed = (
             union_camera_blocks != rank0_preview["union_camera_blocks"]
         )
-        exact_plan_ms = 0.0
-        if prediction_changed:
-            camera_blocks = _split_camera_blocks(
+        camera_blocks = _split_camera_blocks(
+            union_camera_blocks,
+            schedule_info.batch_indices,
+        )
+        curvature_camera_blocks = (
+            _split_camera_blocks(
                 union_camera_blocks,
-                schedule_info.batch_indices,
+                rank0_curvature_camera_ids,
             )
-            curvature_camera_blocks = (
-                _split_camera_blocks(
-                    union_camera_blocks,
-                    rank0_curvature_camera_ids,
+            if rank0_curvature_camera_ids
+            else None
+        )
+        exact_plan_ms = 0.0
+        active_refresh_ms = 0.0
+        replanned = False
+        resolved_plan = None
+        resolution = "full_requested"
+        if not finalize_plan:
+            refresh_start = time.perf_counter()
+            with tide_range("tide.cpu.plan.active_refresh"):
+                resolved_plan, fallback_reason = planner.refresh_active(
+                    predicted_plan=predicted_plan,
+                    predicted_state=rank0_preview["predicted_state"],
+                    camera_blocks=camera_blocks,
+                    curvature_camera_blocks=curvature_camera_blocks,
                 )
-                if rank0_curvature_camera_ids
-                else None
-            )
+            active_refresh_ms = (time.perf_counter() - refresh_start) * 1000.0
+            resolution = fallback_reason or "active_refresh"
+
+        if resolved_plan is None and (prediction_changed or not finalize_plan):
             plan_start = time.perf_counter()
             with tide_range("tide.cpu.plan.finalize"):
-                exact_plan = planner.plan(
+                resolved_plan = planner.plan(
                     iteration=iteration,
                     epoch=schedule_info.epoch,
                     camera_ids=schedule_info.batch_indices,
@@ -556,15 +577,18 @@ def _finalize_distributed_plan(
                     curvature_camera_blocks=curvature_camera_blocks,
                 )
             exact_plan_ms = (time.perf_counter() - plan_start) * 1000.0
-        else:
+            replanned = True
+        elif resolved_plan is None:
             planner.restore_state(rank0_preview["predicted_state"])
-            exact_plan = predicted_plan
+            resolved_plan = predicted_plan
 
         predicted_stream_in = set(predicted_plan.stream_in_blocks)
-        exact_stream_in = set(exact_plan.stream_in_blocks)
-        payload = exact_plan.to_dict()
+        resolved_stream_in = set(resolved_plan.stream_in_blocks)
+        payload = resolved_plan.to_dict()
         payload["block_cull_ms"] = float(predicted_plan.block_cull_ms) + repair_ms
-        payload["plan_ms"] = float(predicted_plan.plan_ms) + exact_plan_ms
+        payload["plan_ms"] = (
+            float(predicted_plan.plan_ms) + active_refresh_ms + exact_plan_ms
+        )
         payload.update(
             {
                 field: getattr(predicted_plan, field)
@@ -589,13 +613,16 @@ def _finalize_distributed_plan(
                     getattr(predicted_plan, field) + repair_cull_metrics[field]
                 )
         payload["predicted_stream_in_blocks"] = len(predicted_stream_in)
-        payload["prediction_missing_blocks"] = len(
-            exact_stream_in - predicted_stream_in
+        payload["prediction_missing_blocks"] = (
+            None if resolution == "active_refresh"
+            else len(resolved_stream_in - predicted_stream_in)
         )
-        payload["prediction_extra_blocks"] = len(
-            predicted_stream_in - exact_stream_in
+        payload["prediction_extra_blocks"] = (
+            None if resolution == "active_refresh"
+            else len(predicted_stream_in - resolved_stream_in)
         )
-        payload["prediction_replanned"] = int(prediction_changed)
+        payload["plan_resolution"] = resolution
+        payload["prediction_replanned"] = int(replanned)
         payload["prediction_repair_ms"] = repair_ms
         payload["prediction_exact_plan_ms"] = exact_plan_ms
         return payload
@@ -605,7 +632,9 @@ def _finalize_distributed_plan(
         phase="final distributed planning",
         operation=finalize_rank0_payload if context.is_rank0 else None,
     )
-    plan = DistributedBatchPlan.from_dict(context.broadcast_object(payload))
+    with tide_range("tide.comm.plan.broadcast"):
+        payload = context.broadcast_object(payload)
+    plan = DistributedBatchPlan.from_dict(payload)
     return plan, schedule_info
 
 
@@ -760,6 +789,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     # Keep the distributed context on ``args`` so runtime initialization can
     # select a rank-local SSD state directory before the first admission.
     args._tide_distributed_context = distributed_context
+    metrics_enabled = bool(
+        args.tide_detailed_metrics or getattr(args, "tide_light_timeline", False)
+    )
 
     # ============================================================================
     # STAGE 1: INITIALIZATION
@@ -779,7 +811,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     if distributed_enabled:
         prepare_distributed_gsplat(
             distributed_context,
-            enable_timing=bool(args.tide_detailed_metrics),
+            enable_timing=metrics_enabled,
             enable_grad_zero_metrics=bool(args.tide_grad_zero_metrics),
             tile_contribution_mode=str(args.tide_tile_contribution_mode),
             tile_alpha_threshold=float(args.tide_tile_alpha_threshold),
@@ -1305,7 +1337,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     )
     timeline_writer = (
         get_distributed_metrics_writer(gaussians, distributed_context)
-        if args.tide_detailed_metrics
+        if metrics_enabled
         else None
     )
     if timeline_writer is not None:
@@ -1584,22 +1616,23 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             next_distributed_rank0_preview = None
             if distributed_enabled and next_iteration <= opt_args.iterations:
                 preview_start_ns = time.perf_counter_ns()
-                (
-                    next_distributed_prediction,
-                    _,
-                    next_distributed_rank0_preview,
-                ) = _preview_distributed_plan(
-                    context=distributed_context,
-                    planner=distributed_planner,
-                    storage_adapter=storage_adapter,
-                    training_schedule=ssd_training_schedule,
-                    iteration=next_iteration,
-                    batch_size=args.bsz,
-                    schedule_ordering=getattr(
-                        args, "ssd_schedule_ordering", "trajectory"
-                    ),
-                    curvature_camera_ids=next_curvature_camera_ids,
-                )
+                with tide_range("tide.cpu.plan.preview.total"):
+                    (
+                        next_distributed_prediction,
+                        _,
+                        next_distributed_rank0_preview,
+                    ) = _preview_distributed_plan(
+                        context=distributed_context,
+                        planner=distributed_planner,
+                        storage_adapter=storage_adapter,
+                        training_schedule=ssd_training_schedule,
+                        iteration=next_iteration,
+                        batch_size=args.bsz,
+                        schedule_ordering=getattr(
+                            args, "ssd_schedule_ordering", "trajectory"
+                        ),
+                        curvature_camera_ids=next_curvature_camera_ids,
+                    )
                 preview_end_ns = time.perf_counter_ns()
                 if timeline_writer is not None:
                     timeline_writer.write_timeline_event(
@@ -1617,19 +1650,21 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 predicted_resident = set(
                     next_distributed_prediction.rank_resident_blocks[rank]
                 )
-                gaussians._block_reader.hint_future(
-                    sorted(predicted_resident - current_resident),
-                    target_iteration=next_iteration,
-                )
+                with tide_range("tide.io.ssd.prefetch.submit"):
+                    gaussians._block_reader.hint_future(
+                        sorted(predicted_resident - current_resident),
+                        target_iteration=next_iteration,
+                    )
 
             if not distributed_enabled and next_iteration <= opt_args.iterations:
-                camera_batch_prefetcher.submit(next_schedule.batch_indices)
-                if next_curvature_camera_ids:
-                    if curvature_camera_batch_prefetcher is None:
-                        raise RuntimeError("3DGS2-TR S2 prefetcher is not initialized")
-                    curvature_camera_batch_prefetcher.submit(
-                        next_curvature_camera_ids
-                    )
+                with tide_range("tide.cpu.camera.prefetch.submit"):
+                    camera_batch_prefetcher.submit(next_schedule.batch_indices)
+                    if next_curvature_camera_ids:
+                        if curvature_camera_batch_prefetcher is None:
+                            raise RuntimeError("3DGS2-TR S2 prefetcher is not initialized")
+                        curvature_camera_batch_prefetcher.submit(
+                            next_curvature_camera_ids
+                        )
 
             if iteration % 100 == 0:
                 log_file.write(
@@ -1647,11 +1682,12 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             # ------------------------------------------------------------------------
             timers.start("send cam matrices to gpu")
             with tide_range("tide.gpu.transfer.h2d"), torch.no_grad():
-                _prepare_camera_batch_on_gpu(batched_cameras, batch_indices)
-                _prepare_camera_batch_on_gpu(
-                    curvature_cameras,
-                    curvature_batch_indices,
-                )
+                with tide_range("tide.cpu.camera.h2d.submit"):
+                    _prepare_camera_batch_on_gpu(batched_cameras, batch_indices)
+                    _prepare_camera_batch_on_gpu(
+                        curvature_cameras,
+                        curvature_batch_indices,
+                    )
             timers.stop("send cam matrices to gpu")
             assert args.bsz > 1, "Pipelined offload requires batch size > 1"
             with tide_range("tide.batch.compute"):
@@ -1710,7 +1746,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     ],
                     "sparsity": float(sparsity),
                 }
-                rank_payloads = distributed_context.all_gather_object(local_payload)
+                with tide_range("tide.comm.loss.gather"):
+                    rank_payloads = distributed_context.all_gather_object(local_payload)
                 records = [
                     record
                     for payload in rank_payloads
@@ -1769,18 +1806,20 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                             f"Missing distributed prediction for iteration {next_iteration}"
                         )
                     finalize_start_ns = time.perf_counter_ns()
-                    next_distributed_plan, _ = _finalize_distributed_plan(
-                        context=distributed_context,
-                        planner=distributed_planner,
-                        storage_adapter=storage_adapter,
-                        training_schedule=ssd_training_schedule,
-                        iteration=next_iteration,
-                        batch_size=args.bsz,
-                        schedule_ordering=getattr(args, "ssd_schedule_ordering", "trajectory"),
-                        predicted_plan=next_distributed_prediction,
-                        rank0_preview=next_distributed_rank0_preview,
-                        curvature_camera_ids=next_curvature_camera_ids,
-                    )
+                    with tide_range("tide.cpu.plan.finalize.total"):
+                        next_distributed_plan, _ = _finalize_distributed_plan(
+                            context=distributed_context,
+                            planner=distributed_planner,
+                            storage_adapter=storage_adapter,
+                            training_schedule=ssd_training_schedule,
+                            iteration=next_iteration,
+                            batch_size=args.bsz,
+                            schedule_ordering=getattr(args, "ssd_schedule_ordering", "trajectory"),
+                            predicted_plan=next_distributed_prediction,
+                            rank0_preview=next_distributed_rank0_preview,
+                            curvature_camera_ids=next_curvature_camera_ids,
+                            finalize_plan=getattr(args, "finalize_plan", False),
+                        )
                     finalize_end_ns = time.perf_counter_ns()
                     if timeline_writer is not None:
                         timeline_writer.write_timeline_event(
@@ -1801,23 +1840,25 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     predicted_resident = set(
                         next_distributed_prediction.rank_resident_blocks[rank]
                     )
-                    gaussians._block_reader.hint_future(
-                        sorted(
-                            (next_resident - current_resident)
-                            - (predicted_resident - current_resident)
-                        ),
-                        target_iteration=next_iteration,
-                    )
-                    camera_batch_prefetcher.submit(
-                        next_distributed_plan.rank_camera_ids[rank]
-                    )
-                    next_rank_s2 = next_distributed_plan.rank_s2_camera_ids[rank]
-                    if next_rank_s2:
-                        if curvature_camera_batch_prefetcher is None:
-                            raise RuntimeError(
-                                "3DGS2-TR S2 prefetcher is not initialized"
-                            )
-                        curvature_camera_batch_prefetcher.submit(next_rank_s2)
+                    with tide_range("tide.io.ssd.prefetch.submit"):
+                        gaussians._block_reader.hint_future(
+                            sorted(
+                                (next_resident - current_resident)
+                                - (predicted_resident - current_resident)
+                            ),
+                            target_iteration=next_iteration,
+                        )
+                    with tide_range("tide.cpu.camera.prefetch.submit"):
+                        camera_batch_prefetcher.submit(
+                            next_distributed_plan.rank_camera_ids[rank]
+                        )
+                        next_rank_s2 = next_distributed_plan.rank_s2_camera_ids[rank]
+                        if next_rank_s2:
+                            if curvature_camera_batch_prefetcher is None:
+                                raise RuntimeError(
+                                    "3DGS2-TR S2 prefetcher is not initialized"
+                                )
+                            curvature_camera_batch_prefetcher.submit(next_rank_s2)
                 current_distributed_plan = next_distributed_plan
 
             matched_checkpoint_iterations = [
@@ -2085,7 +2126,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         from strategies.tide_engine.engine import shutdown_double_buffer_gpu
 
         distributed_context.barrier()
-        if args.tide_detailed_metrics:
+        if metrics_enabled:
             legacy_collector = getattr(
                 gaussians, "_tide_legacy_cuda_metrics_collector", None
             )
@@ -2143,7 +2184,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 lambda: None,
             )(),
         )
-        if args.tide_detailed_metrics:
+        if metrics_enabled:
             def finalize_distributed_metrics():
                 metrics_writer = get_distributed_metrics_writer(
                     gaussians,

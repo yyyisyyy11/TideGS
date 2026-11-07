@@ -1,0 +1,382 @@
+E.EE..................E....ssssssssss..E.EE........................................sssssssssssss..........................................EE..................EEEE.........ss.........................sE.....E[MERGE] FAILED: 1 ambiguous/conflicting blocks; first: ['block 2: non-owner rank 1 holds file_id=17 version=3 (owner rank 0)']
+....[MERGE] FAILED: output already exists, refusing to overwrite: /var/folders/1v/b3pnsc3j10n5fcrkwcd_k6040000gn/T/tmpahnkv0pt/merged
+[MERGE] FAILED: block_owner.npy sha256 does not match the root manifest
+.E........................ss...................................................sss.......ss....sss.......s....E..............................E......EEE.......EE...s...
+======================================================================
+ERROR: test_async_cache_commit (unittest.loader._FailedTest.test_async_cache_commit)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_async_cache_commit
+Traceback (most recent call last):
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/tests/test_async_cache_commit.py", line 6, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+
+
+======================================================================
+ERROR: test_future_queue_preserves_target_iteration_for_worker (test_async_prefetch_target.AsyncPrefetchTargetTest.test_future_queue_preserves_target_iteration_for_worker)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/tests/test_async_prefetch_target.py", line 80, in test_future_queue_preserves_target_iteration_for_worker
+    self.assertEqual(pipeline.urgent_prefetch_queue.get_nowait(), (7, [1]))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/queue.py", line 199, in get_nowait
+    return self.get(block=False)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/queue.py", line 168, in get
+    raise Empty
+_queue.Empty
+
+======================================================================
+ERROR: test_bounds_generation (unittest.loader._FailedTest.test_bounds_generation)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_bounds_generation
+Traceback (most recent call last):
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/tests/test_bounds_generation.py", line 5, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+
+
+======================================================================
+ERROR: test_compaction_scheduler (unittest.loader._FailedTest.test_compaction_scheduler)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_compaction_scheduler
+Traceback (most recent call last):
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/tests/test_compaction_scheduler.py", line 3, in <module>
+    from storage.compaction_scheduler import (
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/storage/__init__.py", line 11, in <module>
+    from .log_storage_manager import LogStorageManager, BlockLocation
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/storage/log_storage_manager.py", line 20, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+
+
+======================================================================
+ERROR: test_distributed_checkpoint_compat (unittest.loader._FailedTest.test_distributed_checkpoint_compat)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_distributed_checkpoint_compat
+Traceback (most recent call last):
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/tests/test_distributed_checkpoint_compat.py", line 7, in <module>
+    from storage.distributed_checkpoint import load_distributed_checkpoint_manifest
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/storage/__init__.py", line 11, in <module>
+    from .log_storage_manager import LogStorageManager, BlockLocation
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/storage/log_storage_manager.py", line 20, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+
+
+======================================================================
+ERROR: test_rank0_directory_failure_stops_all_ranks_before_barrier (test_distributed_checkpoint_setup.DistributedCheckpointSetupContractTest.test_rank0_directory_failure_stops_all_ranks_before_barrier)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/tests/test_distributed_checkpoint_setup.py", line 47, in test_rank0_directory_failure_stops_all_ranks_before_barrier
+    from storage.distributed_checkpoint import (
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/storage/__init__.py", line 11, in <module>
+    from .log_storage_manager import LogStorageManager, BlockLocation
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/storage/log_storage_manager.py", line 83, in <module>
+    class LogStorageManager:
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/storage/log_storage_manager.py", line 99, in LogStorageManager
+    dtype: torch.dtype = torch.float32,
+                         ^^^^^^^^^^^^^
+AttributeError: 'types.SimpleNamespace' object has no attribute 'float32'
+
+======================================================================
+ERROR: test_distributed_checkpoint_v3 (unittest.loader._FailedTest.test_distributed_checkpoint_v3)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_distributed_checkpoint_v3
+Traceback (most recent call last):
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/tests/test_distributed_checkpoint_v3.py", line 11, in <module>
+    from storage.distributed_checkpoint import (
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/storage/__init__.py", line 11, in <module>
+    from .log_storage_manager import LogStorageManager, BlockLocation
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/storage/log_storage_manager.py", line 20, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+
+
+======================================================================
+ERROR: test_distributed_versions (unittest.loader._FailedTest.test_distributed_versions)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_distributed_versions
+Traceback (most recent call last):
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/tests/test_distributed_versions.py", line 3, in <module>
+    from strategies.tide_engine.distributed_engine import DistributedResidentState
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/strategies/tide_engine/distributed_engine.py", line 11, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+
+
+======================================================================
+ERROR: test_double_buffer_materialization (unittest.loader._FailedTest.test_double_buffer_materialization)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_double_buffer_materialization
+Traceback (most recent call last):
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/tests/test_double_buffer_materialization.py", line 5, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+
+
+======================================================================
+ERROR: test_gpu_block_culler (unittest.loader._FailedTest.test_gpu_block_culler)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_gpu_block_culler
+Traceback (most recent call last):
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/tests/test_gpu_block_culler.py", line 4, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+
+
+======================================================================
+ERROR: test_gpu_resident_optimizer (unittest.loader._FailedTest.test_gpu_resident_optimizer)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_gpu_resident_optimizer
+Traceback (most recent call last):
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/tests/test_gpu_resident_optimizer.py", line 6, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+
+
+======================================================================
+ERROR: test_gpu_resident_sophia_tr (unittest.loader._FailedTest.test_gpu_resident_sophia_tr)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_gpu_resident_sophia_tr
+Traceback (most recent call last):
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/tests/test_gpu_resident_sophia_tr.py", line 5, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+
+
+======================================================================
+ERROR: test_gpu_working_set_retention (unittest.loader._FailedTest.test_gpu_working_set_retention)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_gpu_working_set_retention
+Traceback (most recent call last):
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/tests/test_gpu_working_set_retention.py", line 3, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+
+
+======================================================================
+ERROR: test_log_storage_lifecycle (unittest.loader._FailedTest.test_log_storage_lifecycle)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_log_storage_lifecycle
+Traceback (most recent call last):
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/tests/test_log_storage_lifecycle.py", line 11, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+
+
+======================================================================
+ERROR: test_mem_monitor (unittest.loader._FailedTest.test_mem_monitor)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_mem_monitor
+Traceback (most recent call last):
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/tests/test_mem_monitor.py", line 6, in <module>
+    from utils.mem_monitor import MemMonitor
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/utils/mem_monitor.py", line 15, in <module>
+    import psutil
+ModuleNotFoundError: No module named 'psutil'
+
+
+======================================================================
+ERROR: test_optimizer_algorithm_defaults (unittest.loader._FailedTest.test_optimizer_algorithm_defaults)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_optimizer_algorithm_defaults
+Traceback (most recent call last):
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/tests/test_optimizer_algorithm_defaults.py", line 4, in <module>
+    from arguments import _apply_pure_ssd_release_defaults, _apply_tide_aliases
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/arguments/__init__.py", line 20, in <module>
+    import utils.general_utils as utils
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/utils/general_utils.py", line 12, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+
+
+======================================================================
+ERROR: test_resident_policy_active_first (unittest.loader._FailedTest.test_resident_policy_active_first)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_resident_policy_active_first
+Traceback (most recent call last):
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/tests/test_resident_policy_active_first.py", line 7, in <module>
+    from strategies.tide_engine.runtime import resolve_current_iteration_resident_blocks
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/strategies/tide_engine/runtime.py", line 15, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+
+
+======================================================================
+ERROR: test_next_curvature_union_uses_one_cull_and_existing_handoff (test_single_rank_sophia_engine.SingleRankSophiaBatchContractTest.test_next_curvature_union_uses_one_cull_and_existing_handoff)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/tests/test_single_rank_sophia_engine.py", line 330, in test_next_curvature_union_uses_one_cull_and_existing_handoff
+    result = plan(
+             ^^^^^
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/strategies/tide_engine/runtime.py", line 526, in plan_and_start_resident_prefetch
+    with tide_range("tide.cull.block"):
+         ^^^^^^^^^^
+NameError: name 'tide_range' is not defined
+
+======================================================================
+ERROR: test_sophia_tr_math (unittest.loader._FailedTest.test_sophia_tr_math)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_sophia_tr_math
+Traceback (most recent call last):
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/tests/test_sophia_tr_math.py", line 5, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+
+
+======================================================================
+ERROR: test_sophia_tr_sampling (unittest.loader._FailedTest.test_sophia_tr_sampling)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_sophia_tr_sampling
+Traceback (most recent call last):
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/tests/test_sophia_tr_sampling.py", line 5, in <module>
+    from strategies.tide_engine.sophia_tr_sampling import sample_s2_camera_ids
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/strategies/tide_engine/sophia_tr_sampling.py", line 9, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+
+
+======================================================================
+ERROR: test_sophia_tr_shared_curvature (unittest.loader._FailedTest.test_sophia_tr_shared_curvature)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_sophia_tr_shared_curvature
+Traceback (most recent call last):
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/tests/test_sophia_tr_shared_curvature.py", line 5, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+
+
+======================================================================
+ERROR: test_tide_trace (unittest.loader._FailedTest.test_tide_trace)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_tide_trace
+Traceback (most recent call last):
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/tests/test_tide_trace.py", line 4, in <module>
+    import pytest
+ModuleNotFoundError: No module named 'pytest'
+
+
+======================================================================
+ERROR: test_tiered_cache_singleflight (unittest.loader._FailedTest.test_tiered_cache_singleflight)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_tiered_cache_singleflight
+Traceback (most recent call last):
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/tests/test_tiered_cache_singleflight.py", line 55, in <module>
+    _SPEC.loader.exec_module(_MODULE)
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/storage/tiered_cache_manager.py", line 21, in <module>
+    class TieredCacheManager:
+  File "/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/storage/tiered_cache_manager.py", line 998, in TieredCacheManager
+    cuda_stream: Optional[torch.cuda.Stream] = None
+                          ^^^^^^^^^^
+AttributeError: 'types.SimpleNamespace' object has no attribute 'cuda'
+
+
+----------------------------------------------------------------------
+Ran 376 tests in 2.656s
+
+FAILED (errors=23, skipped=38)
+{"iteration": 100, "blocks_total": 6, "blocks_per_rank": {"0": 3, "1": 3}, "missing_blocks": 0, "conflicting_blocks": 0, "mismatched_blocks": 0, "owned_blocks_at_base_per_rank": {}}
+{"iteration": 100, "blocks_total": 6, "blocks_per_rank": {"0": 3, "1": 3}, "missing_blocks": 0, "conflicting_blocks": 0, "mismatched_blocks": 0, "owned_blocks_at_base_per_rank": {}}
+{"iteration": 100, "blocks_total": 6, "blocks_per_rank": {"0": 3, "1": 3}, "missing_blocks": 0, "conflicting_blocks": 0, "mismatched_blocks": 0, "owned_blocks_at_base_per_rank": {}}
+Self-test OK: actual overlap/correlation checks plus ordered four-rank CLI, legacy rank/PID flags, mixed flags and duplicate reports rejected

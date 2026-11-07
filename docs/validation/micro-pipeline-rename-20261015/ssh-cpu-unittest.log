@@ -1,0 +1,44 @@
+test_check_only_has_no_torch_dependency (test_build_gsplat.BuildGsplatTests.test_check_only_has_no_torch_dependency) ... ok
+test_context_restores_state_after_exception (test_build_gsplat.BuildGsplatTests.test_context_restores_state_after_exception) ... ok
+test_missing_required_headers_fail_before_torch_import (test_build_gsplat.BuildGsplatTests.test_missing_required_headers_fail_before_torch_import) ... ok
+test_missing_transitive_local_header_fails (test_build_gsplat.BuildGsplatTests.test_missing_transitive_local_header_fails) ... ok
+test_real_setup_preserves_legacy_and_compiler_options (test_build_gsplat.BuildGsplatTests.test_real_setup_preserves_legacy_and_compiler_options) ... /Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/submodules/gsplat/setup.py:11: ResourceWarning: unclosed file <_io.TextIOWrapper name='gsplat/version.py' mode='r' encoding='UTF-8'>
+  exec(open("gsplat/version.py", "r").read())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/submodules/gsplat/setup.py:11: ResourceWarning: unclosed file <_io.TextIOWrapper name='gsplat/version.py' mode='r' encoding='UTF-8'>
+  exec(open("gsplat/version.py", "r").read())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+ok
+test_real_setup_uses_only_modern_binding_and_headers (test_build_gsplat.BuildGsplatTests.test_real_setup_uses_only_modern_binding_and_headers) ... /Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/submodules/gsplat/setup.py:11: ResourceWarning: unclosed file <_io.TextIOWrapper name='gsplat/version.py' mode='r' encoding='UTF-8'>
+  exec(open("gsplat/version.py", "r").read())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+ok
+test_rejects_changed_setup_source_selection (test_build_gsplat.BuildGsplatTests.test_rejects_changed_setup_source_selection) ... /Users/mac/Projects/proj_tidegs_isc/worktrees/TideGS-pc1-pipeline/submodules/gsplat/setup.py:11: ResourceWarning: unclosed file <_io.TextIOWrapper name='gsplat/version.py' mode='r' encoding='UTF-8'>
+  exec(open("gsplat/version.py", "r").read())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+ok
+test_cli_keeps_filter_diagnostics_out_of_the_returned_search_path (test_runtime_env.RuntimeEnvironmentTests.test_cli_keeps_filter_diagnostics_out_of_the_returned_search_path) ... ok
+test_conflicting_cuda_ld_preload_is_rejected (test_runtime_env.RuntimeEnvironmentTests.test_conflicting_cuda_ld_preload_is_rejected) ... ok
+test_cu124_wheel_replaces_cuda122_toolkit_runtime (test_runtime_env.RuntimeEnvironmentTests.test_cu124_wheel_replaces_cuda122_toolkit_runtime) ... [runtime] Removed toolkit runtime path: /private/var/folders/1v/b3pnsc3j10n5fcrkwcd_k6040000gn/T/tide-runtime-test-8xx3775l/cuda-12.2/lib64
+ok
+test_cuda_preload_symlink_alias_is_rejected (test_runtime_env.RuntimeEnvironmentTests.test_cuda_preload_symlink_alias_is_rejected) ... ok
+test_gcc_mpi_and_actual_driver_paths_are_preserved (test_runtime_env.RuntimeEnvironmentTests.test_gcc_mpi_and_actual_driver_paths_are_preserved) ... ok
+test_loaded_libraries_report_actual_paths_without_map_duplicates (test_runtime_env.RuntimeEnvironmentTests.test_loaded_libraries_report_actual_paths_without_map_duplicates) ... ok
+test_missing_nvjitlink_cannot_be_supplied_by_another_python_root (test_runtime_env.RuntimeEnvironmentTests.test_missing_nvjitlink_cannot_be_supplied_by_another_python_root) ... ok
+test_missing_nvjitlink_cannot_fall_back_to_cuda122_toolkit (test_runtime_env.RuntimeEnvironmentTests.test_missing_nvjitlink_cannot_fall_back_to_cuda122_toolkit) ... ok
+test_missing_torch_fails_before_attempting_a_torch_import (test_runtime_env.RuntimeEnvironmentTests.test_missing_torch_fails_before_attempting_a_torch_import) ... ok
+test_missing_torch_library_directory_is_rejected (test_runtime_env.RuntimeEnvironmentTests.test_missing_torch_library_directory_is_rejected) ... ok
+test_non_cuda_ld_preload_is_allowed_and_not_modified (test_runtime_env.RuntimeEnvironmentTests.test_non_cuda_ld_preload_is_allowed_and_not_modified) ... ok
+test_repeated_configuration_is_idempotent_and_deduplicates_aliases (test_runtime_env.RuntimeEnvironmentTests.test_repeated_configuration_is_idempotent_and_deduplicates_aliases) ... ok
+test_stubs_and_empty_components_are_removed (test_runtime_env.RuntimeEnvironmentTests.test_stubs_and_empty_components_are_removed) ... [runtime] Removed CUDA stubs path: /private/var/folders/1v/b3pnsc3j10n5fcrkwcd_k6040000gn/T/tide-runtime-test-6lkj3cb3/cuda-12.2/lib64/stubs
+[runtime] Removed CUDA stubs path: /private/var/folders/1v/b3pnsc3j10n5fcrkwcd_k6040000gn/T/tide-runtime-test-6lkj3cb3/aliased-driver-libraries
+ok
+test_toolkit_library_alias_is_filtered_after_resolving (test_runtime_env.RuntimeEnvironmentTests.test_toolkit_library_alias_is_filtered_after_resolving) ... [runtime] Removed toolkit runtime path: /private/var/folders/1v/b3pnsc3j10n5fcrkwcd_k6040000gn/T/tide-runtime-test-itlj5bdg/cuda-12.2/lib64
+ok
+test_wheel_discovery_uses_only_the_selected_torch_site_root (test_runtime_env.RuntimeEnvironmentTests.test_wheel_discovery_uses_only_the_selected_torch_site_root) ... ok
+test_wheel_precedes_toolkit_directory_needed_for_real_libcuda (test_runtime_env.RuntimeEnvironmentTests.test_wheel_precedes_toolkit_directory_needed_for_real_libcuda) ... ok
+
+----------------------------------------------------------------------
+Ran 23 tests in 0.107s
+
+OK
