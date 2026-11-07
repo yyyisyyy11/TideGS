@@ -73,6 +73,52 @@ def _write_rank_manifest(rank_dir):
     return manifest
 
 
+def _write_rank_ssd_manifest(rank_dir, block_id):
+    rank_dir = Path(rank_dir)
+    manifest = _write_rank_manifest(rank_dir)
+    state_dir = rank_dir / "optimizer_state_ssd"
+    blocks_dir = state_dir / "blocks"
+    blocks_dir.mkdir(parents=True, exist_ok=True)
+    state_file = blocks_dir / f"block_{int(block_id)}.pt"
+    state_file.write_bytes(f"state-{int(block_id)}".encode("ascii"))
+    index = {
+        "state_format_version": 2,
+        "component_widths": {},
+        "blocks": {
+            str(int(block_id)): {
+                "path": f"blocks/{state_file.name}",
+                "bytes": state_file.stat().st_size,
+                "sha256": _sha256(state_file),
+            }
+        },
+    }
+    (state_dir / "index.json").write_text(json.dumps(index), encoding="utf-8")
+    state_manifest = {
+        "state_format_version": 2,
+        "optimizer_state_mode": "resident_ssd_cache",
+        "optimizer_state_saved": True,
+        "adam_moments_saved": True,
+        "optimizer_state_format_version": 2,
+        "index": "index.json",
+    }
+    (state_dir / "manifest.json").write_text(
+        json.dumps(state_manifest), encoding="utf-8"
+    )
+    manifest.update(
+        {
+            "optimizer_state_mode": "resident_ssd_cache",
+            "optimizer_state_saved": True,
+            "adam_moments_saved": True,
+            "optimizer_state_format_version": 2,
+            "optimizer_state_manifest": "optimizer_state_ssd/manifest.json",
+        }
+    )
+    (rank_dir / CHECKPOINT_MANIFEST).write_text(
+        json.dumps(manifest, sort_keys=True), encoding="utf-8"
+    )
+    return manifest
+
+
 def _write_v3_checkpoint(directory):
     checkpoint = Path(directory)
     rank_dir = checkpoint / "rank_0"
@@ -137,6 +183,74 @@ class _SingleRankContext:
 
 
 class DistributedCheckpointV3Test(unittest.TestCase):
+    def test_v3_accepts_and_routes_rank_local_ssd_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory)
+            _write_rank_ssd_manifest(checkpoint / "rank_0", 0)
+            _write_rank_ssd_manifest(checkpoint / "rank_1", 1)
+            owner_file = checkpoint / "block_owner.npy"
+            bounds_file = checkpoint / "block_bounds.npy"
+            np.save(owner_file, np.asarray([0, 1], dtype=np.int32))
+            np.save(bounds_file, np.zeros((2, 6), dtype=np.float32))
+            root = {
+                "checkpoint_version": 3,
+                "checkpoint_type": "pure_ssd_distributed_incremental",
+                "iteration": 9,
+                "next_iteration": 17,
+                "world_size": 2,
+                "global_bsz": 8,
+                "global_capacity_blocks": 5,
+                "capacity_semantics": "global",
+                "owner_policy": "stable_round_robin",
+                "block_version_semantics": "monotonic_gpu_cpu_ssd",
+                "camera_assignment": "equal",
+                "camera_microbatch": 2,
+                "block_owner": owner_file.name,
+                "block_owner_sha256": _sha256(owner_file),
+                "block_bounds": bounds_file.name,
+                "rank_manifests": ["rank_0", "rank_1"],
+                "rank_manifest_sha256": [
+                    _sha256(checkpoint / "rank_0" / CHECKPOINT_MANIFEST),
+                    _sha256(checkpoint / "rank_1" / CHECKPOINT_MANIFEST),
+                ],
+                "optimizer_provenance": build_optimizer_provenance(
+                    _args(
+                        paper_optimizer_algorithm="adam",
+                        paper_optimizer_state_mode="resident_ssd_cache",
+                    )
+                ),
+                "global_optimizer_step": 2,
+                "optimizer_state_mode": "resident_ssd_cache_per_rank",
+                "optimizer_ema_saved": True,
+                "optimizer_curvature_saved": False,
+                "optimizer_state_format_version": 2,
+                "planner_state": {
+                    "resident": [0, 1],
+                    "active": [1],
+                    "recency": {"0": 0.5, "1": 1.0},
+                },
+                "total_points": 8,
+                "num_blocks": 2,
+                "block_size": 4,
+                "param_dim": 59,
+            }
+            (checkpoint / DISTRIBUTED_CHECKPOINT_MANIFEST).write_text(
+                json.dumps(root, sort_keys=True), encoding="utf-8"
+            )
+            loaded = load_distributed_checkpoint_root(checkpoint)
+            self.assertEqual(
+                loaded["optimizer_state_mode"], "resident_ssd_cache_per_rank"
+            )
+
+            owner = np.asarray([1, 0], dtype=np.int32)
+            np.save(owner_file, owner)
+            root["block_owner_sha256"] = _sha256(owner_file)
+            (checkpoint / DISTRIBUTED_CHECKPOINT_MANIFEST).write_text(
+                json.dumps(root, sort_keys=True), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(RuntimeError, "non-owner block"):
+                load_distributed_checkpoint_root(checkpoint)
+
     def test_future_manifest_version_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = _write_v3_checkpoint(directory)

@@ -119,6 +119,13 @@ class TieredCacheManager:
         self._io_events: List[Dict[str, object]] = []
         self._io_events_lock = threading.Lock()
 
+        # Optional listeners used by the single-card optimizer state tier.
+        # They are deliberately additive: the Gaussian cache remains usable
+        # when no optimizer is attached.
+        self._state_eviction_listeners = []
+        self._state_flush_complete_listeners = []
+        self._state_admission_listeners = []
+
         # Statistics
         self.stats = {
             'cache_hits': 0,
@@ -163,10 +170,46 @@ class TieredCacheManager:
             'inflight_fallback_blocks': 0,
         }
 
-        # Start async worker threads
+        # Start async worker threads before any cache operation or listener
+        # notification.  State listeners are optional and must not control
+        # the lifetime of the Gaussian cache workers.
         self._start_sync_thread()
         self._start_flush_thread()
         self._start_future_prefetch_thread()
+
+    def register_state_eviction_listener(self, callback) -> None:
+        """Notify a listener when a clean Gaussian block leaves RAM."""
+        if not callable(callback):
+            raise TypeError("state eviction listener must be callable")
+        with self.cache_lock:
+            if callback not in self._state_eviction_listeners:
+                self._state_eviction_listeners.append(callback)
+
+    def register_state_flush_complete_listener(self, callback) -> None:
+        """Notify a listener after a dirty Gaussian eviction leaves flushing."""
+        if not callable(callback):
+            raise TypeError("state flush-complete listener must be callable")
+        with self.cache_lock:
+            if callback not in self._state_flush_complete_listeners:
+                self._state_flush_complete_listeners.append(callback)
+
+    def register_state_admission_listener(self, callback) -> None:
+        """Notify a listener when a Gaussian block is present in RAM."""
+        if not callable(callback):
+            raise TypeError("state admission listener must be callable")
+        with self.cache_lock:
+            if callback not in self._state_admission_listeners:
+                self._state_admission_listeners.append(callback)
+
+    def _notify_state_listeners(self, listeners, block_id: int, version: int = 0) -> None:
+        for callback in tuple(listeners):
+            try:
+                callback(int(block_id), int(version))
+            except Exception as error:
+                print(
+                    f"[TieredCache] WARNING: state listener failed for block "
+                    f"{int(block_id)}: {error}"
+                )
 
     def set_foreground_iteration(self, iteration: Optional[int]) -> None:
         self._foreground_iteration = (
@@ -328,6 +371,11 @@ class TieredCacheManager:
         self.cache_data.move_to_end(block_id)
         self._cache_entry_bytes[block_id] = block_bytes
         self._resident_ram_bytes += block_bytes
+        self._notify_state_listeners(
+            self._state_admission_listeners,
+            block_id,
+            int(self.block_versions.get(block_id, 0)),
+        )
 
     def _pop_lru_cache_block_locked(self) -> Tuple[int, torch.Tensor]:
         block_id, tensor = self.cache_data.popitem(last=False)
@@ -658,6 +706,7 @@ class TieredCacheManager:
                 )
             elapsed = time.time() - t0
 
+            completed_state_notifications = []
             with self.flushing_lock:
                 for block_id in dirty_blocks.keys():
                     flushed_version = block_versions.get(block_id)
@@ -667,6 +716,9 @@ class TieredCacheManager:
                     _, _, buffered_version = current_entry
                     if flushed_version is None or buffered_version <= flushed_version:
                         self.flushing_buffer.pop(block_id, None)
+                        completed_state_notifications.append(
+                            (int(block_id), int(buffered_version))
+                        )
 
             with self.cache_lock:
                 for block_id in dirty_blocks.keys():
@@ -678,6 +730,21 @@ class TieredCacheManager:
                     if self.block_versions.get(block_id, 0) == flushed_version:
                         self.dirty_set.discard(block_id)
                         self.block_origin_iterations.pop(block_id, None)
+
+            # A block can be re-promoted to RAM while its SSD write is in
+            # flight.  Notify the optimizer only when it is absent from both
+            # cache_data and flushing_buffer after the write completes.
+            with self.cache_lock:
+                still_cached = set(self.cache_data)
+            with self.flushing_lock:
+                still_flushing = set(self.flushing_buffer)
+            for block_id, version in completed_state_notifications:
+                if block_id not in still_cached and block_id not in still_flushing:
+                    self._notify_state_listeners(
+                        self._state_flush_complete_listeners,
+                        block_id,
+                        version,
+                    )
 
             self.stats['flushes'] += 1
             if mode == 'async':
@@ -1418,6 +1485,7 @@ class TieredCacheManager:
             num_blocks = max(1, int(len(self.cache_data) * 0.2))
 
         victims = []
+        clean_victims = []
         dirty_victims = {}
         dirty_versions = {}
         dirty_origins = {}
@@ -1465,6 +1533,17 @@ class TieredCacheManager:
                                 time.time(),
                                 version,
                             )
+                else:
+                    clean_victims.append(
+                        (int(block_id), int(self.block_versions.get(block_id, 0)))
+                    )
+
+        for block_id, version in clean_victims:
+            self._notify_state_listeners(
+                self._state_eviction_listeners,
+                block_id,
+                version,
+            )
 
         # Flush dirty blocks to SSD on the background writeback worker.
         if dirty_victims:

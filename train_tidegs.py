@@ -756,6 +756,10 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 
     distributed_context = get_distributed_context(args)
     distributed_enabled = distributed_context.enabled
+    # The resident optimizer is created lazily from the shared TideGS engine.
+    # Keep the distributed context on ``args`` so runtime initialization can
+    # select a rank-local SSD state directory before the first admission.
+    args._tide_distributed_context = distributed_context
 
     # ============================================================================
     # STAGE 1: INITIALIZATION
@@ -1110,10 +1114,19 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 if _optimizer_algorithm(args) == "3dgs2_tr"
                 else "Adam"
             )
-            msg = (
-                f"[PURE SSD RESUME] GPUResident{optimizer_label} cold-started; "
-                "optimizer EMA state is not restored"
-            )
+            state_mode = str(
+                getattr(args, "paper_optimizer_state_mode", "resident_blocks")
+            ).lower()
+            if state_mode == "resident_ssd_cache":
+                msg = (
+                    f"[PURE SSD RESUME] GPUResident{optimizer_label} will restore "
+                    "rank-local Adam EMA state from the SSD state manifest"
+                )
+            else:
+                msg = (
+                    f"[PURE SSD RESUME] GPUResident{optimizer_label} cold-started; "
+                    "optimizer EMA state is not restored"
+                )
             utils.print_rank_0(msg)
             log_file.write(msg + "\n")
 
@@ -1177,6 +1190,11 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         'last_persistent_state_hits_total': 0,
         'last_persistent_state_misses_total': 0,
         'last_persistent_state_saves_total': 0,
+        'last_persistent_state_cpu_hits_total': 0,
+        'last_persistent_state_ssd_hits_total': 0,
+        'last_persistent_state_ssd_writebacks_total': 0,
+        'last_persistent_state_index_writes_total': 0,
+        'last_owner_violations_total': 0,
     }
 
     def _snapshot_optimizer_churn_counters():
@@ -1199,6 +1217,12 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             'persistent_state_hits_total': int(stats.get('persistent_state_hits', 0)),
             'persistent_state_misses_total': int(stats.get('persistent_state_misses', 0)),
             'persistent_state_saves_total': int(stats.get('persistent_state_saves', 0)),
+            'persistent_state_cpu_hits_total': int(stats.get('persistent_state_cpu_hits', 0)),
+            'persistent_state_ssd_hits_total': int(stats.get('persistent_state_ssd_hits', 0)),
+            'persistent_state_ssd_writebacks_total': int(stats.get('persistent_state_ssd_writebacks', 0)),
+            'persistent_state_index_writes_total': int(stats.get('persistent_state_index_writes', 0)),
+            'owner_violations_total': int(stats.get('owner_violations', 0)),
+            'persistent_state_blocks': int(stats.get('persistent_state_blocks', 0)),
             'persistent_state_bytes': int(stats.get('persistent_state_bytes', 0)),
         }
 
@@ -1216,13 +1240,20 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         epoch_state_hits = max(0, stats['persistent_state_hits_total'] - optimizer_churn_state['last_persistent_state_hits_total'])
         epoch_state_misses = max(0, stats['persistent_state_misses_total'] - optimizer_churn_state['last_persistent_state_misses_total'])
         epoch_state_saves = max(0, stats['persistent_state_saves_total'] - optimizer_churn_state['last_persistent_state_saves_total'])
+        epoch_cpu_hits = max(0, stats['persistent_state_cpu_hits_total'] - optimizer_churn_state['last_persistent_state_cpu_hits_total'])
+        epoch_ssd_hits = max(0, stats['persistent_state_ssd_hits_total'] - optimizer_churn_state['last_persistent_state_ssd_hits_total'])
+        epoch_writebacks = max(0, stats['persistent_state_ssd_writebacks_total'] - optimizer_churn_state['last_persistent_state_ssd_writebacks_total'])
+        epoch_index_writes = max(0, stats['persistent_state_index_writes_total'] - optimizer_churn_state['last_persistent_state_index_writes_total'])
+        epoch_owner_violations = max(0, stats['owner_violations_total'] - optimizer_churn_state['last_owner_violations_total'])
         epoch_cold_ratio_pct = 100.0 * epoch_cold_rows / max(1, epoch_optimizer_rows)
 
         optimizer_churn_tsv.write(
             f"{epoch_zero_based + 1}\t{iteration_end}\t{epoch_optimizer_rows}\t{epoch_cold_rows}\t"
             f"{epoch_cold_ratio_pct:.6f}\t{epoch_cold_restarts}\t{epoch_state_evictions}\t"
             f"{stats['mean_resident_streak']:.6f}\t{epoch_state_hits}\t{epoch_state_misses}\t"
-            f"{epoch_state_saves}\t{stats['persistent_state_bytes']}\n"
+            f"{epoch_state_saves}\t{epoch_cpu_hits}\t{epoch_ssd_hits}\t{epoch_writebacks}\t"
+            f"{epoch_index_writes}\t{epoch_owner_violations}\t{stats['persistent_state_blocks']}\t"
+            f"{stats['persistent_state_bytes']}\n"
         )
         log_file.write(
             f"[OPTIMIZER CHURN] Epoch {epoch_zero_based + 1}: rows={epoch_optimizer_rows}, "
@@ -1240,6 +1271,11 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         optimizer_churn_state['last_persistent_state_hits_total'] = stats['persistent_state_hits_total']
         optimizer_churn_state['last_persistent_state_misses_total'] = stats['persistent_state_misses_total']
         optimizer_churn_state['last_persistent_state_saves_total'] = stats['persistent_state_saves_total']
+        optimizer_churn_state['last_persistent_state_cpu_hits_total'] = stats['persistent_state_cpu_hits_total']
+        optimizer_churn_state['last_persistent_state_ssd_hits_total'] = stats['persistent_state_ssd_hits_total']
+        optimizer_churn_state['last_persistent_state_ssd_writebacks_total'] = stats['persistent_state_ssd_writebacks_total']
+        optimizer_churn_state['last_persistent_state_index_writes_total'] = stats['persistent_state_index_writes_total']
+        optimizer_churn_state['last_owner_violations_total'] = stats['owner_violations_total']
 
     def _enable_optimizer_churn_logging(reason: str):
         nonlocal optimizer_churn_tsv
@@ -1251,7 +1287,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             'epoch\titeration_end\toptimizer_rows_updated\tcold_restarted_rows_updated\t'
             'cold_restarted_row_ratio_pct\tcold_restarts\tstate_evictions\tmean_resident_streak\t'
             'persistent_state_hits\tpersistent_state_misses\tpersistent_state_saves\t'
-            'persistent_state_bytes\n'
+            'persistent_state_cpu_hits\tpersistent_state_ssd_hits\tssd_writebacks\t'
+            'index_writes\towner_violations\tpersistent_state_blocks\tpersistent_state_bytes\n'
         )
         log_file.write(f"[OPTIMIZER CHURN] Per-epoch churn logging enabled: {churn_tsv_path} ({reason})\n")
         log_file.flush()
@@ -2096,6 +2133,15 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             operation=lambda: storage_adapter.shutdown(
                 compact_storage=False
             ),
+        )
+        _run_synchronized_training_phase(
+            distributed_context,
+            phase="optimizer state shutdown",
+            operation=lambda: getattr(
+                getattr(gaussians, "_paper_gpu_resident_optimizer", None),
+                "close",
+                lambda: None,
+            )(),
         )
         if args.tide_detailed_metrics:
             def finalize_distributed_metrics():

@@ -195,6 +195,35 @@ class CheckpointOptimizerValidationTest(unittest.TestCase):
                 world_size=2,
             )
 
+    def test_v3_accepts_rank_local_ssd_optimizer_state(self):
+        args = _args(
+            paper_optimizer_algorithm="adam",
+            paper_optimizer_state_mode="resident_ssd_cache",
+        )
+        root = _v3_root(
+            args,
+            optimizer_state_mode="resident_ssd_cache_per_rank",
+            optimizer_ema_saved=True,
+            optimizer_curvature_saved=False,
+            optimizer_state_format_version=2,
+        )
+        validate_distributed_checkpoint_resume(args, root, world_size=2)
+
+    def test_v3_rank_local_ssd_state_requires_matching_requested_mode(self):
+        root = _v3_root(
+            _args(paper_optimizer_algorithm="adam"),
+            optimizer_state_mode="resident_ssd_cache_per_rank",
+            optimizer_ema_saved=True,
+            optimizer_curvature_saved=False,
+            optimizer_state_format_version=2,
+        )
+        with self.assertRaisesRegex(ValueError, "requested mode differs"):
+            validate_distributed_checkpoint_resume(
+                _args(paper_optimizer_algorithm="adam"),
+                root,
+                world_size=2,
+            )
+
     def test_legacy_single_rank_without_algorithm_rejects_3dgs2_tr(self):
         with self.assertRaisesRegex(ValueError, "predates 3DGS2-TR"):
             validate_pure_ssd_checkpoint_optimizer(_args(), {"args": {}})

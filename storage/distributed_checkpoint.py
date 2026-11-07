@@ -273,16 +273,31 @@ def load_distributed_checkpoint_root(
                 "Distributed checkpoint global_optimizer_step mismatch: "
                 f"checkpoint={global_optimizer_step} expected={expected_optimizer_step}"
             )
-        if str(root["optimizer_state_mode"]) != "cold_start_per_rank":
+        optimizer_state_mode = str(root["optimizer_state_mode"])
+        if optimizer_state_mode == "cold_start_per_rank":
+            if bool(root["optimizer_ema_saved"]) or bool(
+                root["optimizer_curvature_saved"]
+            ):
+                raise RuntimeError(
+                    "Distributed checkpoint v3 cold_start_per_rank must not claim persisted optimizer state"
+                )
+        elif optimizer_state_mode == "resident_ssd_cache_per_rank":
+            if not bool(root["optimizer_ema_saved"]):
+                raise RuntimeError(
+                    "Distributed checkpoint v3 resident_ssd_cache_per_rank must save optimizer EMA state"
+                )
+            if bool(root["optimizer_curvature_saved"]):
+                raise RuntimeError(
+                    "Distributed checkpoint v3 resident_ssd_cache_per_rank cannot claim curvature EMA state"
+                )
+            if int(root.get("optimizer_state_format_version", -1)) != 2:
+                raise RuntimeError(
+                    "Distributed checkpoint v3 resident_ssd_cache_per_rank requires optimizer_state_format_version=2"
+                )
+        else:
             raise RuntimeError(
                 "Distributed checkpoint v3 optimizer_state_mode must be "
-                "'cold_start_per_rank'"
-            )
-        if bool(root["optimizer_ema_saved"]) or bool(
-            root["optimizer_curvature_saved"]
-        ):
-            raise RuntimeError(
-                "Distributed checkpoint v3 must not claim persisted optimizer EMA state"
+                "'cold_start_per_rank' or 'resident_ssd_cache_per_rank'"
             )
         rank_hashes = list(root["rank_manifest_sha256"])
         if len(rank_hashes) != world_size:
@@ -391,6 +406,115 @@ def load_distributed_checkpoint_root(
                 raise RuntimeError(
                     f"Distributed checkpoint rank {rank} must be incremental"
                 )
+            rank_state_mode = str(rank_manifest.get("optimizer_state_mode", "cold_start"))
+            if optimizer_state_mode == "cold_start_per_rank" and rank_state_mode == "resident_ssd_cache":
+                raise RuntimeError(
+                    f"Distributed checkpoint rank {rank} has resident_ssd_cache state "
+                    "but the root manifest declares cold_start_per_rank"
+                )
+            if optimizer_state_mode == "resident_ssd_cache_per_rank":
+                if rank_state_mode != "resident_ssd_cache":
+                    raise RuntimeError(
+                        f"Distributed checkpoint rank {rank} must contain resident_ssd_cache state"
+                    )
+                if not bool(rank_manifest.get("optimizer_state_saved", False)):
+                    raise RuntimeError(
+                        f"Distributed checkpoint rank {rank} did not save optimizer state"
+                    )
+                if not bool(rank_manifest.get("adam_moments_saved", False)):
+                    raise RuntimeError(
+                        f"Distributed checkpoint rank {rank} did not save Adam moments"
+                    )
+                state_manifest_value = rank_manifest.get("optimizer_state_manifest")
+                if not state_manifest_value:
+                    raise RuntimeError(
+                        f"Distributed checkpoint rank {rank} is missing optimizer_state_manifest"
+                    )
+                state_manifest_path = Path(str(state_manifest_value))
+                if not state_manifest_path.is_absolute():
+                    state_manifest_path = rank_dir / state_manifest_path
+                state_manifest_path = state_manifest_path.resolve()
+                try:
+                    state_manifest_path.relative_to(rank_dir.resolve())
+                except ValueError as error:
+                    raise RuntimeError(
+                        f"Distributed checkpoint rank {rank} optimizer state manifest "
+                        "escapes the rank checkpoint directory"
+                    ) from error
+                if not state_manifest_path.is_file():
+                    raise RuntimeError(
+                        f"Distributed checkpoint rank {rank} optimizer state manifest not found: "
+                        f"{state_manifest_path}"
+                    )
+                with open(state_manifest_path, "r", encoding="utf-8") as handle:
+                    state_payload = json.load(handle)
+                if str(state_payload.get("optimizer_state_mode")) != "resident_ssd_cache":
+                    raise RuntimeError(
+                        f"Distributed checkpoint rank {rank} optimizer state manifest "
+                        "has an unexpected optimizer_state_mode"
+                    )
+                if not bool(state_payload.get("optimizer_state_saved", False)) or not bool(
+                    state_payload.get("adam_moments_saved", False)
+                ):
+                    raise RuntimeError(
+                        f"Distributed checkpoint rank {rank} optimizer state manifest "
+                        "does not claim saved Adam moments"
+                    )
+                if int(state_payload.get("optimizer_state_format_version", -1)) != 2:
+                    raise RuntimeError(
+                        f"Distributed checkpoint rank {rank} optimizer state manifest "
+                        "requires optimizer_state_format_version=2"
+                    )
+                state_index_path = Path(str(state_payload["index"]))
+                if not state_index_path.is_absolute():
+                    state_index_path = state_manifest_path.parent / state_index_path
+                state_index_path = state_index_path.resolve()
+                try:
+                    state_index_path.relative_to(state_manifest_path.parent.resolve())
+                except ValueError as error:
+                    raise RuntimeError(
+                        f"Distributed checkpoint rank {rank} optimizer state index "
+                        "escapes the state directory"
+                    ) from error
+                if not state_index_path.is_file():
+                    raise RuntimeError(
+                        f"Distributed checkpoint rank {rank} optimizer state index not found: "
+                        f"{state_index_path}"
+                    )
+                with open(state_index_path, "r", encoding="utf-8") as handle:
+                    state_index = json.load(handle)
+                if int(state_index.get("state_format_version", -1)) != 2:
+                    raise RuntimeError(
+                        f"Distributed checkpoint rank {rank} optimizer state index "
+                        "requires state_format_version=2"
+                    )
+                for raw_block_id in dict(state_index.get("blocks", {})):
+                    block_id = int(raw_block_id)
+                    if block_id < 0 or block_id >= num_blocks:
+                        raise RuntimeError(
+                            f"Distributed checkpoint rank {rank} optimizer state has out-of-range block {block_id}"
+                        )
+                    if int(block_owner[block_id]) != int(rank):
+                        raise RuntimeError(
+                            f"Distributed checkpoint rank {rank} optimizer state contains non-owner block {block_id}"
+                        )
+                    metadata = dict(state_index["blocks"][raw_block_id])
+                    state_file = Path(str(metadata.get("path", "")))
+                    if not state_file.is_absolute():
+                        state_file = state_index_path.parent / state_file
+                    state_file = state_file.resolve()
+                    try:
+                        state_file.relative_to(state_index_path.parent.resolve())
+                    except ValueError as error:
+                        raise RuntimeError(
+                            f"Distributed checkpoint rank {rank} optimizer state block "
+                            f"{block_id} escapes the state directory"
+                        ) from error
+                    _verify_sha256(
+                        state_file,
+                        metadata.get("sha256", ""),
+                        label=f"rank {rank} optimizer state block {block_id}",
+                    )
             for field, expected in root_metadata.items():
                 actual = int(rank_manifest[field])
                 if actual != expected:
@@ -554,6 +678,18 @@ def write_distributed_incremental_checkpoint(
             "manifest_sha256": _sha256_file(rank_dir / CHECKPOINT_MANIFEST),
             "patch_files": int(rank_manifest.get("patch_files", 0)),
             "patch_bytes": int(rank_manifest.get("patch_bytes", 0)),
+            "optimizer_state_mode": str(
+                rank_manifest.get("optimizer_state_mode", "cold_start")
+            ),
+            "optimizer_state_saved": bool(
+                rank_manifest.get("optimizer_state_saved", False)
+            ),
+            "adam_moments_saved": bool(
+                rank_manifest.get("adam_moments_saved", False)
+            ),
+            "optimizer_state_format_version": int(
+                rank_manifest.get("optimizer_state_format_version", 0)
+            ),
         }
     except Exception as error:
         rank_result = {
@@ -618,6 +754,28 @@ def write_distributed_incremental_checkpoint(
                 raise RuntimeError(
                     "Distributed checkpoint rank results are incomplete or duplicated"
                 )
+            requested_state_mode = str(
+                getattr(args, "paper_optimizer_state_mode", "resident_blocks")
+            ).lower()
+            if requested_state_mode == "resident_ssd_cache":
+                if any(
+                    value["optimizer_state_mode"] != "resident_ssd_cache"
+                    or not value["optimizer_state_saved"]
+                    or not value["adam_moments_saved"]
+                    or value["optimizer_state_format_version"] != 2
+                    for value in ordered
+                ):
+                    raise RuntimeError(
+                        "Distributed resident_ssd_cache checkpoint requires every rank "
+                        "to save optimizer_state_format_version=2 Adam state"
+                    )
+                root_optimizer_state_mode = "resident_ssd_cache_per_rank"
+                root_optimizer_ema_saved = True
+                root_optimizer_curvature_saved = False
+            else:
+                root_optimizer_state_mode = "cold_start_per_rank"
+                root_optimizer_ema_saved = False
+                root_optimizer_curvature_saved = False
             root_manifest = {
                 "checkpoint_version": DISTRIBUTED_CHECKPOINT_VERSION,
                 "checkpoint_type": "pure_ssd_distributed_incremental",
@@ -646,9 +804,10 @@ def write_distributed_incremental_checkpoint(
                 "rank_patch_bytes": [value["patch_bytes"] for value in ordered],
                 "optimizer_provenance": build_optimizer_provenance(args),
                 "global_optimizer_step": global_optimizer_step,
-                "optimizer_state_mode": "cold_start_per_rank",
-                "optimizer_ema_saved": False,
-                "optimizer_curvature_saved": False,
+                "optimizer_state_mode": root_optimizer_state_mode,
+                "optimizer_ema_saved": root_optimizer_ema_saved,
+                "optimizer_curvature_saved": root_optimizer_curvature_saved,
+                "optimizer_state_format_version": 2,
                 "planner_state": normalized_planner_state,
                 "total_points": int(storage_adapter.num_points),
                 "num_blocks": int(storage_adapter.num_blocks),
@@ -659,6 +818,10 @@ def write_distributed_incremental_checkpoint(
                 root_manifest,
                 checkpoint_dir / DISTRIBUTED_CHECKPOINT_MANIFEST,
             )
+            # Re-open the just-written tree before allowing the other ranks to
+            # continue.  This validates rank-local optimizer ownership and
+            # checksums while failures can still be reported collectively.
+            load_distributed_checkpoint_root(checkpoint_dir, verify_integrity=True)
         except Exception as error:
             root_error = {
                 "error_type": type(error).__name__,

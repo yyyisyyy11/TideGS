@@ -13,7 +13,7 @@ import os
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
@@ -186,6 +186,60 @@ def _flush_gpu_resident_dirty(storage_adapter) -> None:
         flush_resident()
 
 
+def _export_optimizer_state(gaussians, checkpoint_dir: Path, log_file=None):
+    optimizer = getattr(gaussians, "_paper_gpu_resident_optimizer", None)
+    export = getattr(optimizer, "export_persistent_state", None)
+    if not callable(export):
+        return None
+    manifest = export(str(checkpoint_dir))
+    if manifest is not None:
+        _log(
+            f"[PURE SSD CHECKPOINT] Optimizer state complete: "
+            f"blocks={manifest.get('state_block_count', 0)} "
+            f"manifest={manifest.get('manifest', '')}",
+            log_file,
+        )
+    return manifest
+
+
+def _optimizer_state_checkpoint_fields(
+    optimizer_state_manifest: Optional[Dict[str, Any]],
+    checkpoint_dir: Path,
+) -> Dict[str, Any]:
+    if not optimizer_state_manifest:
+        return {
+            "optimizer_state_mode": "cold_start",
+            "optimizer_state_saved": False,
+            "adam_moments_saved": False,
+        }
+    fields = {
+        "optimizer_state_mode": str(
+            optimizer_state_manifest.get("optimizer_state_mode", "resident_ssd_cache")
+        ),
+        "optimizer_state_saved": bool(
+            optimizer_state_manifest.get("optimizer_state_saved", True)
+        ),
+        "adam_moments_saved": bool(
+            optimizer_state_manifest.get("adam_moments_saved", True)
+        ),
+        "optimizer_state_format_version": int(
+            optimizer_state_manifest.get("optimizer_state_format_version", 2)
+        ),
+    }
+    manifest_path = optimizer_state_manifest.get(
+        "optimizer_state_manifest",
+        optimizer_state_manifest.get("manifest"),
+    )
+    if manifest_path:
+        path = Path(str(manifest_path))
+        try:
+            path = path.relative_to(checkpoint_dir)
+        except ValueError:
+            pass
+        fields["optimizer_state_manifest"] = str(path)
+    return fields
+
+
 def _manifest_base(storage_adapter, gaussians) -> Dict[str, Any]:
     manifest = dict(getattr(storage_adapter, "streaming_init_manifest", None) or {})
     manifest.setdefault("source_ply", getattr(gaussians, "_streaming_init_ply_path", ""))
@@ -222,46 +276,6 @@ def _optimizer_manifest_args(args) -> Dict[str, Any]:
     return {name: getattr(args, name, None) for name in names}
 
 
-def _optimizer_state_checkpoint_fields(
-    optimizer_state_manifest: Dict[str, Any] | None,
-    checkpoint_dir: Path,
-) -> Dict[str, Any]:
-    """Normalize optional persisted optimizer metadata for the main manifest."""
-
-    if not optimizer_state_manifest:
-        return {
-            "optimizer_state_mode": "cold_start",
-            "optimizer_state_saved": False,
-            "adam_moments_saved": False,
-        }
-    fields = {
-        "optimizer_state_mode": str(
-            optimizer_state_manifest.get("optimizer_state_mode", "resident_ssd_cache")
-        ),
-        "optimizer_state_saved": bool(
-            optimizer_state_manifest.get("optimizer_state_saved", True)
-        ),
-        "adam_moments_saved": bool(
-            optimizer_state_manifest.get("adam_moments_saved", True)
-        ),
-        "optimizer_state_format_version": int(
-            optimizer_state_manifest.get("optimizer_state_format_version", 1)
-        ),
-    }
-    manifest_path = optimizer_state_manifest.get(
-        "optimizer_state_manifest",
-        optimizer_state_manifest.get("manifest"),
-    )
-    if manifest_path:
-        path = Path(str(manifest_path))
-        try:
-            path = path.relative_to(checkpoint_dir)
-        except ValueError:
-            pass
-        fields["optimizer_state_manifest"] = str(path)
-    return fields
-
-
 def write_pure_ssd_snapshot_checkpoint(
     *,
     storage_adapter,
@@ -271,7 +285,7 @@ def write_pure_ssd_snapshot_checkpoint(
     next_iteration: int,
     args,
     chunk_blocks: int = 256,
-    optimizer_state_manifest: Dict[str, Any] | None = None,
+    optimizer_state_manifest: Optional[Dict[str, Any]] = None,
     log_file=None,
 ) -> Dict[str, Any]:
     """Write a block-wise pure SSD snapshot checkpoint.
@@ -311,6 +325,10 @@ def write_pure_ssd_snapshot_checkpoint(
     )
     _flush_gpu_resident_dirty(storage_adapter)
     _wait_for_pending_writeback(getattr(storage_adapter, "cache", None), log_file=log_file)
+    if optimizer_state_manifest is None:
+        optimizer_state_manifest = _export_optimizer_state(
+            gaussians, checkpoint_dir, log_file=log_file
+        )
 
     _log(
         f"[PURE SSD CHECKPOINT] Writing SSD snapshot: blocks={num_blocks:,} "
@@ -418,7 +436,7 @@ def write_pure_ssd_incremental_checkpoint(
     iteration: int,
     next_iteration: int,
     args,
-    optimizer_state_manifest: Dict[str, Any] | None = None,
+    optimizer_state_manifest: Optional[Dict[str, Any]] = None,
     log_file=None,
 ) -> Dict[str, Any]:
     """Write an incremental pure SSD checkpoint.
@@ -457,6 +475,10 @@ def write_pure_ssd_incremental_checkpoint(
     )
     _flush_gpu_resident_dirty(storage_adapter)
     _wait_for_pending_writeback(getattr(storage_adapter, "cache", None), log_file=log_file)
+    if optimizer_state_manifest is None:
+        optimizer_state_manifest = _export_optimizer_state(
+            gaussians, checkpoint_dir, log_file=log_file
+        )
     checkpoint_compaction_rounds = 0
     compacted_before_checkpoint = False
 

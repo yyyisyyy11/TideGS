@@ -338,18 +338,37 @@ def validate_distributed_checkpoint_resume(
             strict=True,
             context="Distributed checkpoint",
         )
-        if str(root.get("optimizer_state_mode")) != "cold_start_per_rank":
+        state_mode = str(root.get("optimizer_state_mode"))
+        if state_mode == "cold_start_per_rank":
+            if bool(root.get("optimizer_ema_saved", True)):
+                raise ValueError(
+                    "Distributed checkpoint v3 unexpectedly claims persisted optimizer EMA state"
+                )
+            if bool(root.get("optimizer_curvature_saved", True)):
+                raise ValueError(
+                    "Distributed checkpoint v3 unexpectedly claims persisted curvature EMA state"
+                )
+        elif state_mode == "resident_ssd_cache_per_rank":
+            if not bool(root.get("optimizer_ema_saved", False)):
+                raise ValueError(
+                    "Distributed checkpoint v3 resident_ssd_cache_per_rank must save optimizer EMA state"
+                )
+            if bool(root.get("optimizer_curvature_saved", True)):
+                raise ValueError(
+                    "Distributed checkpoint v3 resident_ssd_cache_per_rank cannot claim curvature EMA state"
+                )
+            if int(root.get("optimizer_state_format_version", -1)) != 2:
+                raise ValueError(
+                    "Distributed checkpoint v3 resident_ssd_cache_per_rank requires optimizer_state_format_version=2"
+                )
+            if str(_canonical_value(args, "paper_optimizer_state_mode", use_default=True)) != "resident_ssd_cache":
+                raise ValueError(
+                    "Distributed checkpoint contains resident_ssd_cache state but requested mode differs"
+                )
+        else:
             raise ValueError(
                 "Distributed checkpoint v3 optimizer_state_mode must be "
-                "'cold_start_per_rank'"
-            )
-        if bool(root.get("optimizer_ema_saved", True)):
-            raise ValueError(
-                "Distributed checkpoint v3 unexpectedly claims persisted optimizer EMA state"
-            )
-        if bool(root.get("optimizer_curvature_saved", True)):
-            raise ValueError(
-                "Distributed checkpoint v3 unexpectedly claims persisted curvature EMA state"
+                "'cold_start_per_rank' or 'resident_ssd_cache_per_rank'"
             )
         global_optimizer_step = int(root.get("global_optimizer_step", -1))
         if global_optimizer_step < 0:

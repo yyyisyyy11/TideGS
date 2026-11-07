@@ -54,6 +54,10 @@ def get_gpu_resident_optimizer(gaussians, batch_size):
         )
     )
     current_optimizer = getattr(gaussians, '_paper_gpu_resident_optimizer', None)
+    # Reuse the existing object in the rebinding path below.  Without this
+    # alias, the resident_ssd_cache branch references the local constructor
+    # variable before it is assigned whenever no recreation is needed.
+    resident_optimizer = current_optimizer
     if current_optimizer is not None:
         current_state_mode = str(
             getattr(current_optimizer, "state_mode", "resident_blocks")
@@ -96,14 +100,45 @@ def get_gpu_resident_optimizer(gaussians, batch_size):
                 ),
                 allow_cold_start=True,
             )
+            block_reader = getattr(gaussians, "_block_reader", None)
+            cache_manager = getattr(block_reader, "_cache", None)
+            if cache_manager is not None:
+                resident_optimizer.bind_gaussian_cache(cache_manager)
+        distributed_context = getattr(getattr(gaussians, "args", None), "_tide_distributed_context", None)
+        owner = getattr(getattr(gaussians, "args", None), "_tide_block_owner", None)
+        if (
+            state_mode == "resident_ssd_cache"
+            and distributed_context is not None
+            and getattr(distributed_context, "enabled", False)
+            and owner is not None
+        ):
+            resident_optimizer.bind_block_owner(owner, distributed_context.rank)
         gaussians._paper_gpu_resident_optimizer = resident_optimizer
+    elif state_mode == "resident_ssd_cache":
+        # The block reader can be constructed after the optimizer object on a
+        # resume path.  Bind once it becomes available rather than silently
+        # falling back to GPU-eviction-driven SSD writeback.
+        if getattr(resident_optimizer, "_gaussian_cache", None) is None:
+            block_reader = getattr(gaussians, "_block_reader", None)
+            cache_manager = getattr(block_reader, "_cache", None)
+            if cache_manager is not None:
+                resident_optimizer.bind_gaussian_cache(cache_manager)
+        distributed_context = getattr(getattr(gaussians, "args", None), "_tide_distributed_context", None)
+        owner = getattr(getattr(gaussians, "args", None), "_tide_block_owner", None)
+        if (
+            distributed_context is not None
+            and getattr(distributed_context, "enabled", False)
+            and owner is not None
+            and getattr(resident_optimizer, "_state_block_owner", None) is None
+        ):
+            resident_optimizer.bind_block_owner(owner, distributed_context.rank)
     return gaussians._paper_gpu_resident_optimizer
 
 
 def shutdown_gpu_resident_optimizer(gaussians=None):
     if gaussians is None:
         return
-    optimizer = getattr(gaussians, "_paper_gpu_resident_optimizer", None)
+    optimizer = getattr(gaussians, '_paper_gpu_resident_optimizer', None)
     if optimizer is not None and hasattr(optimizer, "close"):
         optimizer.close()
     if hasattr(gaussians, '_paper_gpu_resident_optimizer'):

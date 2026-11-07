@@ -114,7 +114,7 @@ Options:
   --max-patch-files N         Compact at this active patch count (default: ${MAX_PATCH_FILES})
   --max-patch-gb N            Compact at this stale patch size in GiB (default: ${MAX_PATCH_GB})
   --optimizer NAME            adam|3dgs2_tr (default: ${OPTIMIZER_ALGORITHM})
-  --optimizer-state-mode MODE resident_blocks|resident_cpu_cache|resident_ssd_cache (Adam only for cache modes)
+  --optimizer-state-mode MODE resident_blocks|resident_cpu_cache|resident_ssd_cache (Adam only for CPU/SSD cache modes)
   --sophia-beta1 VALUE        Gradient EMA beta (default: ${SOPHIA_BETA1})
   --sophia-beta2 VALUE        Curvature EMA beta (default: ${SOPHIA_BETA2})
   --curvature-interval N      Curvature update interval in optimizer steps (default: ${SOPHIA_CURVATURE_INTERVAL})
@@ -243,7 +243,7 @@ case "${OPTIMIZER_STATE_MODE}" in
   resident_blocks|resident_cpu_cache|resident_ssd_cache) ;;
   *) echo "Invalid --optimizer-state-mode '${OPTIMIZER_STATE_MODE}'" >&2; exit 1 ;;
 esac
-if [[ "${OPTIMIZER_STATE_MODE}" != "resident_blocks" && "${OPTIMIZER_ALGORITHM}" != "adam" ]]; then
+if [[ ( "${OPTIMIZER_STATE_MODE}" == "resident_cpu_cache" || "${OPTIMIZER_STATE_MODE}" == "resident_ssd_cache" ) && "${OPTIMIZER_ALGORITHM}" != "adam" ]]; then
   echo "--optimizer-state-mode ${OPTIMIZER_STATE_MODE} currently requires --optimizer adam" >&2
   exit 1
 fi
