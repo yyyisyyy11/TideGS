@@ -5,6 +5,7 @@ import csv
 import gc
 import hashlib
 import time
+import threading
 import psutil
 import numpy as np
 from collections import Counter
@@ -479,6 +480,280 @@ def _preview_distributed_plan(
     return plan, schedule_info, rank0_preview
 
 
+class _AsyncDistributedPlanHandle:
+    """Background N+1 plan receiver shared by all distributed ranks."""
+
+    def __init__(self, worker, *, snapshot_ms=0.0):
+        self._worker = worker
+        self._snapshot_ms = float(snapshot_ms)
+        self._thread = threading.Thread(
+            target=self._run,
+            name="tide-plan-receiver",
+            daemon=True,
+        )
+        self._result = None
+        self._error = None
+        self._thread.start()
+
+    def _run(self):
+        try:
+            self._result = self._worker()
+        except BaseException as error:  # delivered to the training thread by wait()
+            self._error = error
+
+    def wait(self):
+        ready_during_compute = not self._thread.is_alive()
+        self._thread.join()
+        if self._error is not None:
+            raise self._error
+        if self._result is None:
+            raise RuntimeError("Asynchronous distributed plan worker returned no result")
+        result = dict(self._result)
+        result.setdefault("plan_preview_snapshot_ms", self._snapshot_ms)
+        result["plan_ready_during_compute"] = int(ready_during_compute)
+        return result
+
+    def metrics_if_ready(self):
+        """Return timing fields without blocking the current training batch."""
+
+        if self._thread.is_alive():
+            return {}
+        self._thread.join()
+        if self._error is not None:
+            return {
+                "plan_preview_snapshot_ms": self._snapshot_ms,
+                "plan_ready_during_compute": 1,
+                "plan_error": 1,
+            }
+        result = dict(self._result or {})
+        result.setdefault("plan_preview_snapshot_ms", self._snapshot_ms)
+        result["plan_ready_during_compute"] = 1
+        return result
+
+
+def _start_async_distributed_plan(
+    *,
+    context,
+    planner,
+    storage_adapter,
+    block_reader,
+    current_resident_blocks,
+    training_schedule,
+    iteration,
+    batch_size,
+    schedule_ordering,
+    curvature_camera_ids=None,
+):
+    """Start rank-0 CPU planning and a Gloo plan receiver on every rank.
+
+    The cull is captured before the worker starts, so bounds generation and
+    camera visibility are a stable snapshot.  The worker then performs only
+    CPU planning, Gloo publication, and the RAM/SSD hint while the caller
+    loads and trains the current batch.
+    """
+
+    schedule_info = get_camera_batch_schedule(
+        training_schedule=training_schedule,
+        iteration=iteration,
+        batch_size=batch_size,
+        schedule_ordering=schedule_ordering,
+    )
+    snapshot = None
+    snapshot_error = None
+    snapshot_start = time.perf_counter()
+    if context.is_rank0:
+        try:
+            rank0_curvature_camera_ids = [
+                int(value) for value in (curvature_camera_ids or [])
+            ]
+            union_camera_ids = _union_camera_ids(
+                schedule_info.batch_indices,
+                rank0_curvature_camera_ids,
+            )
+            bounds_generation, union_camera_blocks = (
+                storage_adapter.get_visible_blocks_batch(union_camera_ids)
+            )
+            snapshot = {
+                "bounds_generation": int(bounds_generation),
+                "union_camera_blocks": _normalize_camera_blocks(
+                    union_camera_blocks
+                ),
+                "curvature_camera_ids": rank0_curvature_camera_ids,
+                "cull_metrics": dict(
+                    getattr(storage_adapter, "_batch_cull_metrics", {}) or {}
+                ),
+            }
+        except BaseException as error:
+            snapshot_error = error
+    snapshot_ms = (time.perf_counter() - snapshot_start) * 1000.0
+    if snapshot is not None:
+        snapshot["snapshot_ms"] = snapshot_ms
+
+    def worker():
+        plan_payload = None
+        planner_start = time.perf_counter()
+        if context.is_rank0:
+            if snapshot_error is not None:
+                plan_payload = {
+                    "iteration": int(iteration),
+                    "rank": int(context.rank),
+                    "ok": False,
+                    "error": f"{type(snapshot_error).__name__}: {snapshot_error}",
+                    "plan": None,
+                    "preview": None,
+                }
+            else:
+                try:
+                    rank0_curvature_camera_ids = snapshot["curvature_camera_ids"]
+                    camera_blocks = _split_camera_blocks(
+                        snapshot["union_camera_blocks"],
+                        schedule_info.batch_indices,
+                    )
+                    curvature_camera_blocks = (
+                        _split_camera_blocks(
+                            snapshot["union_camera_blocks"],
+                            rank0_curvature_camera_ids,
+                        )
+                        if rank0_curvature_camera_ids
+                        else None
+                    )
+                    with tide_range("tide.cpu.plan.preview.background"):
+                        plan, predicted_state = planner.preview(
+                            iteration=iteration,
+                            epoch=schedule_info.epoch,
+                            camera_ids=schedule_info.batch_indices,
+                            camera_blocks=camera_blocks,
+                            curvature_camera_ids=(
+                                rank0_curvature_camera_ids or None
+                            ),
+                            curvature_camera_blocks=curvature_camera_blocks,
+                        )
+                    plan_cpu_ms = (time.perf_counter() - planner_start) * 1000.0
+                    payload = plan.to_dict()
+                    payload["block_cull_ms"] = float(snapshot["snapshot_ms"])
+                    payload["plan_ms"] = float(plan_cpu_ms)
+                    payload.update(snapshot["cull_metrics"])
+                    plan_payload = {
+                        "iteration": int(iteration),
+                        "rank": int(context.rank),
+                        "ok": True,
+                        "error": None,
+                        "plan": payload,
+                        "preview": {
+                            "bounds_generation": snapshot["bounds_generation"],
+                            "union_camera_blocks": snapshot[
+                                "union_camera_blocks"
+                            ],
+                            "predicted_state": predicted_state,
+                        },
+                        "plan_cpu_background_ms": float(plan_cpu_ms),
+                    }
+                except BaseException as error:
+                    plan_payload = {
+                        "iteration": int(iteration),
+                        "rank": int(context.rank),
+                        "ok": False,
+                        "error": f"{type(error).__name__}: {error}",
+                        "plan": None,
+                        "preview": None,
+                        "plan_cpu_background_ms": (
+                            time.perf_counter() - planner_start
+                        )
+                        * 1000.0,
+                    }
+
+        publish_start = time.perf_counter()
+        broadcast_plan = getattr(context, "broadcast_plan_object", None)
+        if not callable(broadcast_plan):
+            raise RuntimeError("Distributed context has no Gloo plan publisher")
+        received = broadcast_plan(plan_payload)
+        publish_ms = (time.perf_counter() - publish_start) * 1000.0
+        if not isinstance(received, dict):
+            raise RuntimeError("Invalid asynchronous distributed plan payload")
+        if int(received.get("iteration", -1)) != int(iteration):
+            raise RuntimeError(
+                "Asynchronous distributed plan iteration mismatch: "
+                f"got={received.get('iteration')} expected={iteration}"
+            )
+        if int(received.get("rank", -1)) != 0:
+            raise RuntimeError(
+                "Asynchronous distributed plan was not published by rank 0"
+            )
+        if not bool(received.get("ok", False)):
+            raise RuntimeError(
+                "Distributed predictive plan failed: "
+                f"{received.get('error', 'unknown error')}"
+            )
+        local_error = None
+        plan = None
+        hint_start = time.perf_counter()
+        hinted = 0
+        try:
+            plan = DistributedBatchPlan.from_dict(received["plan"])
+            if int(plan.iteration) != int(iteration):
+                raise RuntimeError(
+                    "Asynchronous distributed plan object iteration mismatch: "
+                    f"got={plan.iteration} expected={iteration}"
+                )
+            if block_reader is not None:
+                predicted_resident = set(
+                    int(value)
+                    for value in plan.rank_resident_blocks[context.rank]
+                )
+                hinted = int(
+                    block_reader.hint_future(
+                        sorted(
+                            predicted_resident - set(current_resident_blocks)
+                        ),
+                        target_iteration=iteration,
+                    )
+                    or 0
+                )
+        except BaseException as error:
+            local_error = error
+        status_gather = getattr(context, "all_gather_plan_object", None)
+        if not callable(status_gather):
+            raise RuntimeError("Distributed context has no Gloo plan status gather")
+        statuses = status_gather(
+            {
+                "rank": int(context.rank),
+                "error": (
+                    None
+                    if local_error is None
+                    else f"{type(local_error).__name__}: {local_error}"
+                ),
+            }
+        )
+        failures = [
+            f"rank={status.get('rank', index)} {status['error']}"
+            for index, status in enumerate(statuses)
+            if status.get("error")
+        ]
+        if failures:
+            synchronized = RuntimeError(
+                "Distributed predictive plan receiver failed: "
+                + "; ".join(failures)
+            )
+            if local_error is not None:
+                raise synchronized from local_error
+            raise synchronized
+        hint_ms = (time.perf_counter() - hint_start) * 1000.0
+        return {
+            "plan": plan,
+            "schedule_info": schedule_info,
+            "rank0_preview": received.get("preview"),
+            "plan_preview_snapshot_ms": snapshot_ms,
+            "plan_cpu_background_ms": float(
+                received.get("plan_cpu_background_ms", 0.0)
+            ),
+            "plan_publish_ms": publish_ms,
+            "plan_hint_submit_ms": hint_ms,
+            "plan_hint_blocks": hinted,
+        }
+
+    return _AsyncDistributedPlanHandle(worker, snapshot_ms=snapshot_ms)
+
+
 def _finalize_distributed_plan(
     *,
     context,
@@ -792,6 +1067,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     metrics_enabled = bool(
         args.tide_detailed_metrics or getattr(args, "tide_light_timeline", False)
     )
+    async_distributed_plan = distributed_enabled and bool(
+        getattr(args, "tide_async_plan", False)
+    )
 
     # ============================================================================
     # STAGE 1: INITIALIZATION
@@ -813,6 +1091,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             distributed_context,
             enable_timing=metrics_enabled,
             enable_grad_zero_metrics=bool(args.tide_grad_zero_metrics),
+            enable_partial_grad_metrics=bool(
+                getattr(args, "tide_partial_grad_metrics", False)
+            ),
             tile_contribution_mode=str(args.tide_tile_contribution_mode),
             tile_alpha_threshold=float(args.tide_tile_alpha_threshold),
         )
@@ -1614,7 +1895,25 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 )
             next_distributed_prediction = None
             next_distributed_rank0_preview = None
-            if distributed_enabled and next_iteration <= opt_args.iterations:
+            next_distributed_plan_handle = None
+            if async_distributed_plan and next_iteration <= opt_args.iterations:
+                next_distributed_plan_handle = _start_async_distributed_plan(
+                    context=distributed_context,
+                    planner=distributed_planner,
+                    storage_adapter=storage_adapter,
+                    block_reader=getattr(gaussians, "_block_reader", None),
+                    current_resident_blocks=current_distributed_plan.rank_resident_blocks[
+                        distributed_context.rank
+                    ],
+                    training_schedule=ssd_training_schedule,
+                    iteration=next_iteration,
+                    batch_size=args.bsz,
+                    schedule_ordering=getattr(
+                        args, "ssd_schedule_ordering", "trajectory"
+                    ),
+                    curvature_camera_ids=next_curvature_camera_ids,
+                )
+            elif distributed_enabled and next_iteration <= opt_args.iterations:
                 preview_start_ns = time.perf_counter_ns()
                 with tide_range("tide.cpu.plan.preview.total"):
                     (
@@ -1691,6 +1990,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             timers.stop("send cam matrices to gpu")
             assert args.bsz > 1, "Pipelined offload requires batch size > 1"
             with tide_range("tide.batch.compute"):
+                gaussians._tide_async_plan_handle = next_distributed_plan_handle
                 losses, ordered_cams, sparsity = train_tide_batch(
                     gaussians=gaussians,
                     scene=scene,
@@ -1801,6 +2101,12 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             if distributed_enabled:
                 next_distributed_plan = None
                 if next_iteration <= opt_args.iterations:
+                    if next_distributed_plan_handle is not None:
+                        async_result = next_distributed_plan_handle.wait()
+                        next_distributed_prediction = async_result["plan"]
+                        next_distributed_rank0_preview = async_result[
+                            "rank0_preview"
+                        ]
                     if next_distributed_prediction is None:
                         raise RuntimeError(
                             f"Missing distributed prediction for iteration {next_iteration}"
@@ -1952,44 +2258,6 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                         phase="checkpoint writeback drain",
                         operation=storage_adapter.drain_cache_writebacks,
                     )
-                    optimizer_state_checkpoint = None
-                    if (
-                        not distributed_enabled
-                        and str(
-                            getattr(args, "paper_optimizer_state_mode", "")
-                        ).lower()
-                        == "resident_ssd_cache"
-                    ):
-                        resident_optimizer = getattr(
-                            gaussians,
-                            "_paper_gpu_resident_optimizer",
-                            None,
-                        )
-                        if resident_optimizer is None:
-                            raise RuntimeError(
-                                "resident_ssd_cache checkpoint requires an initialized optimizer"
-                            )
-                        exported_state = resident_optimizer.export_persistent_state(
-                            save_folder
-                        )
-                        if exported_state is None:
-                            raise RuntimeError(
-                                "resident_ssd_cache optimizer did not export state"
-                            )
-                        log_file.write(
-                            "[PURE SSD CHECKPOINT] Exported optimizer state: "
-                            f"blocks={int(exported_state.get('state_block_count', 0))} "
-                            f"manifest={exported_state['manifest']}\n"
-                        )
-                        optimizer_state_checkpoint = {
-                            "optimizer_state_mode": "resident_ssd_cache",
-                            "optimizer_state_saved": True,
-                            "adam_moments_saved": True,
-                            "optimizer_state_format_version": int(
-                                exported_state.get("state_format_version", 1)
-                            ),
-                            "optimizer_state_manifest": exported_state["manifest"],
-                        }
                     pure_ssd_checkpoint_mode = str(
                         getattr(args, "pure_ssd_checkpoint_mode", "incremental")
                     ).lower()
@@ -2016,7 +2284,6 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                             next_iteration=iteration + args.bsz,
                             args=args,
                             chunk_blocks=getattr(args, "pure_ssd_checkpoint_chunk_blocks", 256),
-                            optimizer_state_manifest=optimizer_state_checkpoint,
                             log_file=log_file,
                         )
                     else:
@@ -2027,7 +2294,6 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                             iteration=checkpoint_iteration,
                             next_iteration=iteration + args.bsz,
                             args=args,
-                            optimizer_state_manifest=optimizer_state_checkpoint,
                             log_file=log_file,
                         )
                     prune_operation = None
@@ -2220,20 +2486,6 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             operation=shutdown_double_buffer_gpu,
         )
         distributed_context.barrier()
-
-    if (
-        not distributed_enabled
-        and str(getattr(args, "paper_optimizer_state_mode", "")).lower()
-        == "resident_ssd_cache"
-    ):
-        resident_optimizer = getattr(
-            gaussians,
-            "_paper_gpu_resident_optimizer",
-            None,
-        )
-        if resident_optimizer is not None:
-            resident_optimizer.flush_persistent_state()
-            resident_optimizer.close()
 
     scene.clean_up()
 

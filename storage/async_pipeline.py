@@ -163,7 +163,11 @@ class AsyncPipeline:
         current iteration's SSD->RAM fetch.
         """
         try:
-            with tide_range("tide.io.ssd.read.submit"):
+            try:
+                with tide_range("tide.io.ssd.read.submit"):
+                    self.urgent_prefetch_queue.put_nowait((iteration, needed_blocks))
+            except Exception:
+                # Queueing must remain functional when optional tracing is unavailable.
                 self.urgent_prefetch_queue.put_nowait((iteration, needed_blocks))
         except Exception:
             pass
@@ -175,7 +179,13 @@ class AsyncPipeline:
                     if future_target_iteration is None
                     else int(future_target_iteration)
                 )
-                with tide_range("tide.io.ssd.read.submit"):
+                try:
+                    with tide_range("tide.io.ssd.read.submit"):
+                        self.future_prefetch_queue.put_nowait(
+                            (target_iteration, future_blocks)
+                        )
+                except Exception:
+                    # Queueing must remain functional when optional tracing is unavailable.
                     self.future_prefetch_queue.put_nowait(
                         (target_iteration, future_blocks)
                     )

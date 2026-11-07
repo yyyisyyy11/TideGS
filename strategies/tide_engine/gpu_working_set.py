@@ -374,6 +374,10 @@ class GPUWorkingSet:
         self._persistent_free_slots: List[int] = []
 
         self._writeback_stream = torch.cuda.Stream(device=self.device)
+        # Persistent resident materialization has its own stream.  The caller
+        # waits on the returned ready_event before binding the tensors to the
+        # training stream, so H2D/unpack can overlap CPU planning and cache I/O.
+        self._load_stream = torch.cuda.Stream(device=self.device)
         self._writeback_staging_slots: List[Optional[torch.Tensor]] = [None, None]
         self._writeback_gpu_staging_slots: List[Optional[torch.Tensor]] = [None, None]
         self._writeback_staging_capacities = [0, 0]
@@ -649,8 +653,11 @@ class GPUWorkingSet:
         enable_retention: bool,
         block_reader,
         capture_timeline: bool = False,
+        load_stream=None,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, object]]:
         """Materialize a distributed rank working set into stable GPU slots."""
+
+        load_stream = load_stream or self._load_stream
         load_start = time.perf_counter()
         sorted_visible = sorted(
             set(
@@ -779,112 +786,118 @@ class GPUWorkingSet:
         h2d_submit_ns = time.perf_counter_ns() if capture_timeline else None
         h2d_start_event = torch.cuda.Event(enable_timing=True)
         h2d_end_event = torch.cuda.Event(enable_timing=True)
-        h2d_start_event.record()
         h2d_bytes = 0
         packed_gpu = None
-        if block_batch is not None:
-            packed_cpu = block_batch.tensor
-            if (
-                packed_cpu.device.type != 'cpu'
-                or packed_cpu.dim() != 2
-                or int(packed_cpu.shape[1]) != 59
-            ):
-                raise ValueError(
-                    f"Invalid persistent BlockBatch shape={tuple(packed_cpu.shape)} "
-                    f"device={packed_cpu.device}"
-                )
-            h2d_bytes = int(packed_cpu.numel()) * int(packed_cpu.element_size())
-            with tide_range("tide.cpu.resident.h2d.submit"):
-                with tide_range("tide.gpu.transfer.h2d"):
-                    packed_gpu = packed_cpu.to(
-                        self.device,
-                        non_blocking=bool(packed_cpu.is_pinned()),
+        # All H2D and unpack work is submitted to the dedicated load stream.
+        # CPU reads above remain synchronous, but can overlap the background
+        # planner and its SSD->RAM hint before this function is entered.
+        current_stream = torch.cuda.current_stream(self.device)
+        load_stream.wait_stream(current_stream)
+        with torch.cuda.stream(load_stream):
+            h2d_start_event.record(load_stream)
+            if block_batch is not None:
+                packed_cpu = block_batch.tensor
+                if (
+                    packed_cpu.device.type != 'cpu'
+                    or packed_cpu.dim() != 2
+                    or int(packed_cpu.shape[1]) != 59
+                ):
+                    raise ValueError(
+                        f"Invalid persistent BlockBatch shape={tuple(packed_cpu.shape)} "
+                        f"device={packed_cpu.device}"
                     )
-            with tide_range("tide.cpu.resident.unpack.prepare"):
-                source_starts = []
-                target_starts = []
-                row_counts = []
-                for block_id in incoming_blocks:
-                    source_slice = block_batch.block_slices.get(block_id)
-                    target_slice = self.block_to_gpu_slice[block_id]
-                    expected_rows = int(target_slice.stop - target_slice.start)
-                    if (
-                        source_slice is None
-                        or int(source_slice.stop - source_slice.start) != expected_rows
-                    ):
-                        raise ValueError(
-                            f"Invalid persistent block slice for {block_id}: "
-                            f"source={source_slice}, expected_rows={expected_rows}"
+                h2d_bytes = int(packed_cpu.numel()) * int(packed_cpu.element_size())
+                with tide_range("tide.cpu.resident.h2d.submit"):
+                    with tide_range("tide.gpu.transfer.h2d"):
+                        packed_gpu = packed_cpu.to(
+                            self.device,
+                            non_blocking=bool(packed_cpu.is_pinned()),
                         )
-                    source_starts.append(int(source_slice.start))
-                    target_starts.append(int(target_slice.start))
-                    row_counts.append(expected_rows)
-
-                source_starts_gpu = torch.tensor(
-                    source_starts,
-                    dtype=torch.long,
-                    device=self.device,
-                )
-                target_starts_gpu = torch.tensor(
-                    target_starts,
-                    dtype=torch.long,
-                    device=self.device,
-                )
-                row_counts_gpu = torch.tensor(
-                    row_counts,
-                    dtype=torch.long,
-                    device=self.device,
-                )
-                block_ids_gpu = torch.tensor(
-                    incoming_blocks,
-                    dtype=torch.long,
-                    device=self.device,
-                )
-            with tide_range("tide.cpu.resident.unpack.submit"):
-                if triton is not None:
-                    from storage.block_reader import BlockLayout
-
-                    grid = (
-                        len(incoming_blocks),
-                        triton.cdiv(self.block_size * 59, 256),
-                    )
-                    _unpack_persistent_blocks_kernel[grid](
-                        packed_gpu,
-                        source_starts_gpu,
-                        target_starts_gpu,
-                        row_counts_gpu,
-                        block_ids_gpu,
-                        self.gpu_xyz,
-                        self.gpu_scaling,
-                        self.gpu_rotation,
-                        self.gpu_opacity,
-                        self.gpu_features_dc,
-                        self.gpu_features_rest,
-                        self.local_to_global_idx,
-                        SOURCE_UNIFIED=block_batch.layout == BlockLayout.UNIFIED,
-                        BLOCK_ROWS=self.block_size,
-                        COPY_BLOCK_SIZE=256,
-                        num_warps=4,
-                    )
-                else:  # pragma: no cover
-                    columns = self._block_layout_columns(block_batch.layout)
-                    with torch.no_grad():
-                        for block_id in incoming_blocks:
-                            source_slice = block_batch.block_slices[block_id]
-                            target_slice = self.block_to_gpu_slice[block_id]
-                            source = packed_gpu[source_slice]
-                            for name, column_slice in columns.items():
-                                self._persistent_component_tensors()[name][
-                                    target_slice
-                                ].copy_(source[:, column_slice])
-                            row_count = int(target_slice.stop - target_slice.start)
-                            self.local_to_global_idx[target_slice] = torch.arange(
-                                block_id * self.block_size,
-                                block_id * self.block_size + row_count,
-                                dtype=torch.long,
-                                device=self.device,
+                with tide_range("tide.cpu.resident.unpack.prepare"):
+                    source_starts = []
+                    target_starts = []
+                    row_counts = []
+                    for block_id in incoming_blocks:
+                        source_slice = block_batch.block_slices.get(block_id)
+                        target_slice = self.block_to_gpu_slice[block_id]
+                        expected_rows = int(target_slice.stop - target_slice.start)
+                        if (
+                            source_slice is None
+                            or int(source_slice.stop - source_slice.start) != expected_rows
+                        ):
+                            raise ValueError(
+                                f"Invalid persistent block slice for {block_id}: "
+                                f"source={source_slice}, expected_rows={expected_rows}"
                             )
-        h2d_end_event.record()
+                        source_starts.append(int(source_slice.start))
+                        target_starts.append(int(target_slice.start))
+                        row_counts.append(expected_rows)
+
+                    source_starts_gpu = torch.tensor(
+                        source_starts,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    target_starts_gpu = torch.tensor(
+                        target_starts,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    row_counts_gpu = torch.tensor(
+                        row_counts,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    block_ids_gpu = torch.tensor(
+                        incoming_blocks,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                with tide_range("tide.cpu.resident.unpack.submit"):
+                    if triton is not None:
+                        from storage.block_reader import BlockLayout
+
+                        grid = (
+                            len(incoming_blocks),
+                            triton.cdiv(self.block_size * 59, 256),
+                        )
+                        _unpack_persistent_blocks_kernel[grid](
+                            packed_gpu,
+                            source_starts_gpu,
+                            target_starts_gpu,
+                            row_counts_gpu,
+                            block_ids_gpu,
+                            self.gpu_xyz,
+                            self.gpu_scaling,
+                            self.gpu_rotation,
+                            self.gpu_opacity,
+                            self.gpu_features_dc,
+                            self.gpu_features_rest,
+                            self.local_to_global_idx,
+                            SOURCE_UNIFIED=block_batch.layout == BlockLayout.UNIFIED,
+                            BLOCK_ROWS=self.block_size,
+                            COPY_BLOCK_SIZE=256,
+                            num_warps=4,
+                        )
+                    else:  # pragma: no cover
+                        columns = self._block_layout_columns(block_batch.layout)
+                        with torch.no_grad():
+                            for block_id in incoming_blocks:
+                                source_slice = block_batch.block_slices[block_id]
+                                target_slice = self.block_to_gpu_slice[block_id]
+                                source = packed_gpu[source_slice]
+                                for name, column_slice in columns.items():
+                                    self._persistent_component_tensors()[name][
+                                        target_slice
+                                    ].copy_(source[:, column_slice])
+                                row_count = int(target_slice.stop - target_slice.start)
+                                self.local_to_global_idx[target_slice] = torch.arange(
+                                    block_id * self.block_size,
+                                    block_id * self.block_size + row_count,
+                                    dtype=torch.long,
+                                    device=self.device,
+                                )
+            h2d_end_event.record(load_stream)
 
         self.loaded_blocks = sorted_visible
         self.previous_blocks = list(sorted_visible)
@@ -911,6 +924,8 @@ class GPUWorkingSet:
                 (time.perf_counter() - load_start) * 1000.0 - foreground_read_ms,
             ),
             'h2d_events': (h2d_start_event, h2d_end_event),
+            'ready_event': h2d_end_event,
+            'load_stream': load_stream,
             'h2d_submit_ns': h2d_submit_ns,
             'h2d_bytes': h2d_bytes,
             'gpu_slot_capacity_blocks': self._persistent_slot_capacity,
@@ -927,6 +942,7 @@ class GPUWorkingSet:
         block_reader: 'Optional[object]' = None,
         allow_gpu_hotspots: bool = False,
         capture_timeline: bool = False,
+        load_stream=None,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, int]]:
         """
         Load visible blocks with resident-block overlap reuse.
@@ -948,6 +964,8 @@ class GPUWorkingSet:
                 When provided, it supersedes both older parameters.
             allow_gpu_hotspots: Preserve overlapping GPU blocks while using the
                 block reader for cold blocks. The caller must flush dirty evictions.
+            load_stream: Optional CUDA stream for H2D/unpack submission. When
+                omitted, the manager's persistent load stream is used.
             
         Returns:
             Tuple of:
@@ -969,6 +987,7 @@ class GPUWorkingSet:
                 enable_retention=enable_retention,
                 block_reader=block_reader,
                 capture_timeline=capture_timeline,
+                load_stream=load_stream,
             )
 
         visible_set = set(int(block_id) for block_id in visible_block_ids if 0 <= int(block_id) < self.num_blocks)

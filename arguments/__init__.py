@@ -236,6 +236,7 @@ class AuxiliaryParams(ParamGroup):
         self.paper_free_unified_params = False  # release _unified_params after init to unlock >100GB scenes; requires paper_block_reader_backend != unified_params and paper_optimizer_backend=gpu_resident
         self.paper_debug_logging = False  # Enable verbose TideGS diagnostics for development runs
         self.tide_distributed_mode = "off"  # {off, gaussian_sharded}; explicit torchrun mode
+        self.tide_async_plan = False  # overlap distributed N+1 plan/SSD hint with current training
         self.tide_camera_assignment = "equal"  # {equal, gaussian_balanced}; camera identity placement
         self.finalize_plan = False  # Re-run full distributed planning when preview visibility changes
         self.tide_camera_microbatch = 4  # Cameras rendered per distributed gsplat call
@@ -244,6 +245,7 @@ class AuxiliaryParams(ParamGroup):
         self.tide_light_timeline = False  # Keep batch/I/O metrics without per-stage GPU timeline events
         self.tide_grad_zero_metrics = False  # Profile exact/near-zero gradients after projection cull
         self.tide_grad_zero_metrics_interval = 1  # Profile every N optimizer steps; 1 means every batch
+        self.tide_partial_grad_metrics = False  # Profile receive-side partial Gaussian gradients
         self.tide_grad_near_zero_threshold = 1e-8  # Primary threshold for per-Gaussian near-zero histograms
         self.tide_grad_sample_rows = 8192  # Raw-gradient rows per rank/batch; 0 disables, -1 records every survivor
         self.tide_grad_stats_chunk_rows = 262144  # Bound temporary memory while scanning gradient rows

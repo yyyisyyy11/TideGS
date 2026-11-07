@@ -32,6 +32,7 @@ from .gradient_sparsity import (
 from .gradient_schema import GRADIENT_COMPONENTS as _LEAF_NAMES
 from .engine import get_gpu_resident_optimizer
 from .gsplat_backend import (
+    consume_partial_gradient_metrics,
     PROJECTION_TIMING_FIX,
     distributed_rasterize,
     distributed_rasterization_pipeline,
@@ -615,6 +616,7 @@ def train_distributed_tide_batch(
     manager = gaussians.gpu_working_set_manager
     cache = storage_adapter.cache
     setup_error = None
+    resident_load_wait_ms = 0.0
     try:
         cache.set_foreground_iteration(iteration)
         cache_before = cache.get_stats()
@@ -653,6 +655,15 @@ def train_distributed_tide_batch(
                 allow_gpu_hotspots=True,
                 capture_timeline=timeline_enabled,
             )
+        # H2D/unpack is submitted on the persistent load stream.  Make the
+        # training stream wait exactly once before exposing the tensors to
+        # autograd; this preserves the old data dependency while allowing the
+        # CPU planner and SSD->RAM hint to run concurrently.
+        ready_event = retention_stats.get("ready_event")
+        if ready_event is not None:
+            wait_start = time.perf_counter()
+            torch.cuda.current_stream(manager.device).wait_event(ready_event)
+            resident_load_wait_ms = (time.perf_counter() - wait_start) * 1000.0
         resident_load_ms = (time.perf_counter() - resident_load_start) * 1000.0
         with tide_range("tide.cpu.resident.bind"):
             _bind_working_set(gaussians, gpu_tensors)
@@ -818,6 +829,10 @@ def train_distributed_tide_batch(
                 group=getattr(context, "error_group", None),
             )
     grad_zero_sample_due = metrics_writer.should_write_grad_zero(optimizer_step)
+    partial_grad_sample_due = metrics_writer.should_write_partial_grad(optimizer_step)
+    torch._tide_partial_grad_metrics_sample = bool(partial_grad_sample_due)
+    partial_records_total = 0
+    partial_records_all_zero = 0
     tile_contribution_mode = str(
         getattr(args, "tide_tile_contribution_mode", "off")
     ).lower()
@@ -1411,6 +1426,10 @@ def train_distributed_tide_batch(
             backward_end = torch.cuda.Event(enable_timing=True)
             backward_start.record()
             torch.stack(micro_losses).sum().backward()
+            if partial_grad_sample_due:
+                partial_total, partial_all_zero = consume_partial_gradient_metrics(meta)
+                partial_records_total += int(partial_total)
+                partial_records_all_zero += int(partial_all_zero)
             backward_end.record()
             backward_ranges.append(
                 (backward_start, backward_end, backward_submit_ns, cameras)
@@ -1523,6 +1542,13 @@ def train_distributed_tide_batch(
         with tide_range("tide.cpu.gradient.sample_emit"):
             metrics_writer.write_grad_zero(grad_zero_record)
             metrics_writer.write_grad_sample(grad_sample_payload)
+    if partial_grad_sample_due:
+        metrics_writer.write_partial_grad(
+            iteration=iteration,
+            optimizer_step=optimizer_step,
+            partial_records_total=partial_records_total,
+            partial_records_all_zero=partial_records_all_zero,
+        )
 
     optimizer_start = torch.cuda.Event(enable_timing=True)
     optimizer_end = torch.cuda.Event(enable_timing=True)
@@ -1626,6 +1652,13 @@ def train_distributed_tide_batch(
     # ``get_stats`` walks the rank-local SSD index and must not become a hidden
     # per-batch cost in normal runs.
     optimizer_state_stats = optimizer.get_stats() if timeline_enabled else {}
+
+    async_plan_metrics = {}
+    async_plan_handle = getattr(gaussians, "_tide_async_plan_handle", None)
+    if async_plan_handle is not None:
+        peek = getattr(async_plan_handle, "metrics_if_ready", None)
+        if callable(peek):
+            async_plan_metrics = dict(peek() or {})
 
     def cache_delta(name):
         return float(cache_after.get(name, 0)) - float(cache_before.get(name, 0))
@@ -2031,6 +2064,23 @@ def train_distributed_tide_batch(
         "plan_ms": float(plan.plan_ms),
         "writeback_submit_ms": writeback_submit_ms,
         "resident_load_ms": resident_load_ms,
+        "resident_load_submit_ms": float(
+            retention_stats.get("cpu_materialize_ms", 0.0)
+        ),
+        "resident_load_wait_ms": resident_load_wait_ms,
+        "resident_load_h2d_ms": h2d_ms,
+        "plan_preview_snapshot_ms": float(
+            async_plan_metrics.get("plan_preview_snapshot_ms", 0.0)
+        ),
+        "plan_cpu_background_ms": float(
+            async_plan_metrics.get("plan_cpu_background_ms", 0.0)
+        ),
+        "plan_publish_ms": float(
+            async_plan_metrics.get("plan_publish_ms", 0.0)
+        ),
+        "plan_ready_during_compute": int(
+            async_plan_metrics.get("plan_ready_during_compute", 0)
+        ),
         "block_reader_foreground_ms": float(
             retention_stats.get("foreground_read_ms", 0.0)
         ),
@@ -2041,6 +2091,13 @@ def train_distributed_tide_batch(
         ),
         "ssd_urgent_read_blocks": cache_delta("urgent_storage_read_blocks"),
         "ssd_urgent_read_bytes": cache_delta("ssd_bytes_read_urgent"),
+        "ssd_read_blocks": cache_delta("urgent_storage_read_blocks"),
+        "ram_hit_blocks": max(
+            0,
+            int(retention_stats.get("cold_count", 0))
+            - int(cache_delta("urgent_storage_read_blocks")),
+        ),
+        "inflight_wait_blocks": int(cache_delta("inflight_wait_blocks")),
         "h2d_bytes": int(retention_stats.get("h2d_bytes", 0)),
         "h2d_ms": h2d_ms,
         "gsplat_forward_ms": forward_ms,

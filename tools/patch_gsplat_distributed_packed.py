@@ -12,9 +12,12 @@ from pathlib import Path
 
 ORIGINAL = "            C = C_world[world_rank]\n\n        else:\n"
 BUGGY_IMAGE_IDS = "image_ids = batch_ids * C + camera_ids"
+CAMERA_FIX_MARKER = "            image_ids = camera_ids\n"
 PROJECTION_TIMING_MARKER = "_tide_projection_events"
 OWNER_SURVIVOR_MARKER = "_tide_owner_projection_survivor_mask"
 TILE_CONTRIBUTION_MARKER = "_tide_owner_tile_survivor_mask"
+PARTIAL_GRADIENT_MARKER = "_tide_partial_gradient_context"
+PARTIAL_GRADIENT_CALL_MARKER = "_tide_begin_partial_gradient_metrics"
 PROJECTION_START_ANCHOR = "    if with_ut:\n"
 PROJECTION_END_ANCHOR = (
     "    if packed:\n"
@@ -25,6 +28,33 @@ PATCHED = (
     "            image_ids = camera_ids\n"
     "\n"
     "        else:\n"
+)
+PARTIAL_GRADIENT_RECEIVE_PATCHED = (
+    "            C = C_world[world_rank]\n"
+    "            image_ids = camera_ids\n"
+    '            if (\n'
+    '                getattr(torch, "_tide_partial_grad_metrics", False)\n'
+    '                and getattr(torch, "_tide_partial_grad_metrics_sample", True)\n'
+    "            ):\n"
+    "                _tide_partial_gradient_context = (\n"
+    '                    torch._tide_begin_partial_gradient_metrics(\n'
+    "                        means2d=means2d,\n"
+    "                        depths=depths,\n"
+    "                        conics=conics,\n"
+    "                        opacity=opacities,\n"
+    "                        features=colors,\n"
+    "                        valid_mask=(radii > 0),\n"
+    "                    )\n"
+    "                )\n"
+    "\n"
+    "        else:\n"
+)
+PARTIAL_GRADIENT_RETURN_ANCHOR = "    return render_colors, render_alphas, meta\n"
+PARTIAL_GRADIENT_RETURN_PATCHED = (
+    "    if \"_tide_partial_gradient_context\" in locals():\n"
+    f'        meta["{PARTIAL_GRADIENT_MARKER}"] = _tide_partial_gradient_context\n'
+    "\n"
+    f"{PARTIAL_GRADIENT_RETURN_ANCHOR}"
 )
 PROJECTION_START_PATCHED = (
     "    _tide_projection_start = None\n"
@@ -143,7 +173,9 @@ OWNER_SURVIVOR_PATCHED = (
 
 
 def patch_rendering_source(source: str) -> tuple[str, bool]:
-    if PATCHED in source:
+    if PATCHED in source or (
+        CAMERA_FIX_MARKER in source and BUGGY_IMAGE_IDS in source
+    ):
         return source, False
     if BUGGY_IMAGE_IDS not in source:
         raise RuntimeError(
@@ -188,6 +220,52 @@ def patch_projection_timing_source(source: str) -> tuple[str, bool]:
         PROJECTION_END_PATCHED,
         1,
     )
+    return patched, True
+
+
+def patch_partial_gradient_source(source: str) -> tuple[str, bool]:
+    """Attach hooks to the post-all-to-all rendering-side parameter buffers."""
+
+    if PARTIAL_GRADIENT_CALL_MARKER in source or PARTIAL_GRADIENT_MARKER in source:
+        if (
+            PARTIAL_GRADIENT_RECEIVE_PATCHED in source
+            and PARTIAL_GRADIENT_RETURN_PATCHED in source
+        ):
+            return source, False
+        raise RuntimeError(
+            "Found an unknown existing partial-gradient patch layout. "
+            "Refusing to modify it."
+        )
+    receive_occurrences = source.count(PATCHED)
+    if receive_occurrences != 1:
+        raise RuntimeError(
+            "Expected exactly one gsplat distributed receive insertion point; "
+            f"found {receive_occurrences}. Refusing to modify an unknown source layout."
+        )
+    # gsplat 1.5.3 里 `return render_colors, render_alphas, meta` 出现 **两次**：
+    #   一次在 rasterization()（公开入口，分布式相机修正 C_world[world_rank] 就在这里），
+    #   一次在它调用的 _rasterization() 里。
+    # 要挂 meta 的是前者——上下文正是在 rasterization() 里创建、随它的返回值出去的。
+    # 所以从接收插入点之后找第一个 return，并确认它没有越过下一个模块级 def。
+    receive_end = source.index(PATCHED) + len(PATCHED)
+    return_index = source.find(PARTIAL_GRADIENT_RETURN_ANCHOR, receive_end)
+    if return_index < 0:
+        raise RuntimeError(
+            "Expected a gsplat rasterization return after the distributed receive "
+            "point; found none. Refusing to modify an unknown source layout."
+        )
+    next_def = source.find("\ndef ", receive_end)
+    if next_def != -1 and next_def < return_index:
+        raise RuntimeError(
+            "The rasterization return after the distributed receive point belongs "
+            "to a different function. Refusing to modify an unknown source layout."
+        )
+    patched = (
+        source[:return_index]
+        + PARTIAL_GRADIENT_RETURN_PATCHED
+        + source[return_index + len(PARTIAL_GRADIENT_RETURN_ANCHOR):]
+    )
+    patched = patched.replace(PATCHED, PARTIAL_GRADIENT_RECEIVE_PATCHED, 1)
     return patched, True
 
 
@@ -306,7 +384,14 @@ def main() -> None:
     patched_source, timing_changed = patch_projection_timing_source(patched_source)
     patched_source, tile_changed = patch_tile_contribution_source(patched_source)
     patched_source, survivor_changed = patch_owner_survivor_source(patched_source)
-    if not camera_changed and not timing_changed and not tile_changed and not survivor_changed:
+    patched_source, partial_changed = patch_partial_gradient_source(patched_source)
+    if (
+        not camera_changed
+        and not timing_changed
+        and not tile_changed
+        and not survivor_changed
+        and not partial_changed
+    ):
         print(f"TideGS gsplat fixes already present: {rendering_path}")
         return
 
@@ -326,6 +411,8 @@ def main() -> None:
         print(f"Patched gsplat owner projection survivor mask: {rendering_path}")
     if tile_changed:
         print(f"Patched gsplat tile contribution mask: {rendering_path}")
+    if partial_changed:
+        print(f"Patched gsplat partial-gradient receive hooks: {rendering_path}")
     print(f"Original source backup: {backup_path}")
 
 

@@ -380,6 +380,74 @@ class DistributedMetricsTest(unittest.TestCase):
                 global_rows[0]["would_drop_nonzero_gradient_gaussians"], "4"
             )
 
+    def test_partial_grad_metrics_write_weighted_rank_and_global_ratio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = DistributedMetricsWriter(
+                args=SimpleNamespace(
+                    log_folder=directory,
+                    tide_partial_grad_metrics=True,
+                    tide_grad_zero_metrics_interval=2,
+                ),
+                context=_Context(),
+            )
+            self.assertTrue(writer.should_write_partial_grad(4))
+            self.assertFalse(writer.should_write_partial_grad(5))
+            writer.write_partial_grad(
+                iteration=8,
+                optimizer_step=4,
+                partial_records_total=10,
+                partial_records_all_zero=4,
+            )
+            rank_rows = _read_rows(
+                Path(directory) / "metrics_partial_grad_rank0.tsv"
+            )
+            global_rows = _read_rows(
+                Path(directory) / "metrics_partial_grad_global.tsv"
+            )
+            self.assertEqual(rank_rows[0]["partial_records_nonzero"], "6")
+            self.assertEqual(rank_rows[0]["partial_exact_zero_ratio"], "0.4")
+            self.assertEqual(global_rows[0]["partial_records_total"], "20")
+            self.assertEqual(global_rows[0]["partial_records_all_zero"], "8")
+            self.assertEqual(global_rows[0]["partial_records_nonzero"], "12")
+            self.assertEqual(global_rows[0]["partial_exact_zero_ratio"], "0.4")
+
+    def test_partial_grad_metrics_reject_invalid_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = DistributedMetricsWriter(
+                args=SimpleNamespace(
+                    log_folder=directory,
+                    tide_partial_grad_metrics=True,
+                ),
+                context=_SingleRankContext(),
+            )
+            with self.assertRaises(ValueError):
+                writer.write_partial_grad(
+                    iteration=1,
+                    optimizer_step=1,
+                    partial_records_total=2,
+                    partial_records_all_zero=3,
+                )
+
+    def test_partial_grad_metrics_disabled_writes_no_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = DistributedMetricsWriter(
+                args=SimpleNamespace(
+                    log_folder=directory,
+                    tide_partial_grad_metrics=False,
+                ),
+                context=_SingleRankContext(),
+            )
+            self.assertFalse(writer.should_write_partial_grad(1))
+            writer.write_partial_grad(
+                iteration=1,
+                optimizer_step=1,
+                partial_records_total=1,
+                partial_records_all_zero=1,
+            )
+            self.assertFalse(
+                (Path(directory) / "metrics_partial_grad_rank0.tsv").exists()
+            )
+
     def test_legacy_collector_defers_cuda_read_and_writes_single_rank_schema(self):
         with tempfile.TemporaryDirectory() as directory:
             writer = DistributedMetricsWriter(
