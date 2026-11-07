@@ -964,9 +964,6 @@ def init_args(args):
             )
 
     if getattr(args, "tide_distributed_mode", "off") == "gaussian_sharded":
-        assert getattr(args, "paper_optimizer_state_mode", "full_cpu") != "resident_ssd_cache", (
-            "resident_ssd_cache currently supports single-card training only"
-        )
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         assert world_size > 1, (
             "gaussian_sharded mode must be launched with torchrun and WORLD_SIZE > 1"
