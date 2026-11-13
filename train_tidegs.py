@@ -1609,6 +1609,16 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     gaussians._paper_optimizer_state_mode = str(getattr(args, 'paper_optimizer_state_mode', 'resident_blocks')).lower()
     gaussians._paper_optimizer_block_size = int(getattr(args, 'gaussian_block_size', 4096))
     gaussians._paper_optimizer_backend = 'gpu_resident'
+    # Distributed batches create the optimizer lazily in
+    # distributed_engine.train_distributed_tide_batch, which never runs
+    # initialize_paper_mode_runtime_state; mirror its rank-scoped state path here.
+    if gaussians._paper_optimizer_state_mode == 'resident_ssd_cache':
+        state_root = os.path.join(str(getattr(args, 'model_path', '')), 'optimizer_state_ssd')
+        if distributed_context is not None and getattr(distributed_context, 'enabled', False):
+            state_root = os.path.join(state_root, f'rank_{int(distributed_context.rank)}')
+        elif str(getattr(args, 'tide_distributed_mode', 'off')).lower() == 'gaussian_sharded':
+            state_root = os.path.join(state_root, f"rank_{int(os.environ.get('RANK', '0'))}")
+        gaussians._paper_optimizer_state_dir = state_root
     _enable_optimizer_churn_logging("pure_ssd_gpu_resident")
     camera_batch_prefetcher = CameraBatchPrefetcher(train_dataset)
     curvature_camera_batch_prefetcher = (
