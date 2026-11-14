@@ -154,7 +154,15 @@ def plan_merge(dist: dict) -> dict:
         raise MergeError(f"{len(conflicts)} ambiguous/conflicting blocks; first: {conflicts[:5]}")
 
     # patch files actually referenced by owner entries, with collision-free new ids and names
-    used = sorted({(c["rank"], int(c["file_id"])) for c in chosen.values() if int(c["file_id"]) != 0})
+    used = sorted({
+        (c["rank"], int(fid))
+        for c in chosen.values()
+        for fid in (
+            [c["file_id"]]
+            + ([c["state"]["file_id"]] if c.get("state") else [])
+        )
+        if int(fid) != 0
+    })
     new_ids: Dict[tuple, int] = {}
     names: Dict[tuple, str] = {}
     taken_ids, taken_names = {0}, set()
@@ -210,10 +218,23 @@ def write_merged(dist: dict, plan: dict, out: Path, link_mode: str) -> dict:
         patch_bytes += size
 
     index = {}
+    state_bytes_total = 0
     for b, c in plan["chosen"].items():
         fid = int(c["file_id"])
-        index[str(b)] = {"file_id": 0 if fid == 0 else plan["new_ids"][(c["rank"], fid)],
-                         "offset": int(c["offset"]), "size": int(c["size"]), "version": int(c["version"])}
+        entry = {"file_id": 0 if fid == 0 else plan["new_ids"][(c["rank"], fid)],
+                 "offset": int(c["offset"]), "size": int(c["size"]), "version": int(c["version"])}
+        state = c.get("state")
+        if state:
+            state_fid = int(state["file_id"])
+            entry["state"] = {
+                "file_id": 0 if state_fid == 0 else plan["new_ids"][(c["rank"], state_fid)],
+                "offset": int(state["offset"]),
+                "size": int(state["size"]),
+                "row_count": int(state["row_count"]),
+                "step": int(state["step"]),
+            }
+            state_bytes_total += int(state["size"])
+        index[str(b)] = entry
 
     idx0 = rank0["index"]
     merged_index = {k: idx0[k] for k in ("block_size", "bytes_per_block", "dtype", "num_blocks", "point_dim",
@@ -224,7 +245,10 @@ def write_merged(dist: dict, plan: dict, out: Path, link_mode: str) -> dict:
         "patch_files": len(files) - 1, "patch_bytes": patch_bytes,
         "linked_patch_files": len(files) - 1, "linked_patch_bytes": patch_bytes,
         "copied_patch_files": 0, "copied_patch_bytes": 0, "patch_file_mode": link_mode,
+        "state_bytes": int(state_bytes_total),
     })
+    if state_bytes_total and "state_extent" in idx0:
+        merged_index["state_extent"] = idx0["state_extent"]
     _write_json(delta / "storage_index.json", merged_index)
 
     # bounds: the root copy is authoritative; it must equal the owner-selected rank bounds
@@ -289,6 +313,20 @@ def verify_merged(dist: dict, out: Path) -> dict:
         if not (same_file and int(got["offset"]) == int(want["offset"]) and int(got["size"]) == int(want["size"])
                 and int(got["version"]) == int(want["version"])):
             mismatches.append(b)
+        want_state = want.get("state")
+        got_state = got.get("state")
+        if (want_state is None) != (got_state is None):
+            mismatches.append(b)
+        elif want_state is not None:
+            same_state_file = inode_of[int(got_state["file_id"])] == src_inode[(o, int(want_state["file_id"]))]
+            if not (same_state_file and int(got_state["offset"]) == int(want_state["offset"])
+                    and int(got_state["size"]) == int(want_state["size"])
+                    and int(got_state["row_count"]) == int(want_state["row_count"])
+                    and int(got_state["step"]) == int(want_state["step"])):
+                mismatches.append(b)
+            state_file_size = os.stat(files[int(got_state["file_id"])]["path"]).st_size
+            if int(got_state["offset"]) + int(got_state["size"]) > state_file_size:
+                mismatches.append(b)
         size = os.stat(files[int(got["file_id"])]["path"]).st_size
         if int(got["offset"]) + int(got["size"]) > size:
             mismatches.append(b)
