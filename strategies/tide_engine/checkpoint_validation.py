@@ -348,18 +348,27 @@ def validate_distributed_checkpoint_resume(
                 raise ValueError(
                     "Distributed checkpoint v3 unexpectedly claims persisted curvature EMA state"
                 )
-        elif state_mode == "resident_ssd_cache_per_rank":
+        elif state_mode in {"resident_ssd_cache_per_rank", "resident_ssd_cache_in_patch"}:
             if not bool(root.get("optimizer_ema_saved", False)):
                 raise ValueError(
-                    "Distributed checkpoint v3 resident_ssd_cache_per_rank must save optimizer EMA state"
+                    "Distributed checkpoint v3 resident_ssd_cache* must save optimizer EMA state"
                 )
             if bool(root.get("optimizer_curvature_saved", True)):
                 raise ValueError(
-                    "Distributed checkpoint v3 resident_ssd_cache_per_rank cannot claim curvature EMA state"
+                    "Distributed checkpoint v3 resident_ssd_cache* cannot claim curvature EMA state"
                 )
-            if int(root.get("optimizer_state_format_version", -1)) != 2:
+            expected_format = 3 if state_mode == "resident_ssd_cache_in_patch" else 2
+            if int(root.get("optimizer_state_format_version", -1)) != expected_format:
                 raise ValueError(
-                    "Distributed checkpoint v3 resident_ssd_cache_per_rank requires optimizer_state_format_version=2"
+                    f"Distributed checkpoint v3 {state_mode} requires "
+                    f"optimizer_state_format_version={expected_format}"
+                )
+            if state_mode == "resident_ssd_cache_in_patch" and str(
+                root.get("state_storage", "")
+            ) != "in_patch":
+                raise ValueError(
+                    "Distributed checkpoint v3 resident_ssd_cache_in_patch requires "
+                    "state_storage=in_patch"
                 )
             if str(_canonical_value(args, "paper_optimizer_state_mode", use_default=True)) != "resident_ssd_cache":
                 raise ValueError(
@@ -368,7 +377,8 @@ def validate_distributed_checkpoint_resume(
         else:
             raise ValueError(
                 "Distributed checkpoint v3 optimizer_state_mode must be "
-                "'cold_start_per_rank' or 'resident_ssd_cache_per_rank'"
+                "'cold_start_per_rank', 'resident_ssd_cache_per_rank' or "
+                "'resident_ssd_cache_in_patch'"
             )
         global_optimizer_step = int(root.get("global_optimizer_step", -1))
         if global_optimizer_step < 0:

@@ -281,23 +281,36 @@ def load_distributed_checkpoint_root(
                 raise RuntimeError(
                     "Distributed checkpoint v3 cold_start_per_rank must not claim persisted optimizer state"
                 )
-        elif optimizer_state_mode == "resident_ssd_cache_per_rank":
+        elif optimizer_state_mode in {
+            "resident_ssd_cache_per_rank",
+            "resident_ssd_cache_in_patch",
+        }:
             if not bool(root["optimizer_ema_saved"]):
                 raise RuntimeError(
-                    "Distributed checkpoint v3 resident_ssd_cache_per_rank must save optimizer EMA state"
+                    "Distributed checkpoint v3 resident_ssd_cache* must save optimizer EMA state"
                 )
             if bool(root["optimizer_curvature_saved"]):
                 raise RuntimeError(
-                    "Distributed checkpoint v3 resident_ssd_cache_per_rank cannot claim curvature EMA state"
+                    "Distributed checkpoint v3 resident_ssd_cache* cannot claim curvature EMA state"
                 )
-            if int(root.get("optimizer_state_format_version", -1)) != 2:
+            expected_format = 3 if optimizer_state_mode == "resident_ssd_cache_in_patch" else 2
+            if int(root.get("optimizer_state_format_version", -1)) != expected_format:
                 raise RuntimeError(
-                    "Distributed checkpoint v3 resident_ssd_cache_per_rank requires optimizer_state_format_version=2"
+                    f"Distributed checkpoint v3 {optimizer_state_mode} requires "
+                    f"optimizer_state_format_version={expected_format}"
+                )
+            if optimizer_state_mode == "resident_ssd_cache_in_patch" and str(
+                root.get("state_storage", "")
+            ) != "in_patch":
+                raise RuntimeError(
+                    "Distributed checkpoint v3 resident_ssd_cache_in_patch requires "
+                    "state_storage=in_patch"
                 )
         else:
             raise RuntimeError(
                 "Distributed checkpoint v3 optimizer_state_mode must be "
-                "'cold_start_per_rank' or 'resident_ssd_cache_per_rank'"
+                "'cold_start_per_rank', 'resident_ssd_cache_per_rank' or "
+                "'resident_ssd_cache_in_patch'"
             )
         rank_hashes = list(root["rank_manifest_sha256"])
         if len(rank_hashes) != world_size:
@@ -515,6 +528,35 @@ def load_distributed_checkpoint_root(
                         metadata.get("sha256", ""),
                         label=f"rank {rank} optimizer state block {block_id}",
                     )
+            elif optimizer_state_mode == "resident_ssd_cache_in_patch":
+                if rank_state_mode != "resident_ssd_cache":
+                    raise RuntimeError(
+                        f"Distributed checkpoint rank {rank} must contain "
+                        "resident_ssd_cache state"
+                    )
+                if not bool(rank_manifest.get("optimizer_state_saved", False)):
+                    raise RuntimeError(
+                        f"Distributed checkpoint rank {rank} did not save optimizer state"
+                    )
+                if not bool(rank_manifest.get("adam_moments_saved", False)):
+                    raise RuntimeError(
+                        f"Distributed checkpoint rank {rank} did not save Adam moments"
+                    )
+                if int(rank_manifest.get("optimizer_state_format_version", -1)) != 3:
+                    raise RuntimeError(
+                        f"Distributed checkpoint rank {rank} requires "
+                        "optimizer_state_format_version=3 for in-patch state"
+                    )
+                if str(rank_manifest.get("state_storage", "")) != "in_patch":
+                    raise RuntimeError(
+                        f"Distributed checkpoint rank {rank} must record "
+                        "state_storage=in_patch"
+                    )
+                if rank_manifest.get("optimizer_state_manifest"):
+                    raise RuntimeError(
+                        f"Distributed checkpoint rank {rank} must not reference a "
+                        "legacy optimizer_state_manifest in extent mode"
+                    )
             for field, expected in root_metadata.items():
                 actual = int(rank_manifest[field])
                 if actual != expected:
@@ -690,6 +732,7 @@ def write_distributed_incremental_checkpoint(
             "optimizer_state_format_version": int(
                 rank_manifest.get("optimizer_state_format_version", 0)
             ),
+            "state_storage": str(rank_manifest.get("state_storage", "")),
         }
     except Exception as error:
         rank_result = {
@@ -757,19 +800,37 @@ def write_distributed_incremental_checkpoint(
             requested_state_mode = str(
                 getattr(args, "paper_optimizer_state_mode", "resident_blocks")
             ).lower()
+            root_optimizer_format_version = 2
+            root_state_storage = ""
             if requested_state_mode == "resident_ssd_cache":
-                if any(
-                    value["optimizer_state_mode"] != "resident_ssd_cache"
-                    or not value["optimizer_state_saved"]
-                    or not value["adam_moments_saved"]
-                    or value["optimizer_state_format_version"] != 2
+                in_patch = all(
+                    value["optimizer_state_mode"] == "resident_ssd_cache"
+                    and value["optimizer_state_saved"]
+                    and value["adam_moments_saved"]
+                    and int(value["optimizer_state_format_version"]) == 3
+                    and str(value.get("state_storage", "")) == "in_patch"
                     for value in ordered
-                ):
+                )
+                legacy = all(
+                    value["optimizer_state_mode"] == "resident_ssd_cache"
+                    and value["optimizer_state_saved"]
+                    and value["adam_moments_saved"]
+                    and int(value["optimizer_state_format_version"]) == 2
+                    for value in ordered
+                )
+                if in_patch:
+                    root_optimizer_state_mode = "resident_ssd_cache_in_patch"
+                    root_optimizer_format_version = 3
+                    root_state_storage = "in_patch"
+                elif legacy:
+                    root_optimizer_state_mode = "resident_ssd_cache_per_rank"
+                else:
                     raise RuntimeError(
                         "Distributed resident_ssd_cache checkpoint requires every rank "
-                        "to save optimizer_state_format_version=2 Adam state"
+                        "to save optimizer state consistently: either "
+                        "optimizer_state_format_version=3 with state_storage=in_patch "
+                        "or optimizer_state_format_version=2 per-rank state"
                     )
-                root_optimizer_state_mode = "resident_ssd_cache_per_rank"
                 root_optimizer_ema_saved = True
                 root_optimizer_curvature_saved = False
             else:
@@ -807,7 +868,8 @@ def write_distributed_incremental_checkpoint(
                 "optimizer_state_mode": root_optimizer_state_mode,
                 "optimizer_ema_saved": root_optimizer_ema_saved,
                 "optimizer_curvature_saved": root_optimizer_curvature_saved,
-                "optimizer_state_format_version": 2,
+                "optimizer_state_format_version": int(root_optimizer_format_version),
+                "state_storage": root_state_storage,
                 "planner_state": normalized_planner_state,
                 "total_points": int(storage_adapter.num_points),
                 "num_blocks": int(storage_adapter.num_blocks),
