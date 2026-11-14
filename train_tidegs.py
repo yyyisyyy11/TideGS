@@ -1727,6 +1727,14 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         start_from_this_iteration, opt_args.iterations + 1, args.bsz
     ):
         with tide_range("tide.batch.step"):
+            iter_wall_start = time.perf_counter()
+            loop_schedule_ms = 0.0
+            loop_camera_prefetch_ms = 0.0
+            loop_plan_finalize_ms = 0.0
+            loop_camera_h2d_ms = 0.0
+            loop_loss_sync_ms = 0.0
+            loop_loss_gather_ms = 0.0
+            loop_logging_ms = 0.0
             # # rewrite the checking iterations
             # ------------------------------------------------------------------------
             # 2.1: Iteration setup and profiling
@@ -1797,6 +1805,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             ):
                 _enable_optimizer_churn_logging("pure_ssd_gpu_resident")
 
+            schedule_start = time.perf_counter()
             with tide_range("tide.cpu.camera.schedule"):
                 schedule_info = get_camera_batch_schedule(
                     training_schedule=ssd_training_schedule,
@@ -1804,6 +1813,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     batch_size=args.bsz,
                     schedule_ordering=getattr(args, "ssd_schedule_ordering", "trajectory"),
                 )
+            loop_schedule_ms += (time.perf_counter() - schedule_start) * 1000.0
             global_batch_indices = schedule_info.batch_indices
             if distributed_context.is_rank0:
                 canonical_batch_start_position = (
@@ -1876,6 +1886,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     )
                     optimizer_churn_state['current_epoch'] = epoch
 
+            prefetch_wait_start = time.perf_counter()
             with tide_range("tide.wait.camera_prefetch"):
                 batched_cameras = camera_batch_prefetcher.get(batch_indices)
                 curvature_cameras = []
@@ -1885,6 +1896,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     curvature_cameras = curvature_camera_batch_prefetcher.get(
                         curvature_batch_indices
                     )
+            loop_camera_prefetch_ms += (time.perf_counter() - prefetch_wait_start) * 1000.0
             next_iteration = iteration + args.bsz
             next_optimizer_step = optimizer_step + 1
             next_curvature_camera_ids = []
@@ -1906,6 +1918,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             next_distributed_prediction = None
             next_distributed_rank0_preview = None
             next_distributed_plan_handle = None
+            plan_start = time.perf_counter()
             if async_distributed_plan and next_iteration <= opt_args.iterations:
                 next_distributed_plan_handle = _start_async_distributed_plan(
                     context=distributed_context,
@@ -1923,6 +1936,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     ),
                     curvature_camera_ids=next_curvature_camera_ids,
                 )
+                loop_plan_finalize_ms += (time.perf_counter() - plan_start) * 1000.0
             elif distributed_enabled and next_iteration <= opt_args.iterations:
                 preview_start_ns = time.perf_counter_ns()
                 with tide_range("tide.cpu.plan.preview.total"):
@@ -1990,6 +2004,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             # 2.3: Transfer camera matrices to GPU
             # ------------------------------------------------------------------------
             timers.start("send cam matrices to gpu")
+            camera_h2d_start = time.perf_counter()
             with tide_range("tide.gpu.transfer.h2d"), torch.no_grad():
                 with tide_range("tide.cpu.camera.h2d.submit"):
                     _prepare_camera_batch_on_gpu(batched_cameras, batch_indices)
@@ -1997,6 +2012,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                         curvature_cameras,
                         curvature_batch_indices,
                     )
+            loop_camera_h2d_ms += (time.perf_counter() - camera_h2d_start) * 1000.0
             timers.stop("send cam matrices to gpu")
             assert args.bsz > 1, "Pipelined offload requires batch size > 1"
             with tide_range("tide.batch.compute"):
@@ -2041,9 +2057,11 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             batched_cameras = [batched_cameras[i] for i in ordered_cams]
 
             timers.start("sync_loss_and_log")
+            loss_sync_start = time.perf_counter()
             with tide_range("tide.cpu.loss_sync"):
                 batched_losses = torch.stack(losses)
                 local_loss_cpu = batched_losses.cpu().numpy()
+            loop_loss_sync_ms += (time.perf_counter() - loss_sync_start) * 1000.0
             if distributed_enabled:
                 local_payload = {
                     "records": [
@@ -2056,8 +2074,10 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     ],
                     "sparsity": float(sparsity),
                 }
+                loss_gather_start = time.perf_counter()
                 with tide_range("tide.comm.loss.gather"):
                     rank_payloads = distributed_context.all_gather_object(local_payload)
+                loop_loss_gather_ms += (time.perf_counter() - loss_gather_start) * 1000.0
                 records = [
                     record
                     for payload in rank_payloads
@@ -2092,6 +2112,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 else 0.6 * ema_loss_for_log + 0.4 * batched_loss_cpu.mean()
             )
 
+            logging_start = time.perf_counter()
             with tide_range("tide.cpu.logging"):
                 if not distributed_enabled or distributed_context.is_rank0:
                     train_dataset.update_losses(batched_loss_cpu)
@@ -2106,11 +2127,13 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                         logged_image_names,
                     )
                 )
+            loop_logging_ms += (time.perf_counter() - logging_start) * 1000.0
             timers.stop("sync_loss_and_log")
 
             if distributed_enabled:
                 next_distributed_plan = None
                 if next_iteration <= opt_args.iterations:
+                    wait_start = time.perf_counter()
                     if next_distributed_plan_handle is not None:
                         async_result = next_distributed_plan_handle.wait()
                         next_distributed_prediction = async_result["plan"]
@@ -2137,6 +2160,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                             finalize_plan=getattr(args, "finalize_plan", False),
                         )
                     finalize_end_ns = time.perf_counter_ns()
+                    loop_plan_finalize_ms += (time.perf_counter() - wait_start) * 1000.0
                     if timeline_writer is not None:
                         timeline_writer.write_timeline_event(
                             name="finalize_plan",
@@ -2349,6 +2373,18 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 
             utils.memory_report("at the end of the iteration")
             log_file.flush()
+            # Consumed by the next batch row; attributes the outer-loop work to
+            # the batch whose data it prepared.
+            gaussians._tide_pending_loop_metrics = {
+                "iter_total_ms": (time.perf_counter() - iter_wall_start) * 1000.0,
+                "loop_schedule_ms": loop_schedule_ms,
+                "loop_camera_prefetch_ms": loop_camera_prefetch_ms,
+                "loop_plan_finalize_ms": loop_plan_finalize_ms,
+                "loop_camera_h2d_ms": loop_camera_h2d_ms,
+                "loop_loss_sync_ms": loop_loss_sync_ms,
+                "loop_loss_gather_ms": loop_loss_gather_ms,
+                "loop_logging_ms": loop_logging_ms,
+            }
 
     if optimizer_churn_tsv is not None and optimizer_churn_state['current_epoch'] is not None:
         _write_optimizer_churn_epoch(

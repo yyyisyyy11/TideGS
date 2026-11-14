@@ -1,5 +1,6 @@
 import math
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -209,7 +210,12 @@ class GPUResidentAdam:
             "persistent_state_warnings": 0,
             "state_owner_rank": -1,
             "owner_violations": 0,
+            "state_evict_d2h_ms": 0.0,
+            "state_admit_h2d_ms": 0.0,
+            "state_load_from_ssd_ms": 0.0,
+            "persistent_state_stats_ms": 0.0,
         }
+        self._state_timing_baseline = {}
 
     def enable_cpu_state_cache(self) -> None:
         """Keep evicted Adam state in CPU memory for an A/B quality experiment."""
@@ -465,7 +471,12 @@ class GPUResidentAdam:
             self._stats["persistent_state_blocks"] = cpu_blocks
             self._stats["persistent_state_bytes"] = cpu_bytes
             return
+        stats_start = time.perf_counter()
         store_stats = self._ssd_state_store.stats()
+        self._stats["persistent_state_stats_ms"] = (
+            float(self._stats.get("persistent_state_stats_ms", 0.0))
+            + (time.perf_counter() - stats_start) * 1000.0
+        )
         self._stats["persistent_state_blocks"] = cpu_blocks + int(store_stats["blocks"])
         self._stats["persistent_state_bytes"] = cpu_bytes + int(store_stats["bytes"])
         self._stats["persistent_state_index_writes"] = int(store_stats["index_writes"])
@@ -608,7 +619,12 @@ class GPUResidentAdam:
             slot = next_block_to_slot.pop(block_id)
             if next_slot_initialized[slot]:
                 if self._persistent_state_enabled:
+                    snapshot_start = time.perf_counter()
                     cached_state = self._snapshot_slot_state(block_id, slot)
+                    next_stats["state_evict_d2h_ms"] = (
+                        float(next_stats.get("state_evict_d2h_ms", 0.0))
+                        + (time.perf_counter() - snapshot_start) * 1000.0
+                    )
                     self._next_state_version(block_id)
                     previous_state = next_cpu_state_cache.get(block_id)
                     if previous_state is not None:
@@ -678,7 +694,12 @@ class GPUResidentAdam:
                         self.state_mode == "resident_ssd_cache"
                         and self._ssd_state_store is not None
                     ):
+                        load_start = time.perf_counter()
                         cached_state = self._ssd_state_store.load(block_id)
+                        next_stats["state_load_from_ssd_ms"] = (
+                            float(next_stats.get("state_load_from_ssd_ms", 0.0))
+                            + (time.perf_counter() - load_start) * 1000.0
+                        )
                         if cached_state is not None:
                             next_stats["persistent_state_ssd_hits"] += 1
                             previous_state = next_cpu_state_cache.get(block_id)
@@ -699,7 +720,12 @@ class GPUResidentAdam:
                     if cached_state is None:
                         next_stats["persistent_state_misses"] += 1
                         continue
+                    restore_start = time.perf_counter()
                     self._restore_slot_state(block_id, slot, cached_state)
+                    next_stats["state_admit_h2d_ms"] = (
+                        float(next_stats.get("state_admit_h2d_ms", 0.0))
+                        + (time.perf_counter() - restore_start) * 1000.0
+                    )
                     next_slot_steps[slot] = int(cached_state["step"])
                     next_slot_initialized[slot] = True
                     row_count = int(cached_state["row_count"])
@@ -1064,6 +1090,24 @@ class GPUResidentAdam:
         with self._state_lock:
             self._update_state_stats()
             return dict(self._stats)
+
+    def take_state_timing_deltas(self) -> Dict[str, float]:
+        """Per-step deltas of the state-path timers (no index walk)."""
+
+        keys = (
+            "state_evict_d2h_ms",
+            "state_admit_h2d_ms",
+            "state_load_from_ssd_ms",
+            "persistent_state_stats_ms",
+        )
+        with self._state_lock:
+            deltas = {}
+            for key in keys:
+                current = float(self._stats.get(key, 0.0))
+                previous = float(self._state_timing_baseline.get(key, 0.0))
+                deltas[key] = max(0.0, current - previous)
+                self._state_timing_baseline[key] = current
+            return deltas
 
 
 class GPUResidentSophiaTR(GPUResidentAdam):

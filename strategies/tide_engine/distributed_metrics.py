@@ -119,6 +119,24 @@ BATCH_FIELDS = [
     "bounds_sync_ms",
     "barrier_ms",
     "batch_total_ms",
+    # State-persistence and outer-loop instrumentation.  These are additive
+    # wall-clock columns; none of them changes the execution path.
+    "state_bind_ms",
+    "state_evict_d2h_ms",
+    "state_admit_h2d_ms",
+    "state_load_from_ssd_ms",
+    "persistent_state_stats_ms",
+    "rank_sync_ms",
+    "cache_stats_ms",
+    "metrics_emit_ms",
+    "iter_total_ms",
+    "loop_schedule_ms",
+    "loop_camera_prefetch_ms",
+    "loop_plan_finalize_ms",
+    "loop_camera_h2d_ms",
+    "loop_loss_sync_ms",
+    "loop_loss_gather_ms",
+    "loop_logging_ms",
     # Legacy single-rank pipeline details.  These are intentionally separate
     # from the common fields above: the N+1 planner is asynchronous and must
     # not be added to the foreground critical path.

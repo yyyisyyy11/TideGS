@@ -312,6 +312,17 @@ def _error_description(error: Optional[BaseException]) -> Optional[str]:
     return f"{type(error).__name__}: {error}"
 
 
+_BATCH_RANK_SYNC_MS = [0.0]
+
+
+def _take_batch_rank_sync_ms() -> float:
+    """Return and reset the blocking rank-sync time accumulated this batch."""
+
+    value = _BATCH_RANK_SYNC_MS[0]
+    _BATCH_RANK_SYNC_MS[0] = 0.0
+    return value
+
+
 def _synchronize_rank_errors(
     context: DistributedContext,
     *,
@@ -328,6 +339,7 @@ def _synchronize_rank_errors(
         "rank": int(context.rank),
         "error": _error_description(error),
     }
+    sync_start = time.perf_counter()
     if controller is not None:
         with controller.operation(phase):
             statuses = context.all_gather_object(payload, group=group)
@@ -335,6 +347,7 @@ def _synchronize_rank_errors(
         statuses = context.all_gather_object(payload)
     else:
         statuses = context.all_gather_object(payload, group=group)
+    _BATCH_RANK_SYNC_MS[0] += (time.perf_counter() - sync_start) * 1000.0
     failures = [
         f"rank={status.get('rank', index)} {status['error']}"
         for index, status in enumerate(statuses)
@@ -433,6 +446,7 @@ def _validate_distributed_batch_contract(
     except BaseException as error:
         local_error = error
 
+    contract_sync_start = time.perf_counter()
     statuses = context.all_gather_object(
         {
             "rank": int(context.rank),
@@ -440,6 +454,7 @@ def _validate_distributed_batch_contract(
             "contract": contract,
         }
     )
+    _BATCH_RANK_SYNC_MS[0] += (time.perf_counter() - contract_sync_start) * 1000.0
     failures = [
         f"rank={status.get('rank', index)} {status['error']}"
         for index, status in enumerate(statuses)
@@ -594,6 +609,7 @@ def train_distributed_tide_batch(
     args = gaussians.args
     iteration = int(plan.iteration)
     batch_start = time.perf_counter()
+    _BATCH_RANK_SYNC_MS[0] = 0.0
     metrics_writer = get_distributed_metrics_writer(gaussians, context)
     timeline_enabled = bool(metrics_writer.detailed_timeline_enabled)
     (
@@ -617,9 +633,13 @@ def train_distributed_tide_batch(
     cache = storage_adapter.cache
     setup_error = None
     resident_load_wait_ms = 0.0
+    state_bind_ms = 0.0
+    cache_stats_ms = 0.0
     try:
         cache.set_foreground_iteration(iteration)
+        cache_stats_start = time.perf_counter()
         cache_before = cache.get_stats()
+        cache_stats_ms += (time.perf_counter() - cache_stats_start) * 1000.0
         state = _resident_state(gaussians)
         target_resident = set(
             int(value) for value in plan.rank_resident_blocks[context.rank]
@@ -676,7 +696,11 @@ def train_distributed_tide_batch(
 
         with tide_range("tide.cpu.resident.active_leaves"):
             optimizer = get_gpu_resident_optimizer(gaussians, int(args.bsz))
+            resident_state_start = time.perf_counter()
             optimizer.set_resident_blocks(sorted(target_resident))
+            state_bind_ms = (
+                time.perf_counter() - resident_state_start
+            ) * 1000.0
             active_blocks = sorted(
                 target_resident.intersection(
                     plan.rank_union_active_blocks[context.rank]
@@ -1647,7 +1671,9 @@ def train_distributed_tide_batch(
         if h2d_events is not None
         else 0.0
     )
+    cache_stats_start = time.perf_counter()
     cache_after = cache.get_stats()
+    cache_stats_ms += (time.perf_counter() - cache_stats_start) * 1000.0
     # State-cache counters are collected only for detailed metrics.  Calling
     # ``get_stats`` walks the rank-local SSD index and must not become a hidden
     # per-batch cost in normal runs.
@@ -1767,6 +1793,7 @@ def train_distributed_tide_batch(
                     forward_ranges, loss_ranges, backward_ranges,
                 ) for entry in ranges] + [(optimizer_start, optimizer_end)],
             )
+    emit_start = time.perf_counter()
     if timeline_enabled:
         with tide_range("tide.cpu.metrics.timeline_emit"):
             anchor_event = None
@@ -1994,6 +2021,10 @@ def train_distributed_tide_batch(
                     bytes=int(retention_stats.get("h2d_bytes", 0)),
                     detail="h2d_plus_gpu_unpack",
                 )
+    metrics_emit_ms = (time.perf_counter() - emit_start) * 1000.0
+    optimizer_timing = optimizer.take_state_timing_deltas()
+    loop_metrics = getattr(gaussians, "_tide_pending_loop_metrics", None) or {}
+    gaussians._tide_pending_loop_metrics = {}
     metrics_row = {
         "iteration": iteration,
         "optimizer_algorithm": optimizer_algorithm,
@@ -2121,6 +2152,22 @@ def train_distributed_tide_batch(
         "bounds_sync_ms": bounds_sync_ms,
         "barrier_ms": barrier_ms,
         "batch_total_ms": (time.perf_counter() - batch_start) * 1000.0,
+        "state_bind_ms": state_bind_ms,
+        "state_evict_d2h_ms": optimizer_timing.get("state_evict_d2h_ms", 0.0),
+        "state_admit_h2d_ms": optimizer_timing.get("state_admit_h2d_ms", 0.0),
+        "state_load_from_ssd_ms": optimizer_timing.get("state_load_from_ssd_ms", 0.0),
+        "persistent_state_stats_ms": optimizer_timing.get("persistent_state_stats_ms", 0.0),
+        "rank_sync_ms": _take_batch_rank_sync_ms(),
+        "cache_stats_ms": cache_stats_ms,
+        "metrics_emit_ms": metrics_emit_ms,
+        "iter_total_ms": float(loop_metrics.get("iter_total_ms", 0.0)),
+        "loop_schedule_ms": float(loop_metrics.get("loop_schedule_ms", 0.0)),
+        "loop_camera_prefetch_ms": float(loop_metrics.get("loop_camera_prefetch_ms", 0.0)),
+        "loop_plan_finalize_ms": float(loop_metrics.get("loop_plan_finalize_ms", 0.0)),
+        "loop_camera_h2d_ms": float(loop_metrics.get("loop_camera_h2d_ms", 0.0)),
+        "loop_loss_sync_ms": float(loop_metrics.get("loop_loss_sync_ms", 0.0)),
+        "loop_loss_gather_ms": float(loop_metrics.get("loop_loss_gather_ms", 0.0)),
+        "loop_logging_ms": float(loop_metrics.get("loop_logging_ms", 0.0)),
     }
     with tide_range("tide.cpu.metrics.io_emit"):
         metrics_writer.write_io_events(cache.drain_io_events())
