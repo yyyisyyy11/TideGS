@@ -614,6 +614,21 @@ class StateExtentCacheTest(unittest.TestCase):
         self.assertTrue(torch.equal(result[0]["tensor"], attached))
         self.assertEqual(result[1]["step"], 9)
 
+    def test_state_prefetch_fills_payloads_from_storage(self):
+        self.cache.enable_state_prefetch(True)
+        self.storage.state_data[5] = {
+            "tensor": torch.full((2, 118), 5.0),
+            "row_count": 2,
+            "step": 13,
+            "version": 6,
+        }
+        self.cache._prefetch_states_for([5, 6])
+        payload = self.cache.peek_block_state(5)
+        self.assertIsNotNone(payload)
+        self.assertTrue(torch.equal(payload["tensor"], torch.full((2, 118), 5.0)))
+        self.assertEqual(payload["step"], 13)
+        self.assertIsNone(self.cache.peek_block_state(6))
+
 
 if __name__ == "__main__":
     unittest.main()

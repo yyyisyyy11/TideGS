@@ -90,6 +90,7 @@ class TieredCacheManager:
         # block is written back.  Values are (flat state tensor, step, version).
         self.state_payloads: Dict[int, Tuple[torch.Tensor, int, int]] = {}
         self.state_payloads_lock = threading.RLock()
+        self.state_prefetch_enabled = False
 
         # Async sync queue: (block_id, gpu_tensor, cuda_stream)
         # Producer-consumer queue for asynchronously syncing GPU updates back to RAM.
@@ -215,6 +216,41 @@ class TieredCacheManager:
                     f"[TieredCache] WARNING: state listener failed for block "
                     f"{int(block_id)}: {error}"
                 )
+
+    def enable_state_prefetch(self, enabled: bool = True) -> None:
+        """Prefetch paired state extents together with future Gaussian blocks."""
+        self.state_prefetch_enabled = bool(enabled)
+
+    def _prefetch_states_for(self, block_ids) -> None:
+        if not self.state_prefetch_enabled:
+            return
+        if not hasattr(self.storage, "read_block_states"):
+            return
+        missing = []
+        with self.state_payloads_lock:
+            for block_id in block_ids:
+                if int(block_id) not in self.state_payloads:
+                    missing.append(int(block_id))
+        if not missing:
+            return
+        try:
+            payloads = self.storage.read_block_states(missing)
+        except Exception as error:
+            print(f"[TieredCache] WARNING: state prefetch failed: {error}")
+            return
+        with self.state_payloads_lock:
+            for block_id, payload in payloads.items():
+                if int(block_id) in self.state_payloads:
+                    continue
+                tensor = payload["tensor"].detach().to("cpu").contiguous()
+                self.state_payloads[int(block_id)] = (
+                    tensor,
+                    int(payload.get("step", 0)),
+                    int(payload.get("version", 0)),
+                )
+        self.stats['state_prefetch_blocks'] = (
+            self.stats.get('state_prefetch_blocks', 0) + len(payloads)
+        )
 
     def attach_block_state(
         self,
@@ -990,6 +1026,8 @@ class TieredCacheManager:
             else:
                 origin_iteration, target_iteration, block_ids = None, None, item
             block_ids = [int(block_id) for block_id in block_ids]
+            with tide_range("tide.io.ssd.state.prefetch"):
+                self._prefetch_states_for(block_ids)
             dequeue_ns = (
                 time.perf_counter_ns() if self.timeline_enabled else None
             )

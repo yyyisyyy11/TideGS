@@ -251,6 +251,9 @@ class GPUResidentAdam:
         self.state_mode = "resident_ssd_cache"
         self._state_extent_enabled = True
         self._state_extent_cache = cache_manager
+        enable_prefetch = getattr(cache_manager, "enable_state_prefetch", None)
+        if callable(enable_prefetch):
+            enable_prefetch(True)
         self._stats["state_mode"] = self.state_mode
         self._stats["state_storage"] = "patch_extent"
 
@@ -821,6 +824,11 @@ class GPUResidentAdam:
                         )
                         next_stats["persistent_state_hits"] += 1
                         next_stats["persistent_state_restores"] += 1
+                        take_state = getattr(
+                            self._state_extent_cache, "take_block_state", None
+                        )
+                        if callable(take_state):
+                            take_state(int(block_id))
                         continue
                     cached_state = next_cpu_state_cache.get(block_id)
                     if cached_state is not None:

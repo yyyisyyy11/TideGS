@@ -32,6 +32,14 @@ class FakeExtentCache:
                     }
         return result
 
+    def take_block_state(self, block_id):
+        with self.state_payloads_lock:
+            entry = self.state_payloads.pop(int(block_id), None)
+        if entry is None:
+            return None
+        tensor, step, version = entry
+        return {"tensor": tensor, "step": int(step), "version": int(version)}
+
 
 class StateExtentOptimizerTest(unittest.TestCase):
     def setUp(self):
@@ -126,6 +134,8 @@ class StateExtentOptimizerTest(unittest.TestCase):
 
         self.optimizer.set_resident_blocks([0, 1])
         slot = self.optimizer._block_to_slot[0]
+        self.assertNotIn(0, self.cache.state_payloads)
+        self.assertNotIn(1, self.cache.state_payloads)
         for name, _, width, _ in self.optimizer.COMPONENT_SPECS:
             restored_avg = self.optimizer._exp_avg[name].view(
                 self.optimizer._allocated_slots, self.optimizer.block_size, width
