@@ -172,6 +172,8 @@ class GPUResidentAdam:
         self._bias_correction1: Optional[torch.Tensor] = None
         self._denom_scale: Optional[torch.Tensor] = None
         self._persistent_state_enabled = False
+        self._state_extent_enabled = False
+        self._state_extent_cache = None
         self._cpu_state_cache: Dict[int, Dict[str, Any]] = {}
         self._cpu_state_lru: "OrderedDict[int, None]" = OrderedDict()
         self._cpu_state_cache_bytes = 0
@@ -228,6 +230,82 @@ class GPUResidentAdam:
         self._persistent_state_enabled = True
         self.state_mode = "resident_cpu_cache"
         self._stats["state_mode"] = self.state_mode
+
+    def enable_state_extent(self, cache_manager) -> None:
+        """Persist Adam state as a second extent of the Gaussian block.
+
+        State follows the block through RAM and SSD: it is attached to the cache
+        entry on GPU eviction and written in the same patch as the block rows.
+        """
+        if self._resident_blocks:
+            raise RuntimeError(
+                "[GPUResidentAdam] State extent must be enabled before residency "
+                "is initialized"
+            )
+        if self._ssd_state_store is not None:
+            raise RuntimeError(
+                "[GPUResidentAdam] State extent cannot be combined with the legacy "
+                "SSD state store"
+            )
+        self._persistent_state_enabled = True
+        self.state_mode = "resident_ssd_cache"
+        self._state_extent_enabled = True
+        self._state_extent_cache = cache_manager
+        self._stats["state_mode"] = self.state_mode
+        self._stats["state_storage"] = "patch_extent"
+
+    def _snapshot_slot_flat(self, block_id: int, slot: int):
+        row_count = int(self._slot_row_counts[slot])
+        if row_count <= 0 or row_count > self.block_size:
+            raise RuntimeError(
+                f"[GPUResidentAdam] invalid state row count for block {block_id}: {row_count}"
+            )
+        avg_cols = torch.empty(
+            (row_count, self.TOTAL_WIDTH), dtype=torch.float32, device="cpu"
+        )
+        sq_cols = torch.empty(
+            (row_count, self.TOTAL_WIDTH), dtype=torch.float32, device="cpu"
+        )
+        offset = 0
+        for name, _, width, _ in self.COMPONENT_SPECS:
+            avg_view = self._exp_avg[name].view(
+                self._allocated_slots, self.block_size, width
+            )
+            sq_view = self._exp_avg_sq[name].view(
+                self._allocated_slots, self.block_size, width
+            )
+            avg_cols[:, offset:offset + width] = avg_view[slot, :row_count].detach().cpu()
+            sq_cols[:, offset:offset + width] = sq_view[slot, :row_count].detach().cpu()
+            offset += width
+        flat = torch.cat((avg_cols, sq_cols), dim=1).contiguous()
+        return flat, int(self._slot_steps[slot])
+
+    def _restore_slot_flat(self, block_id: int, slot: int, flat, row_count: int) -> None:
+        if not torch.is_tensor(flat):
+            flat = torch.as_tensor(flat, dtype=torch.float32)
+        expected = int(row_count) * self.TOTAL_WIDTH * 2
+        if flat.numel() != expected:
+            raise RuntimeError(
+                f"[GPUResidentAdam] state payload for block {block_id} has "
+                f"{flat.numel()} floats; expected {expected}"
+            )
+        flat = flat.reshape(int(row_count), self.TOTAL_WIDTH * 2)
+        offset = 0
+        for name, _, width, _ in self.COMPONENT_SPECS:
+            avg_view = self._exp_avg[name].view(
+                self._allocated_slots, self.block_size, width
+            )
+            sq_view = self._exp_avg_sq[name].view(
+                self._allocated_slots, self.block_size, width
+            )
+            avg_view[slot, :row_count].copy_(
+                flat[:, offset:offset + width], non_blocking=False
+            )
+            sq_view[slot, :row_count].copy_(
+                flat[:, self.TOTAL_WIDTH + offset:self.TOTAL_WIDTH + offset + width],
+                non_blocking=False,
+            )
+            offset += width
 
     def enable_ssd_state_cache(
         self,
@@ -343,6 +421,10 @@ class GPUResidentAdam:
 
     def _drop_cpu_state(self, block_id: int, *, writeback: bool) -> None:
         block_id = int(block_id)
+        if self._state_extent_enabled:
+            # State is attached to the cached Gaussian block and written with it;
+            # the legacy CPU/SSD state cache is not used in this mode.
+            return
         with self._state_lock:
             if writeback and self._ssd_state_store is None:
                 # A late cache callback after optimizer shutdown must not
@@ -465,6 +547,15 @@ class GPUResidentAdam:
             avg_sq_view[slot, :row_count].copy_(cached_avg_sq, non_blocking=False)
 
     def _update_persistent_state_stats(self) -> None:
+        if self._state_extent_enabled and self._state_extent_cache is not None:
+            with self._state_extent_cache.state_payloads_lock:
+                entries = list(self._state_extent_cache.state_payloads.values())
+            self._stats["persistent_state_blocks"] = len(entries)
+            self._stats["persistent_state_bytes"] = sum(
+                int(tensor.numel()) * int(tensor.element_size())
+                for tensor, _, _ in entries
+            )
+            return
         cpu_blocks = len(self._cpu_state_cache)
         cpu_bytes = int(self._cpu_state_cache_bytes)
         if self._ssd_state_store is None:
@@ -618,7 +709,26 @@ class GPUResidentAdam:
                 next_completed_streak_count += 1
             slot = next_block_to_slot.pop(block_id)
             if next_slot_initialized[slot]:
-                if self._persistent_state_enabled:
+                if (
+                    self._persistent_state_enabled
+                    and self._state_extent_enabled
+                    and self._state_extent_cache is not None
+                ):
+                    snapshot_start = time.perf_counter()
+                    flat_state, state_step = self._snapshot_slot_flat(block_id, slot)
+                    next_stats["state_evict_d2h_ms"] = (
+                        float(next_stats.get("state_evict_d2h_ms", 0.0))
+                        + (time.perf_counter() - snapshot_start) * 1000.0
+                    )
+                    self._next_state_version(block_id)
+                    self._state_extent_cache.attach_block_state(
+                        block_id,
+                        flat_state,
+                        step=state_step,
+                        state_version=None,
+                    )
+                    next_stats["persistent_state_saves"] += 1
+                elif self._persistent_state_enabled:
                     snapshot_start = time.perf_counter()
                     cached_state = self._snapshot_slot_state(block_id, slot)
                     next_stats["state_evict_d2h_ms"] = (
@@ -685,6 +795,33 @@ class GPUResidentAdam:
             if self._persistent_state_enabled:
                 for block_id in sorted(incoming):
                     slot = next_block_to_slot[block_id]
+                    if self._state_extent_enabled and self._state_extent_cache is not None:
+                        payload = self._state_extent_cache.state_prefetch([int(block_id)]).get(
+                            int(block_id)
+                        )
+                        if payload is None:
+                            next_stats["persistent_state_misses"] += 1
+                            continue
+                        restore_start = time.perf_counter()
+                        flat_state = payload["tensor"]
+                        row_count = int(
+                            payload.get("row_count", flat_state.shape[0])
+                        )
+                        self._restore_slot_flat(block_id, slot, flat_state, row_count)
+                        next_stats["state_admit_h2d_ms"] = (
+                            float(next_stats.get("state_admit_h2d_ms", 0.0))
+                            + (time.perf_counter() - restore_start) * 1000.0
+                        )
+                        next_slot_steps[slot] = int(payload.get("step", 0))
+                        next_slot_initialized[slot] = True
+                        next_slot_row_counts[slot] = row_count
+                        next_logical_state_blocks += 1
+                        next_logical_state_bytes += (
+                            row_count * self._logical_state_bytes_per_row()
+                        )
+                        next_stats["persistent_state_hits"] += 1
+                        next_stats["persistent_state_restores"] += 1
+                        continue
                     cached_state = next_cpu_state_cache.get(block_id)
                     if cached_state is not None:
                         next_cpu_state_lru.pop(block_id, None)

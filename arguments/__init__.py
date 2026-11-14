@@ -219,6 +219,7 @@ class AuxiliaryParams(ParamGroup):
         self.paper_balanced_seed_fraction = 0.25  # topc_balanced camera-seed capacity fraction
         self.paper_resident_capacity_blocks = 2048  # Global cap in distributed mode
         self.paper_optimizer_state_mode = "full_cpu"  # {full_cpu, resident_blocks, resident_cpu_cache, resident_ssd_cache}; optimizer-state placement
+        self.paper_optimizer_state_extent = True  # resident_ssd_cache: store Adam state as a paired patch extent
         self.paper_optimizer_backend = "cpu"  # {cpu, gpu_resident}; optimizer update backend
         self.paper_optimizer_algorithm = "adam"  # {adam, 3dgs2_tr}; Adam remains the default
         self.paper_sophia_beta1 = 0.9
@@ -503,6 +504,7 @@ def _apply_tide_aliases(args):
         ("tide_balanced_seed_fraction", "paper_balanced_seed_fraction"),
         ("tide_resident_capacity_blocks", "paper_resident_capacity_blocks"),
         ("tide_optimizer_state_mode", "paper_optimizer_state_mode"),
+        ("tide_optimizer_state_extent", "paper_optimizer_state_extent"),
         ("tide_optimizer_backend", "paper_optimizer_backend"),
         ("tide_optimizer_algorithm", "paper_optimizer_algorithm"),
         ("optimizer", "paper_optimizer_algorithm"),

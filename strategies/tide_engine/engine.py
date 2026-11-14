@@ -86,24 +86,31 @@ def get_gpu_resident_optimizer(gaussians, batch_size):
         if state_mode == "resident_cpu_cache":
             resident_optimizer.enable_cpu_state_cache()
         elif state_mode == "resident_ssd_cache":
-            state_dir = getattr(gaussians, "_paper_optimizer_state_dir", None)
-            if not state_dir:
-                raise RuntimeError(
-                    "resident_ssd_cache requires gaussians._paper_optimizer_state_dir"
-                )
-            resident_optimizer.enable_ssd_state_cache(
-                state_dir,
-                resume_manifest=getattr(
-                    gaussians,
-                    "_paper_optimizer_state_resume_manifest",
-                    None,
-                ),
-                allow_cold_start=True,
-            )
             block_reader = getattr(gaussians, "_block_reader", None)
             cache_manager = getattr(block_reader, "_cache", None)
-            if cache_manager is not None:
-                resident_optimizer.bind_gaussian_cache(cache_manager)
+            optimizer_args = getattr(gaussians, "args", None)
+            use_extent = bool(
+                getattr(optimizer_args, "paper_optimizer_state_extent", True)
+            )
+            if use_extent and cache_manager is not None:
+                resident_optimizer.enable_state_extent(cache_manager)
+            else:
+                state_dir = getattr(gaussians, "_paper_optimizer_state_dir", None)
+                if not state_dir:
+                    raise RuntimeError(
+                        "resident_ssd_cache requires gaussians._paper_optimizer_state_dir"
+                    )
+                resident_optimizer.enable_ssd_state_cache(
+                    state_dir,
+                    resume_manifest=getattr(
+                        gaussians,
+                        "_paper_optimizer_state_resume_manifest",
+                        None,
+                    ),
+                    allow_cold_start=True,
+                )
+                if cache_manager is not None:
+                    resident_optimizer.bind_gaussian_cache(cache_manager)
         distributed_context = getattr(getattr(gaussians, "args", None), "_tide_distributed_context", None)
         owner = getattr(getattr(gaussians, "args", None), "_tide_block_owner", None)
         if (

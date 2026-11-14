@@ -188,6 +188,19 @@ def _flush_gpu_resident_dirty(storage_adapter) -> None:
 
 def _export_optimizer_state(gaussians, checkpoint_dir: Path, log_file=None):
     optimizer = getattr(gaussians, "_paper_gpu_resident_optimizer", None)
+    if getattr(optimizer, "_state_extent_enabled", False):
+        _log(
+            "[PURE SSD CHECKPOINT] Optimizer state is stored as paired patch "
+            "extents; skipping the legacy state export",
+            log_file,
+        )
+        return {
+            "optimizer_state_mode": "resident_ssd_cache",
+            "optimizer_state_saved": True,
+            "adam_moments_saved": True,
+            "optimizer_state_format_version": 3,
+            "state_storage": "in_patch",
+        }
     export = getattr(optimizer, "export_persistent_state", None)
     if not callable(export):
         return None
@@ -226,6 +239,8 @@ def _optimizer_state_checkpoint_fields(
             optimizer_state_manifest.get("optimizer_state_format_version", 2)
         ),
     }
+    if optimizer_state_manifest.get("state_storage"):
+        fields["state_storage"] = str(optimizer_state_manifest["state_storage"])
     manifest_path = optimizer_state_manifest.get(
         "optimizer_state_manifest",
         optimizer_state_manifest.get("manifest"),

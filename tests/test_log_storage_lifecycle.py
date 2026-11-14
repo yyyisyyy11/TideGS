@@ -386,6 +386,85 @@ class LogStorageLifecycleTest(unittest.TestCase):
         self.assertIn("num_patches", stats)
         self.assertTrue(torch.equal(self.storage.read_blocks([0])[0], self.block(20)))
 
+    @staticmethod
+    def state_block(value, step):
+        return (torch.full((2, 118), float(value), dtype=torch.float32), int(step))
+
+    def test_state_extent_round_trip_and_compaction(self):
+        self.storage.write_patch(
+            {0: self.block(10)}, block_states={0: self.state_block(1.0, 7)}
+        )
+        self.storage.write_patch(
+            {1: self.block(11)}, block_states={1: self.state_block(2.0, 8)}
+        )
+        location = self.storage.index[0]
+        self.assertIsNotNone(location.state)
+        self.assertEqual(location.state.size, 2 * 118 * 4)
+        self.assertEqual(location.state.step, 7)
+
+        states = self.storage.read_block_states([0, 1, 2])
+        self.assertEqual(set(states), {0, 1})
+        self.assertTrue(torch.equal(states[0]["tensor"], torch.full((2, 118), 1.0)))
+        self.assertEqual(states[0]["step"], 7)
+        self.assertEqual(states[1]["version"], self.storage.index[1].version)
+
+        versions = {block_id: loc.version for block_id, loc in self.storage.index.items()}
+        self.assertTrue(self.storage.compact_patches(force=True))
+        compacted = self.storage.read_block_states([0, 1])
+        self.assertTrue(torch.equal(compacted[0]["tensor"], torch.full((2, 118), 1.0)))
+        self.assertEqual(compacted[1]["step"], 8)
+        self.assertEqual(
+            {block_id: loc.version for block_id, loc in self.storage.index.items()},
+            versions,
+        )
+
+    def test_state_extent_requires_matching_rows_and_width(self):
+        with self.assertRaises(ValueError):
+            self.storage.write_patch(
+                {0: self.block(1)},
+                block_states={0: (torch.zeros((3, 118)), 1)},
+            )
+        with self.assertRaises(ValueError):
+            self.storage.write_patch(
+                {0: self.block(1)},
+                block_states={0: (torch.zeros((2, 117)), 1)},
+            )
+        with self.assertRaises(ValueError):
+            self.storage.write_patch(
+                {0: self.block(1)},
+                block_states={1: (torch.zeros((2, 118)), 1)},
+            )
+
+    def test_state_extent_index_manifest_round_trip(self):
+        self.storage.write_patch(
+            {0: self.block(10)}, block_states={0: self.state_block(3.0, 11)}
+        )
+        manifest_path = self.root / "delta" / "storage_index.json"
+        patches_dir = self.root / "delta" / "patches"
+        manifest = self.storage.export_index_manifest(manifest_path, patches_dir)
+        self.assertEqual(manifest["version"], 2)
+        self.assertEqual(manifest["state_extent"], "paired_v1")
+        self.assertIn("state", manifest["index"]["0"])
+        self.assertEqual(manifest["state_bytes"], 2 * 118 * 4)
+
+        reloaded = LogStorageManager(
+            storage_dir=str(self.storage_dir),
+            block_size=2,
+            num_blocks=4,
+            point_dim=3,
+            verbose=False,
+            max_patch_files=32,
+            max_patch_gb=0,
+            idle_compaction_seconds=0,
+        )
+        try:
+            reloaded.load_index_manifest(manifest_path)
+            states = reloaded.read_block_states([0])
+            self.assertTrue(torch.equal(states[0]["tensor"], torch.full((2, 118), 3.0)))
+            self.assertEqual(states[0]["step"], 11)
+        finally:
+            reloaded.close()
+
     def test_checkpoint_retention_keeps_newest_numeric_directories(self):
         model_path = self.root / "model"
         for iteration in (100, 200, 300):

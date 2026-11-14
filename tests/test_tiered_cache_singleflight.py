@@ -551,5 +551,69 @@ class TieredCacheSingleFlightTest(unittest.TestCase):
         self.assertGreaterEqual(stats["inflight_fallback_blocks"], 1)
 
 
+class RecordingStateStorage(FakeStorage):
+    def __init__(self, block_size=2, point_dim=3):
+        super().__init__(block_size=block_size, point_dim=point_dim)
+        self.written_states = {}
+        self.state_data = {}
+
+    def write_patch(self, dirty_blocks, block_versions=None, block_states=None):
+        with self.lock:
+            if block_states:
+                self.written_states.update(
+                    {int(k): (v[0].clone(), int(v[1])) for k, v in block_states.items()}
+                )
+        return 1
+
+    def read_block_states(self, block_ids):
+        return {
+            int(block_id): dict(self.state_data[int(block_id)])
+            for block_id in block_ids
+            if int(block_id) in self.state_data
+        }
+
+
+class StateExtentCacheTest(unittest.TestCase):
+    def setUp(self):
+        self.storage = RecordingStateStorage()
+        self.cache = TieredCacheManager(
+            self.storage, max_ram_gb=1, block_size=2, point_dim=3, verbose=False
+        )
+
+    def tearDown(self):
+        shutdown = getattr(self.cache, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
+
+    def test_attach_state_flushes_with_block_and_pairs_version(self):
+        state = torch.full((2, 118), 7.0)
+        with self.cache.cache_lock:
+            self.cache._store_cache_block_locked(0, torch.full((2, 3), 1.0))
+            self.cache.block_versions[0] = 1
+            self.cache.dirty_set.add(0)
+        self.cache.attach_block_state(0, state, step=5)
+        self.cache._flush_dirty_blocks(
+            {0: torch.full((2, 3), 2.0)}, block_versions={0: 2}, mode="sync"
+        )
+        self.assertIn(0, self.storage.written_states)
+        written, step = self.storage.written_states[0]
+        self.assertTrue(torch.equal(written, state))
+        self.assertEqual(step, 5)
+        self.assertIsNone(self.cache.peek_block_state(0))
+
+    def test_state_prefetch_prefers_attached_then_storage(self):
+        attached = torch.full((2, 118), 1.0)
+        self.cache.attach_block_state(0, attached, step=2)
+        self.storage.state_data[1] = {
+            "tensor": torch.full((2, 118), 3.0),
+            "row_count": 2,
+            "step": 9,
+            "version": 4,
+        }
+        result = self.cache.state_prefetch([0, 1])
+        self.assertTrue(torch.equal(result[0]["tensor"], attached))
+        self.assertEqual(result[1]["step"], 9)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -86,6 +86,11 @@ class TieredCacheManager:
         self.flushing_buffer: Dict[int, Tuple[torch.Tensor, float, int]] = {}
         self.flushing_lock = threading.RLock()
 
+        # Paired optimizer-state payloads kept with the Gaussian block until the
+        # block is written back.  Values are (flat state tensor, step, version).
+        self.state_payloads: Dict[int, Tuple[torch.Tensor, int, int]] = {}
+        self.state_payloads_lock = threading.RLock()
+
         # Async sync queue: (block_id, gpu_tensor, cuda_stream)
         # Producer-consumer queue for asynchronously syncing GPU updates back to RAM.
         # Queue elements: (block_id, gpu_tensor, cuda_stream).
@@ -210,6 +215,93 @@ class TieredCacheManager:
                     f"[TieredCache] WARNING: state listener failed for block "
                     f"{int(block_id)}: {error}"
                 )
+
+    def attach_block_state(
+        self,
+        block_id: int,
+        payload,
+        *,
+        step: int = 0,
+        state_version: Optional[int] = None,
+    ) -> None:
+        """Attach a flat optimizer-state payload to a cached Gaussian block.
+
+        The payload is written to the same patch as the block on the next flush,
+        so state and parameters share one index version.
+        """
+        if payload is None:
+            return
+        if torch.is_tensor(payload):
+            tensor = payload.detach().to("cpu").contiguous()
+        else:
+            tensor = torch.as_tensor(payload, dtype=torch.float32).contiguous()
+        with self.state_payloads_lock:
+            version = (
+                int(state_version)
+                if state_version is not None
+                else int(self.block_versions.get(int(block_id), 0))
+            )
+            self.state_payloads[int(block_id)] = (tensor, int(step), version)
+
+    def take_block_state(self, block_id: int):
+        """Remove and return the attached state payload for a block, if any."""
+        with self.state_payloads_lock:
+            entry = self.state_payloads.pop(int(block_id), None)
+        if entry is None:
+            return None
+        tensor, step, version = entry
+        return {"tensor": tensor, "step": int(step), "version": int(version)}
+
+    def peek_block_state(self, block_id: int):
+        with self.state_payloads_lock:
+            entry = self.state_payloads.get(int(block_id))
+        if entry is None:
+            return None
+        tensor, step, version = entry
+        return {"tensor": tensor, "step": int(step), "version": int(version)}
+
+    def state_prefetch(self, block_ids, *, allow_storage: bool = True) -> Dict[int, Dict]:
+        """Return attached or on-disk optimizer state for the requested blocks."""
+        result: Dict[int, Dict] = {}
+        with self.state_payloads_lock:
+            for block_id in block_ids:
+                entry = self.state_payloads.get(int(block_id))
+                if entry is not None:
+                    tensor, step, version = entry
+                    result[int(block_id)] = {
+                        "tensor": tensor,
+                        "step": int(step),
+                        "version": int(version),
+                    }
+        missing = [int(b) for b in block_ids if int(b) not in result]
+        if allow_storage and missing and hasattr(self.storage, "read_block_states"):
+            for block_id, payload in self.storage.read_block_states(missing).items():
+                result[int(block_id)] = payload
+        return result
+
+    def _state_payloads_for_flush(self, block_ids, block_versions) -> Dict[int, Tuple[torch.Tensor, int]]:
+        payloads: Dict[int, Tuple[torch.Tensor, int]] = {}
+        with self.state_payloads_lock:
+            for block_id in block_ids:
+                entry = self.state_payloads.get(int(block_id))
+                if entry is None:
+                    continue
+                tensor, step, version = entry
+                flush_version = block_versions.get(int(block_id))
+                if flush_version is None or int(version) <= int(flush_version):
+                    payloads[int(block_id)] = (tensor, int(step))
+        return payloads
+
+    def _forget_flushed_states(self, block_ids, block_versions) -> None:
+        with self.state_payloads_lock:
+            for block_id in block_ids:
+                entry = self.state_payloads.get(int(block_id))
+                if entry is None:
+                    continue
+                _, _, version = entry
+                flush_version = block_versions.get(int(block_id))
+                if flush_version is not None and int(version) <= int(flush_version):
+                    self.state_payloads.pop(int(block_id), None)
 
     def set_foreground_iteration(self, iteration: Optional[int]) -> None:
         self._foreground_iteration = (
@@ -693,6 +785,7 @@ class TieredCacheManager:
             return
 
         block_versions = block_versions or {}
+        state_payloads = self._state_payloads_for_flush(dirty_blocks.keys(), block_versions)
         bytes_written = sum(
             int(tensor.numel()) * int(tensor.element_size())
             for tensor in dirty_blocks.values()
@@ -700,11 +793,13 @@ class TieredCacheManager:
         t0 = time.time()
         try:
             with tide_range("tide.io.ssd.write.service"):
-                self.storage.write_patch(
-                    dirty_blocks,
-                    block_versions=block_versions or None,
-                )
+                write_kwargs = {"block_versions": block_versions or None}
+                if state_payloads:
+                    write_kwargs["block_states"] = state_payloads
+                self.storage.write_patch(dirty_blocks, **write_kwargs)
             elapsed = time.time() - t0
+            if state_payloads:
+                self._forget_flushed_states(dirty_blocks.keys(), block_versions)
 
             completed_state_notifications = []
             with self.flushing_lock:
@@ -1512,13 +1607,21 @@ class TieredCacheManager:
                 victims.append(block_id)
                 resident_bytes -= self._tensor_nbytes(tensor)
 
-                # Check if dirty
-                if block_id in self.dirty_set:
+                # Check if dirty (a block carrying an attached state payload
+                # must also be written so the pair stays in one patch).
+                with self.state_payloads_lock:
+                    has_state = block_id in self.state_payloads
+                if block_id in self.dirty_set or has_state:
                     if not self._is_valid_block_tensor(block_id, tensor, 'evict_and_flush'):
                         self.dirty_set.discard(block_id)
                         continue
                     dirty_victims[block_id] = tensor
-                    dirty_versions[block_id] = self.block_versions.get(block_id, 0)
+                    version = int(self.block_versions.get(block_id, 0))
+                    if block_id not in self.dirty_set:
+                        version += 1
+                        self.block_versions[block_id] = version
+                        self.dirty_set.add(block_id)
+                    dirty_versions[block_id] = version
                     if block_id in self.block_origin_iterations:
                         dirty_origins[block_id] = int(
                             self.block_origin_iterations[block_id]

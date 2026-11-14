@@ -20,13 +20,30 @@ import numpy as np
 import torch
 
 
+@dataclass(frozen=True)
+class StateExtent:
+    """Location of an optimizer-state payload stored next to a Gaussian block."""
+
+    file_id: int
+    offset: int
+    size: int
+    row_count: int
+    step: int
+
+
 @dataclass
 class BlockLocation:
     """Metadata for locating a block in storage."""
+
     file_id: int  # 0 = base_file, 1+ = patch files
     offset: int   # Byte offset in the file
-    size: int     # Size in bytes
+    size: int     # Size in bytes (Gaussian rows only)
     version: int  # Version number for tracking updates
+    state: Optional["StateExtent"] = None  # Paired optimizer-state extent, if persisted
+
+
+# exp_avg(59) + exp_avg_sq(59) floats per row, fixed component order.
+STATE_PARAM_DIM = 118
 
 
 class _ReaderPriorityRWLock:
@@ -386,6 +403,65 @@ class LogStorageManager:
 
         return (result, versions) if return_versions else result
 
+    def read_block_states(self, block_ids: List[int]) -> Dict[int, Dict[str, object]]:
+        """Read paired optimizer-state extents for the given blocks.
+
+        Blocks without a persisted state extent are omitted, which callers must
+        treat as a cold start.
+        """
+        self._note_foreground_read()
+        with self._storage_operation():
+            return self._read_block_states_uncoordinated(block_ids)
+
+    def _read_block_states_uncoordinated(
+        self,
+        block_ids: List[int],
+    ) -> Dict[int, Dict[str, object]]:
+        if not block_ids:
+            return {}
+        result: Dict[int, Dict[str, object]] = {}
+        with self.index_lock:
+            selected = {
+                int(block_id): self.index[int(block_id)]
+                for block_id in block_ids
+                if int(block_id) in self.index
+            }
+        groups: Dict[int, List[Tuple[int, StateExtent]]] = {}
+        for block_id, location in selected.items():
+            if location.state is None:
+                continue
+            groups.setdefault(int(location.state.file_id), []).append(
+                (block_id, location.state)
+            )
+        for file_id, entries in groups.items():
+            file_path = self.file_paths[file_id]
+            entries.sort(key=lambda item: item[1].offset)
+            with open(file_path, "rb") as handle:
+                for block_id, extent in entries:
+                    handle.seek(extent.offset)
+                    data = handle.read(extent.size)
+                    if len(data) != int(extent.size):
+                        raise RuntimeError(
+                            f"Short state read for block {block_id}: "
+                            f"{len(data)} of {extent.size} bytes from {file_path}"
+                        )
+                    array = np.frombuffer(data, dtype=np.float32).copy()
+                    expected = int(extent.row_count) * STATE_PARAM_DIM
+                    if array.size != expected:
+                        raise ValueError(
+                            f"State extent for block {block_id} has {array.size} floats; "
+                            f"expected {expected}"
+                        )
+                    result[block_id] = {
+                        "tensor": torch.from_numpy(array).reshape(
+                            int(extent.row_count), STATE_PARAM_DIM
+                        ),
+                        "row_count": int(extent.row_count),
+                        "step": int(extent.step),
+                        "version": int(selected[block_id].version),
+                    }
+        return result
+
     def _read_base_block(self, block_id: int) -> torch.Tensor:
         """Read a block directly from the immutable base segment."""
         base_path = self.file_paths[0]
@@ -403,11 +479,13 @@ class LogStorageManager:
         self,
         block_dict: Dict[int, torch.Tensor],
         block_versions: Optional[Dict[int, int]] = None,
+        block_states: Optional[Dict[int, Tuple[torch.Tensor, int]]] = None,
     ) -> int:
         if not block_dict:
             return -1
         with self._write_lock:
             selected = dict(block_dict)
+            selected_states = dict(block_states) if block_states else None
             selected_versions = None
             if block_versions is not None:
                 missing_versions = sorted(
@@ -431,12 +509,19 @@ class LogStorageManager:
                     block_id: int(block_versions[block_id])
                     for block_id in selected
                 }
+                if selected_states is not None:
+                    selected_states = {
+                        block_id: payload
+                        for block_id, payload in selected_states.items()
+                        if int(block_id) in selected
+                    }
             if not selected:
                 return -1
             with self._storage_operation():
                 patch_id = self._write_patch_uncoordinated(
                     selected,
                     block_versions=selected_versions,
+                    block_states=selected_states,
                 )
             self._request_idle_compaction()
             return patch_id
@@ -445,12 +530,16 @@ class LogStorageManager:
         self,
         block_dict: Dict[int, torch.Tensor],
         block_versions: Optional[Dict[int, int]] = None,
+        block_states: Optional[Dict[int, Tuple[torch.Tensor, int]]] = None,
     ) -> int:
         """
         Write updated blocks to a new patch file (append-only).
 
         Args:
             block_dict: Dictionary mapping block_id -> updated tensor data
+            block_states: Optional mapping block_id -> (flat state tensor, step).
+                State payloads are appended after all Gaussian rows in the same
+                patch file and committed by the same index update.
 
         Returns:
             patch_id: ID of the created patch file
@@ -479,6 +568,35 @@ class LogStorageManager:
             print("[LogStorage] Skipped patch creation: no non-empty dirty blocks")
             return -1
 
+        valid_states: Dict[int, Tuple[torch.Tensor, int]] = {}
+        for raw_block_id, payload in (block_states or {}).items():
+            block_id = int(raw_block_id)
+            if block_id not in valid_blocks:
+                raise ValueError(
+                    f"State payload for block {block_id} has no matching Gaussian rows"
+                )
+            if not isinstance(payload, (tuple, list)) or len(payload) != 2:
+                raise ValueError(
+                    f"State payload for block {block_id} must be (tensor, step)"
+                )
+            tensor, step = payload
+            if tensor is None:
+                continue
+            if tensor.is_cuda:
+                tensor = tensor.cpu()
+            tensor = tensor.contiguous()
+            if tensor.dim() != 2 or tensor.shape[1] != STATE_PARAM_DIM:
+                raise ValueError(
+                    f"Invalid state payload for block {block_id} shape "
+                    f"{tuple(tensor.shape)}; expected (*, {STATE_PARAM_DIM})"
+                )
+            if int(tensor.shape[0]) != int(valid_blocks[block_id].shape[0]):
+                raise ValueError(
+                    f"State rows for block {block_id} do not match Gaussian rows: "
+                    f"{int(tensor.shape[0])} vs {int(valid_blocks[block_id].shape[0])}"
+                )
+            valid_states[block_id] = (tensor, int(step))
+
         # Allocate new patch file ID
         with self.patch_counter_lock:
             patch_id = self.next_patch_id
@@ -487,9 +605,9 @@ class LogStorageManager:
         # Create patch file
         timestamp = int(time.time() * 1000000)
         patch_file = self.storage_dir / f"patch_{patch_id:06d}_{timestamp}.bin"
-        # Write blocks sequentially
+        # Write Gaussian rows first, then state payloads, into one file.
         current_offset = 0
-        updated_locations = {}
+        placements: Dict[int, Dict[str, object]] = {}
 
         try:
             with open(patch_file, 'wb') as f:
@@ -509,11 +627,23 @@ class LogStorageManager:
                         if block_versions is not None
                         else int(old_version) + 1
                     )
-                    updated_locations[block_id] = BlockLocation(
+                    placements[block_id] = {
+                        "offset": current_offset,
+                        "size": len(data_bytes),
+                        "version": new_version,
+                    }
+                    current_offset += len(data_bytes)
+
+                for block_id in sorted(valid_states.keys()):
+                    tensor, step = valid_states[block_id]
+                    data_bytes = tensor.numpy().astype(np.float32, copy=False).tobytes()
+                    f.write(data_bytes)
+                    placements[block_id]["state"] = StateExtent(
                         file_id=patch_id,
                         offset=current_offset,
                         size=len(data_bytes),
-                        version=new_version,
+                        row_count=int(tensor.shape[0]),
+                        step=int(step),
                     )
                     current_offset += len(data_bytes)
                 f.flush()
@@ -521,6 +651,17 @@ class LogStorageManager:
         except Exception:
             patch_file.unlink(missing_ok=True)
             raise
+
+        updated_locations = {
+            block_id: BlockLocation(
+                file_id=patch_id,
+                offset=int(record["offset"]),
+                size=int(record["size"]),
+                version=int(record["version"]),
+                state=record.get("state"),
+            )
+            for block_id, record in placements.items()
+        }
 
         # Update index atomically
         # Update the in-memory index only after the complete file is durable, so readers never see a partial file.
@@ -647,18 +788,36 @@ class LogStorageManager:
                 "size": size,
             }
 
-        index_payload = {
-            str(block_id): {
+        def _index_entry(location: BlockLocation) -> Dict:
+            entry = {
                 "file_id": int(location.file_id),
                 "offset": int(location.offset),
                 "size": int(location.size),
                 "version": int(location.version),
             }
+            if location.state is not None:
+                entry["state"] = {
+                    "file_id": int(location.state.file_id),
+                    "offset": int(location.state.offset),
+                    "size": int(location.state.size),
+                    "row_count": int(location.state.row_count),
+                    "step": int(location.state.step),
+                }
+            return entry
+
+        index_payload = {
+            str(block_id): _index_entry(location)
             for block_id, location in sorted(index_snapshot.items())
         }
+        live_state_bytes = sum(
+            int(location.state.size)
+            for location in index_snapshot.values()
+            if location.state is not None
+        )
         manifest = {
-            "version": 1,
+            "version": 2,
             "storage_type": "log_structured_blocks",
+            "state_extent": "paired_v1",
             "block_size": int(self.block_size),
             "num_blocks": int(self.num_blocks),
             "point_dim": int(self.point_dim),
@@ -667,6 +826,7 @@ class LogStorageManager:
             "next_patch_id": int(next_patch_id),
             "files": files,
             "index": index_payload,
+            "state_bytes": int(live_state_bytes),
             "patch_file_mode": patch_file_mode,
             "patch_files": int(patch_files),
             "patch_bytes": int(patch_bytes),
@@ -702,13 +862,26 @@ class LogStorageManager:
                 f"Index point_dim mismatch: manifest={manifest.get('point_dim')} runtime={self.point_dim}"
             )
 
+        index_version = int(manifest.get("version", 1))
+        if index_version not in {1, 2}:
+            raise ValueError(
+                f"Unsupported storage index version: {index_version}; expected 1 or 2"
+            )
+        if index_version >= 2 and manifest.get("state_extent") != "paired_v1":
+            raise ValueError(
+                "Storage index declares state extents with unsupported layout "
+                f"{manifest.get('state_extent')!r}"
+            )
+
         loaded_file_paths: Dict[int, Path] = {}
+        loaded_file_sizes: Dict[int, int] = {}
         for file_id_raw, file_info in manifest.get("files", {}).items():
             file_id = int(file_id_raw)
             path = Path(file_info["path"])
             if not path.exists():
                 raise FileNotFoundError(f"Index file_id={file_id} path does not exist: {path}")
             loaded_file_paths[file_id] = path
+            loaded_file_sizes[file_id] = int(path.stat().st_size)
 
         loaded_index: Dict[int, BlockLocation] = {}
         for block_id_raw, location in manifest.get("index", {}).items():
@@ -716,11 +889,45 @@ class LogStorageManager:
             file_id = int(location["file_id"])
             if file_id not in loaded_file_paths:
                 raise KeyError(f"Block {block_id} references missing file_id={file_id}")
+            state_payload = location.get("state")
+            state_extent = None
+            if state_payload is not None:
+                if index_version < 2:
+                    raise ValueError(
+                        f"Block {block_id} has a state extent in a version-1 index"
+                    )
+                state_file_id = int(state_payload["file_id"])
+                if state_file_id not in loaded_file_paths:
+                    raise KeyError(
+                        f"Block {block_id} state references missing file_id={state_file_id}"
+                    )
+                row_count = int(state_payload["row_count"])
+                state_size = int(state_payload["size"])
+                state_offset = int(state_payload["offset"])
+                if row_count <= 0 or state_size <= 0:
+                    raise ValueError(f"Block {block_id} has an empty state extent")
+                if state_size != row_count * STATE_PARAM_DIM * 4:
+                    raise ValueError(
+                        f"Block {block_id} state extent size {state_size} does not match "
+                        f"row_count {row_count} x {STATE_PARAM_DIM} float32"
+                    )
+                if state_offset < 0 or state_offset + state_size > loaded_file_sizes[state_file_id]:
+                    raise ValueError(
+                        f"Block {block_id} state extent exceeds file_id={state_file_id}"
+                    )
+                state_extent = StateExtent(
+                    file_id=state_file_id,
+                    offset=state_offset,
+                    size=state_size,
+                    row_count=row_count,
+                    step=int(state_payload.get("step", 0)),
+                )
             loaded_index[block_id] = BlockLocation(
                 file_id=file_id,
                 offset=int(location["offset"]),
                 size=int(location["size"]),
                 version=int(location["version"]),
+                state=state_extent,
             )
 
         if len(loaded_index) != int(self.num_blocks):
@@ -758,7 +965,11 @@ class LogStorageManager:
             for block_id, location in index_snapshot.items()
             if int(location.file_id) != 0
         )
-        live_bytes = sum(int(index_snapshot[block_id].size) for block_id in live_block_ids)
+        live_bytes = sum(
+            int(index_snapshot[block_id].size)
+            + (int(index_snapshot[block_id].state.size) if index_snapshot[block_id].state else 0)
+            for block_id in live_block_ids
+        )
         return index_snapshot, file_paths_snapshot, patch_paths, patch_bytes, live_block_ids, live_bytes
 
     def _compaction_needed(self) -> bool:
@@ -877,6 +1088,7 @@ class LogStorageManager:
                             for chunk_start in range(0, len(live_block_ids), 256):
                                 block_ids = live_block_ids[chunk_start:chunk_start + 256]
                                 blocks = self._read_blocks_uncoordinated(block_ids)
+                                chunk_states = self._read_block_states_uncoordinated(block_ids)
                                 for block_id in block_ids:
                                     tensor = blocks[block_id]
                                     data = tensor.numpy().astype(
@@ -885,13 +1097,35 @@ class LogStorageManager:
                                     ).tobytes()
                                     output.write(data)
                                     previous = index_snapshot[block_id]
+                                    block_offset = output_bytes
+                                    output_bytes += len(data)
+                                    state_extent = None
+                                    if previous.state is not None:
+                                        payload = chunk_states.get(block_id)
+                                        if payload is None:
+                                            raise RuntimeError(
+                                                f"Missing state extent while compacting block {block_id}"
+                                            )
+                                        state_bytes = payload["tensor"].numpy().astype(
+                                            np.float32,
+                                            copy=False,
+                                        ).tobytes()
+                                        output.write(state_bytes)
+                                        state_extent = StateExtent(
+                                            file_id=compacted_file_id,
+                                            offset=output_bytes,
+                                            size=len(state_bytes),
+                                            row_count=int(previous.state.row_count),
+                                            step=int(previous.state.step),
+                                        )
+                                        output_bytes += len(state_bytes)
                                     new_locations[block_id] = BlockLocation(
                                         file_id=compacted_file_id,
-                                        offset=output_bytes,
+                                        offset=block_offset,
                                         size=len(data),
                                         version=int(previous.version),
+                                        state=state_extent,
                                     )
-                                    output_bytes += len(data)
                             output.flush()
                             os.fsync(output.fileno())
                         os.replace(temp_path, final_path)
