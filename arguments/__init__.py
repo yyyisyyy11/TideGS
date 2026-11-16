@@ -220,6 +220,8 @@ class AuxiliaryParams(ParamGroup):
         self.paper_resident_capacity_blocks = 2048  # Global cap in distributed mode
         self.paper_optimizer_state_mode = "full_cpu"  # {full_cpu, resident_blocks, resident_cpu_cache, resident_ssd_cache}; optimizer-state placement
         self.paper_optimizer_state_extent = True  # resident_ssd_cache: store Adam state as a paired patch extent
+        self.paper_optimizer_state_quantization = "off"  # {off, fp16, int8_dynamic}; paired extent encoding
+        self.paper_optimizer_state_quant_tile_size = 512
         self.paper_optimizer_backend = "cpu"  # {cpu, gpu_resident}; optimizer update backend
         self.paper_optimizer_algorithm = "adam"  # {adam, 3dgs2_tr}; Adam remains the default
         self.paper_sophia_beta1 = 0.9
@@ -505,6 +507,8 @@ def _apply_tide_aliases(args):
         ("tide_resident_capacity_blocks", "paper_resident_capacity_blocks"),
         ("tide_optimizer_state_mode", "paper_optimizer_state_mode"),
         ("tide_optimizer_state_extent", "paper_optimizer_state_extent"),
+        ("tide_optimizer_state_quantization", "paper_optimizer_state_quantization"),
+        ("tide_optimizer_state_quant_tile_size", "paper_optimizer_state_quant_tile_size"),
         ("tide_optimizer_backend", "paper_optimizer_backend"),
         ("tide_optimizer_algorithm", "paper_optimizer_algorithm"),
         ("optimizer", "paper_optimizer_algorithm"),
@@ -677,6 +681,36 @@ def init_args(args):
             )
             assert getattr(args, "paper_optimizer_deferred_mode", "off") == "off", (
                 "resident optimizer state mode currently requires --paper_optimizer_deferred_mode off"
+            )
+
+    if hasattr(args, "paper_optimizer_state_quantization"):
+        args.paper_optimizer_state_quantization = str(
+            args.paper_optimizer_state_quantization
+        ).lower()
+        assert args.paper_optimizer_state_quantization in {
+            "off",
+            "fp16",
+            "int8_dynamic",
+        }, (
+            "Invalid paper_optimizer_state_quantization="
+            f"{args.paper_optimizer_state_quantization!r}; expected off, fp16, int8_dynamic"
+        )
+        args.paper_optimizer_state_quant_tile_size = int(
+            getattr(args, "paper_optimizer_state_quant_tile_size", 512)
+        )
+        assert 1 <= args.paper_optimizer_state_quant_tile_size <= 65535, (
+            "paper_optimizer_state_quant_tile_size must be in [1, 65535]"
+        )
+        if args.paper_optimizer_state_quantization != "off":
+            assert args.paper_optimizer_state_mode == "resident_ssd_cache", (
+                "state quantization currently requires paper_optimizer_state_mode="
+                "resident_ssd_cache"
+            )
+            assert bool(getattr(args, "paper_optimizer_state_extent", True)), (
+                "state quantization requires paper_optimizer_state_extent=True"
+            )
+            assert str(getattr(args, "pure_ssd_checkpoint_mode", "incremental")).lower() != "snapshot", (
+                "state quantization requires pure_ssd_checkpoint_mode=incremental"
             )
 
     if hasattr(args, "paper_optimizer_algorithm"):

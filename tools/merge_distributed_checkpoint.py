@@ -128,6 +128,34 @@ def plan_merge(dist: dict) -> dict:
         if len(values) != 1:
             raise MergeError(f"ranks disagree on index field {key}: {values}")
 
+    state_fields = (
+        "optimizer_state_format_version",
+        "state_storage",
+        "state_quantization",
+        "state_codec",
+        "state_codebook_id",
+        "state_quant_tile_size",
+    )
+    state_defaults = {
+        "optimizer_state_format_version": 0,
+        "state_storage": "",
+        "state_quantization": "off",
+        "state_codec": "fp32_v1",
+        "state_codebook_id": "",
+        "state_quant_tile_size": 0,
+    }
+    for field in state_fields:
+        root_value = root.get(field, state_defaults[field])
+        values = {
+            str(rank["manifest"].get(field, state_defaults[field]))
+            for rank in ranks
+        }
+        if values != {str(root_value)}:
+            raise MergeError(
+                f"distributed checkpoint state field {field} disagrees with root: "
+                f"root={root_value!r} ranks={sorted(values)}"
+            )
+
     conflicts: List[str] = []
     per_rank_owned = Counter()
     per_rank_owned_at_base = Counter()
@@ -142,6 +170,11 @@ def plan_merge(dist: dict) -> dict:
             if int(entry["file_id"]) != 0 or int(entry["version"]) != 0:
                 conflicts.append(f"block {b}: non-owner rank {r} holds file_id={entry['file_id']} "
                                  f"version={entry['version']} (owner rank {o})")
+            if entry.get("state") is not None:
+                conflicts.append(
+                    f"block {b}: non-owner rank {r} holds an optimizer-state extent "
+                    f"(owner rank {o})"
+                )
         entry = dict(ranks[o]["index"]["index"][key])
         rows = _rows_in_block(b, total_points, block_size)
         if int(entry["size"]) != rows * param_dim * 4:
@@ -233,6 +266,10 @@ def write_merged(dist: dict, plan: dict, out: Path, link_mode: str) -> dict:
                 "row_count": int(state["row_count"]),
                 "step": int(state["step"]),
             }
+            if "raw_size" in state:
+                entry["state"]["raw_size"] = int(state["raw_size"])
+            if "encoding" in state:
+                entry["state"]["encoding"] = str(state["encoding"])
             state_bytes_total += int(state["size"])
         index[str(b)] = entry
 
@@ -246,9 +283,17 @@ def write_merged(dist: dict, plan: dict, out: Path, link_mode: str) -> dict:
         "linked_patch_files": len(files) - 1, "linked_patch_bytes": patch_bytes,
         "copied_patch_files": 0, "copied_patch_bytes": 0, "patch_file_mode": link_mode,
         "state_bytes": int(state_bytes_total),
+        "state_raw_bytes": int(
+            sum(
+                int(c["state"].get("raw_size", int(c["state"]["row_count"]) * 118 * 4))
+                for c in plan["chosen"].values()
+                if c.get("state")
+            )
+        ),
     })
-    if state_bytes_total and "state_extent" in idx0:
-        merged_index["state_extent"] = idx0["state_extent"]
+    for key in ("state_extent", "state_codec"):
+        if state_bytes_total and key in idx0:
+            merged_index[key] = idx0[key]
     _write_json(delta / "storage_index.json", merged_index)
 
     # bounds: the root copy is authoritative; it must equal the owner-selected rank bounds
@@ -276,6 +321,8 @@ def write_merged(dist: dict, plan: dict, out: Path, link_mode: str) -> dict:
         "patch_files": len(files) - 1, "patch_bytes": patch_bytes,
         "patch_files_linked": len(files) - 1, "patch_bytes_linked": patch_bytes,
         "patch_files_copied": 0, "patch_bytes_copied": 0, "patch_file_mode": link_mode,
+        "state_bytes": int(merged_index.get("state_bytes", 0)),
+        "state_raw_bytes": int(merged_index.get("state_raw_bytes", 0)),
         "iteration": int(root["iteration"]), "checkpoint_iter": int(root["iteration"]),
         "next_iteration": int(root["next_iteration"]),
         "merged_from_distributed": {
@@ -322,7 +369,10 @@ def verify_merged(dist: dict, out: Path) -> dict:
             if not (same_state_file and int(got_state["offset"]) == int(want_state["offset"])
                     and int(got_state["size"]) == int(want_state["size"])
                     and int(got_state["row_count"]) == int(want_state["row_count"])
-                    and int(got_state["step"]) == int(want_state["step"])):
+                    and int(got_state["step"]) == int(want_state["step"])
+                    and str(got_state.get("encoding", "fp32_v1")) == str(want_state.get("encoding", "fp32_v1"))
+                    and int(got_state.get("raw_size", int(got_state["row_count"]) * 118 * 4))
+                    == int(want_state.get("raw_size", int(want_state["row_count"]) * 118 * 4))):
                 mismatches.append(b)
             state_file_size = os.stat(files[int(got_state["file_id"])]["path"]).st_size
             if int(got_state["offset"]) + int(got_state["size"]) > state_file_size:

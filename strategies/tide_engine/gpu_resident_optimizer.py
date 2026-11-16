@@ -8,6 +8,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 from storage.optimizer_state_ssd import SSDOptimizerStateStore
+from storage.state_quantization import (
+    CODEC_INT8,
+    DEFAULT_QTILE_SIZE,
+    StatePayload,
+    decode_state,
+    encode_state,
+)
 
 
 @dataclass
@@ -174,6 +181,8 @@ class GPUResidentAdam:
         self._persistent_state_enabled = False
         self._state_extent_enabled = False
         self._state_extent_cache = None
+        self._state_quantization = "off"
+        self._state_quant_tile_size = DEFAULT_QTILE_SIZE
         self._cpu_state_cache: Dict[int, Dict[str, Any]] = {}
         self._cpu_state_lru: "OrderedDict[int, None]" = OrderedDict()
         self._cpu_state_cache_bytes = 0
@@ -216,6 +225,15 @@ class GPUResidentAdam:
             "state_admit_h2d_ms": 0.0,
             "state_load_from_ssd_ms": 0.0,
             "persistent_state_stats_ms": 0.0,
+            "state_quantization": "off",
+            "state_quantized_bytes": 0,
+            "state_raw_bytes": 0,
+            "state_zero_tiles": 0,
+            "state_sparse_tiles": 0,
+            "state_fp16_fallback_tiles": 0,
+            "state_fp32_fallback_tiles": 0,
+            "state_encode_ms": 0.0,
+            "state_decode_ms": 0.0,
         }
         self._state_timing_baseline = {}
 
@@ -231,7 +249,13 @@ class GPUResidentAdam:
         self.state_mode = "resident_cpu_cache"
         self._stats["state_mode"] = self.state_mode
 
-    def enable_state_extent(self, cache_manager) -> None:
+    def enable_state_extent(
+        self,
+        cache_manager,
+        *,
+        quantization: str = "off",
+        qtile_size: int = DEFAULT_QTILE_SIZE,
+    ) -> None:
         """Persist Adam state as a second extent of the Gaussian block.
 
         State follows the block through RAM and SSD: it is attached to the cache
@@ -251,11 +275,23 @@ class GPUResidentAdam:
         self.state_mode = "resident_ssd_cache"
         self._state_extent_enabled = True
         self._state_extent_cache = cache_manager
+        quantization = str(quantization).lower()
+        if quantization not in {"off", "fp16", "int8_dynamic"}:
+            raise ValueError(
+                f"unsupported state quantization {quantization!r}; expected off, fp16, int8_dynamic"
+            )
+        self._state_quantization = quantization
+        self._state_quant_tile_size = int(qtile_size)
+        if not 1 <= self._state_quant_tile_size <= 0xFFFF:
+            raise ValueError(
+                "state quantization tile size must be in [1, 65535]"
+            )
         enable_prefetch = getattr(cache_manager, "enable_state_prefetch", None)
         if callable(enable_prefetch):
             enable_prefetch(True)
         self._stats["state_mode"] = self.state_mode
         self._stats["state_storage"] = "patch_extent"
+        self._stats["state_quantization"] = self._state_quantization
 
     def _snapshot_slot_flat(self, block_id: int, slot: int):
         row_count = int(self._slot_row_counts[slot])
@@ -283,6 +319,40 @@ class GPUResidentAdam:
         flat = torch.cat((avg_cols, sq_cols), dim=1).contiguous()
         return flat, int(self._slot_steps[slot])
 
+    def _snapshot_slot_payload(self, block_id: int, slot: int):
+        """Snapshot state, quantizing on the source device when enabled."""
+        if self._state_quantization == "off":
+            return self._snapshot_slot_flat(block_id, slot)
+        row_count = int(self._slot_row_counts[slot])
+        if row_count <= 0 or row_count > self.block_size:
+            raise RuntimeError(
+                f"[GPUResidentAdam] invalid state row count for block {block_id}: {row_count}"
+            )
+        avg_cols = torch.empty(
+            (row_count, self.TOTAL_WIDTH), dtype=torch.float32, device=self.device
+        )
+        sq_cols = torch.empty(
+            (row_count, self.TOTAL_WIDTH), dtype=torch.float32, device=self.device
+        )
+        offset = 0
+        for name, _, width, _ in self.COMPONENT_SPECS:
+            avg_view = self._exp_avg[name].view(
+                self._allocated_slots, self.block_size, width
+            )
+            sq_view = self._exp_avg_sq[name].view(
+                self._allocated_slots, self.block_size, width
+            )
+            avg_cols[:, offset : offset + width].copy_(avg_view[slot, :row_count])
+            sq_cols[:, offset : offset + width].copy_(sq_view[slot, :row_count])
+            offset += width
+        flat = torch.cat((avg_cols, sq_cols), dim=1).contiguous()
+        payload = encode_state(
+            flat,
+            quantization=self._state_quantization,
+            qtile_size=self._state_quant_tile_size,
+        )
+        return payload, int(self._slot_steps[slot])
+
     def _restore_slot_flat(self, block_id: int, slot: int, flat, row_count: int) -> None:
         if not torch.is_tensor(flat):
             flat = torch.as_tensor(flat, dtype=torch.float32)
@@ -309,6 +379,15 @@ class GPUResidentAdam:
                 non_blocking=False,
             )
             offset += width
+
+    def _restore_slot_payload(self, block_id: int, slot: int, payload, row_count: int) -> None:
+        if isinstance(payload, StatePayload):
+            flat = decode_state(payload, device=self.device)
+        else:
+            flat = payload
+            if not torch.is_tensor(flat):
+                flat = torch.as_tensor(flat, dtype=torch.float32, device=self.device)
+        self._restore_slot_flat(block_id, slot, flat, row_count)
 
     def enable_ssd_state_cache(
         self,
@@ -555,8 +634,10 @@ class GPUResidentAdam:
                 entries = list(self._state_extent_cache.state_payloads.values())
             self._stats["persistent_state_blocks"] = len(entries)
             self._stats["persistent_state_bytes"] = sum(
-                int(tensor.numel()) * int(tensor.element_size())
-                for tensor, _, _ in entries
+                int(value.compressed_size)
+                if isinstance(value, StatePayload)
+                else int(value.numel()) * int(value.element_size())
+                for value, _, _ in entries
             )
             return
         cpu_blocks = len(self._cpu_state_cache)
@@ -718,7 +799,11 @@ class GPUResidentAdam:
                     and self._state_extent_cache is not None
                 ):
                     snapshot_start = time.perf_counter()
-                    flat_state, state_step = self._snapshot_slot_flat(block_id, slot)
+                    flat_state, state_step = self._snapshot_slot_payload(block_id, slot)
+                    if isinstance(flat_state, StatePayload):
+                        next_stats["state_encode_ms"] += (
+                            time.perf_counter() - snapshot_start
+                        ) * 1000.0
                     next_stats["state_evict_d2h_ms"] = (
                         float(next_stats.get("state_evict_d2h_ms", 0.0))
                         + (time.perf_counter() - snapshot_start) * 1000.0
@@ -730,6 +815,19 @@ class GPUResidentAdam:
                         step=state_step,
                         state_version=None,
                     )
+                    if isinstance(flat_state, StatePayload):
+                        next_stats["state_quantized_bytes"] += int(
+                            flat_state.compressed_size
+                        )
+                        next_stats["state_raw_bytes"] += int(flat_state.raw_size)
+                        next_stats["state_zero_tiles"] += int(flat_state.zero_tiles)
+                        next_stats["state_sparse_tiles"] += int(flat_state.sparse_tiles)
+                        next_stats["state_fp16_fallback_tiles"] += int(
+                            flat_state.fp16_fallback_tiles
+                        )
+                        next_stats["state_fp32_fallback_tiles"] += int(
+                            flat_state.fp32_fallback_tiles
+                        )
                     next_stats["persistent_state_saves"] += 1
                 elif self._persistent_state_enabled:
                     snapshot_start = time.perf_counter()
@@ -806,11 +904,26 @@ class GPUResidentAdam:
                             next_stats["persistent_state_misses"] += 1
                             continue
                         restore_start = time.perf_counter()
-                        flat_state = payload["tensor"]
-                        row_count = int(
-                            payload.get("row_count", flat_state.shape[0])
-                        )
-                        self._restore_slot_flat(block_id, slot, flat_state, row_count)
+                        state_value = payload.get("payload", payload.get("tensor"))
+                        if state_value is None:
+                            state_value = payload.get("tensor")
+                        if state_value is None:
+                            next_stats["persistent_state_misses"] += 1
+                            continue
+                        if isinstance(state_value, StatePayload):
+                            row_count = int(payload.get("row_count", state_value.row_count))
+                        else:
+                            row_count = int(
+                                payload.get(
+                                    "row_count",
+                                    state_value.shape[0] if hasattr(state_value, "shape") else 0,
+                                )
+                            )
+                        self._restore_slot_payload(block_id, slot, state_value, row_count)
+                        if isinstance(state_value, StatePayload):
+                            next_stats["state_decode_ms"] += (
+                                time.perf_counter() - restore_start
+                            ) * 1000.0
                         next_stats["state_admit_h2d_ms"] = (
                             float(next_stats.get("state_admit_h2d_ms", 0.0))
                             + (time.perf_counter() - restore_start) * 1000.0

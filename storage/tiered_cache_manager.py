@@ -16,6 +16,18 @@ from typing import Dict, List, Set, Optional, Tuple
 import torch
 import psutil
 from utils.tide_trace import tide_range
+try:
+    from .state_quantization import StatePayload, state_payload_from_tensor
+except ImportError:  # pragma: no cover - standalone lightweight test loader
+    try:
+        from storage.state_quantization import StatePayload, state_payload_from_tensor
+    except ImportError:
+        class StatePayload:  # type: ignore[no-redef]
+            pass
+
+        def state_payload_from_tensor(tensor, *, codec="fp32_v1", qtile_size=512):
+            _ = codec, qtile_size
+            return tensor
 
 
 class TieredCacheManager:
@@ -87,8 +99,9 @@ class TieredCacheManager:
         self.flushing_lock = threading.RLock()
 
         # Paired optimizer-state payloads kept with the Gaussian block until the
-        # block is written back.  Values are (flat state tensor, step, version).
-        self.state_payloads: Dict[int, Tuple[torch.Tensor, int, int]] = {}
+        # block is written back. Values are (opaque payload or FP32 tensor, step,
+        # version).
+        self.state_payloads: Dict[int, Tuple[object, int, int]] = {}
         self.state_payloads_lock = threading.RLock()
         self.state_prefetch_enabled = False
 
@@ -171,6 +184,8 @@ class TieredCacheManager:
             'ssd_bytes_read_future': 0,
             'ssd_bytes_written_async': 0,
             'ssd_bytes_written_sync': 0,
+            'ssd_state_bytes_written_async': 0,
+            'ssd_state_bytes_written_sync': 0,
             'inflight_wait_blocks': 0,
             'inflight_wait_time': 0.0,
             'inflight_fallback_blocks': 0,
@@ -242,9 +257,25 @@ class TieredCacheManager:
             for block_id, payload in payloads.items():
                 if int(block_id) in self.state_payloads:
                     continue
-                tensor = payload["tensor"].detach().to("cpu").contiguous()
+                state_value = payload.get("payload")
+                if state_value is None:
+                    state_value = payload.get("tensor")
+                legacy_tensor = payload.get("tensor")
+                if isinstance(state_value, StatePayload) and torch.is_tensor(legacy_tensor):
+                    # Keep the existing FP32 cache representation for the
+                    # uncompressed compatibility format.  Compressed payloads
+                    # intentionally do not expose ``tensor`` and remain opaque.
+                    cached_value = legacy_tensor.detach().to("cpu").contiguous()
+                elif isinstance(state_value, StatePayload):
+                    cached_value = state_value
+                elif torch.is_tensor(state_value):
+                    cached_value = state_value.detach().to("cpu").contiguous()
+                else:
+                    cached_value = state_payload_from_tensor(
+                        torch.as_tensor(state_value, dtype=torch.float32),
+                    )
                 self.state_payloads[int(block_id)] = (
-                    tensor,
+                    cached_value,
                     int(payload.get("step", 0)),
                     int(payload.get("version", 0)),
                 )
@@ -267,17 +298,19 @@ class TieredCacheManager:
         """
         if payload is None:
             return
-        if torch.is_tensor(payload):
-            tensor = payload.detach().to("cpu").contiguous()
+        if isinstance(payload, StatePayload):
+            cached_value = payload
+        elif torch.is_tensor(payload):
+            cached_value = payload.detach().to("cpu").contiguous()
         else:
-            tensor = torch.as_tensor(payload, dtype=torch.float32).contiguous()
+            cached_value = torch.as_tensor(payload, dtype=torch.float32).contiguous()
         with self.state_payloads_lock:
             version = (
                 int(state_version)
                 if state_version is not None
                 else int(self.block_versions.get(int(block_id), 0))
             )
-            self.state_payloads[int(block_id)] = (tensor, int(step), version)
+            self.state_payloads[int(block_id)] = (cached_value, int(step), version)
 
     def take_block_state(self, block_id: int):
         """Remove and return the attached state payload for a block, if any."""
@@ -285,16 +318,22 @@ class TieredCacheManager:
             entry = self.state_payloads.pop(int(block_id), None)
         if entry is None:
             return None
-        tensor, step, version = entry
-        return {"tensor": tensor, "step": int(step), "version": int(version)}
+        state_value, step, version = entry
+        result = {"payload": state_value, "step": int(step), "version": int(version)}
+        if torch.is_tensor(state_value):
+            result["tensor"] = state_value
+        return result
 
     def peek_block_state(self, block_id: int):
         with self.state_payloads_lock:
             entry = self.state_payloads.get(int(block_id))
         if entry is None:
             return None
-        tensor, step, version = entry
-        return {"tensor": tensor, "step": int(step), "version": int(version)}
+        state_value, step, version = entry
+        result = {"payload": state_value, "step": int(step), "version": int(version)}
+        if torch.is_tensor(state_value):
+            result["tensor"] = state_value
+        return result
 
     def state_prefetch(self, block_ids, *, allow_storage: bool = True) -> Dict[int, Dict]:
         """Return attached or on-disk optimizer state for the requested blocks."""
@@ -303,29 +342,31 @@ class TieredCacheManager:
             for block_id in block_ids:
                 entry = self.state_payloads.get(int(block_id))
                 if entry is not None:
-                    tensor, step, version = entry
+                    state_value, step, version = entry
                     result[int(block_id)] = {
-                        "tensor": tensor,
+                        "payload": state_value,
                         "step": int(step),
                         "version": int(version),
                     }
+                    if torch.is_tensor(state_value):
+                        result[int(block_id)]["tensor"] = state_value
         missing = [int(b) for b in block_ids if int(b) not in result]
         if allow_storage and missing and hasattr(self.storage, "read_block_states"):
             for block_id, payload in self.storage.read_block_states(missing).items():
                 result[int(block_id)] = payload
         return result
 
-    def _state_payloads_for_flush(self, block_ids, block_versions) -> Dict[int, Tuple[torch.Tensor, int]]:
-        payloads: Dict[int, Tuple[torch.Tensor, int]] = {}
+    def _state_payloads_for_flush(self, block_ids, block_versions) -> Dict[int, Tuple[object, int]]:
+        payloads: Dict[int, Tuple[object, int]] = {}
         with self.state_payloads_lock:
             for block_id in block_ids:
                 entry = self.state_payloads.get(int(block_id))
                 if entry is None:
                     continue
-                tensor, step, version = entry
+                state_value, step, version = entry
                 flush_version = block_versions.get(int(block_id))
                 if flush_version is None or int(version) <= int(flush_version):
-                    payloads[int(block_id)] = (tensor, int(step))
+                    payloads[int(block_id)] = (state_value, int(step))
         return payloads
 
     def _forget_flushed_states(self, block_ids, block_versions) -> None:
@@ -822,10 +863,17 @@ class TieredCacheManager:
 
         block_versions = block_versions or {}
         state_payloads = self._state_payloads_for_flush(dirty_blocks.keys(), block_versions)
-        bytes_written = sum(
+        gaussian_bytes_written = sum(
             int(tensor.numel()) * int(tensor.element_size())
             for tensor in dirty_blocks.values()
         )
+        state_bytes_written = sum(
+            len(value[0].payload)
+            if isinstance(value[0], StatePayload)
+            else int(value[0].numel()) * int(value[0].element_size())
+            for value in state_payloads.values()
+        )
+        bytes_written = gaussian_bytes_written + state_bytes_written
         t0 = time.time()
         try:
             with tide_range("tide.io.ssd.write.service"):
@@ -883,11 +931,13 @@ class TieredCacheManager:
                 self.stats['async_flush_blocks'] += len(dirty_blocks)
                 self.stats['async_flush_time'] += elapsed
                 self.stats['ssd_bytes_written_async'] += bytes_written
+                self.stats['ssd_state_bytes_written_async'] += state_bytes_written
             else:
                 self.stats['sync_flush_jobs'] += 1
                 self.stats['sync_flush_blocks'] += len(dirty_blocks)
                 self.stats['sync_flush_time'] += elapsed
                 self.stats['ssd_bytes_written_sync'] += bytes_written
+                self.stats['ssd_state_bytes_written_sync'] += state_bytes_written
             self.record_partitioned_io_events(
                 operation=f"ssd_write_{mode}",
                 tier="ssd",

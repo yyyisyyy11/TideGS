@@ -274,6 +274,30 @@ def validate_pure_ssd_checkpoint_optimizer(args: Any, manifest: Mapping[str, Any
     if distributed_root is not None:
         validate_distributed_checkpoint_resume(args, distributed_root)
         return
+    state_format = int(manifest.get("optimizer_state_format_version", 0))
+    if state_format >= 4:
+        required_quantized = (
+            "state_quantization",
+            "state_codec",
+            "state_codebook_id",
+            "state_quant_tile_size",
+        )
+        missing_quantized = [field for field in required_quantized if field not in manifest]
+        if missing_quantized:
+            raise ValueError(
+                "Quantized Pure SSD checkpoint is missing: "
+                + ", ".join(missing_quantized)
+            )
+        if manifest.get("state_quantization") not in {"fp16", "int8_dynamic"}:
+            raise ValueError("Quantized Pure SSD checkpoint has an invalid state_quantization")
+        if manifest.get("state_codec") not in {"fp16_v1", "dynamic_int8_v1"}:
+            raise ValueError("Quantized Pure SSD checkpoint has an invalid state_codec")
+        if manifest.get("state_quantization") == "int8_dynamic" and not str(
+            manifest.get("state_codebook_id", "")
+        ):
+            raise ValueError("Quantized INT8 Pure SSD checkpoint requires a codebook id")
+        if int(manifest.get("state_quant_tile_size", 0)) <= 0:
+            raise ValueError("Quantized Pure SSD checkpoint requires a positive tile size")
     validate_optimizer_provenance(
         args,
         manifest.get("args") or {},
@@ -357,11 +381,11 @@ def validate_distributed_checkpoint_resume(
                 raise ValueError(
                     "Distributed checkpoint v3 resident_ssd_cache* cannot claim curvature EMA state"
                 )
-            expected_format = 3 if state_mode == "resident_ssd_cache_in_patch" else 2
-            if int(root.get("optimizer_state_format_version", -1)) != expected_format:
+            expected_formats = {3, 4} if state_mode == "resident_ssd_cache_in_patch" else {2}
+            if int(root.get("optimizer_state_format_version", -1)) not in expected_formats:
                 raise ValueError(
                     f"Distributed checkpoint v3 {state_mode} requires "
-                    f"optimizer_state_format_version={expected_format}"
+                    f"optimizer_state_format_version in {sorted(expected_formats)}"
                 )
             if state_mode == "resident_ssd_cache_in_patch" and str(
                 root.get("state_storage", "")
@@ -370,6 +394,45 @@ def validate_distributed_checkpoint_resume(
                     "Distributed checkpoint v3 resident_ssd_cache_in_patch requires "
                     "state_storage=in_patch"
                 )
+            if (
+                state_mode == "resident_ssd_cache_in_patch"
+                and int(root.get("optimizer_state_format_version", 3)) >= 4
+            ):
+                required_quantized = (
+                    "state_quantization",
+                    "state_codec",
+                    "state_codebook_id",
+                    "state_quant_tile_size",
+                )
+                missing_quantized = [
+                    field for field in required_quantized if field not in root
+                ]
+                if missing_quantized:
+                    raise ValueError(
+                        "Distributed quantized checkpoint is missing: "
+                        + ", ".join(missing_quantized)
+                    )
+                quantization = str(root["state_quantization"])
+                codec = str(root["state_codec"])
+                expected_codec = {
+                    "fp16": "fp16_v1",
+                    "int8_dynamic": "dynamic_int8_v1",
+                }.get(quantization)
+                if expected_codec is None or codec != expected_codec:
+                    raise ValueError(
+                        "Distributed quantized checkpoint has an invalid "
+                        f"quantization/codec pair: {quantization!r}/{codec!r}"
+                    )
+                if str(root.get("state_quantization", "")) == "int8_dynamic" and not str(
+                    root["state_codebook_id"]
+                ):
+                    raise ValueError(
+                        "Distributed INT8 checkpoint requires a codebook id"
+                    )
+                if int(root["state_quant_tile_size"]) <= 0:
+                    raise ValueError(
+                        "Distributed quantized checkpoint requires a positive tile size"
+                    )
             if str(_canonical_value(args, "paper_optimizer_state_mode", use_default=True)) != "resident_ssd_cache":
                 raise ValueError(
                     "Distributed checkpoint contains resident_ssd_cache state but requested mode differs"

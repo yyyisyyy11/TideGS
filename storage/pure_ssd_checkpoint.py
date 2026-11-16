@@ -194,12 +194,25 @@ def _export_optimizer_state(gaussians, checkpoint_dir: Path, log_file=None):
             "extents; skipping the legacy state export",
             log_file,
         )
+        quantization = str(getattr(optimizer, "_state_quantization", "off"))
+        quantized = quantization != "off"
         return {
             "optimizer_state_mode": "resident_ssd_cache",
             "optimizer_state_saved": True,
             "adam_moments_saved": True,
-            "optimizer_state_format_version": 3,
+            "optimizer_state_format_version": 4 if quantized else 3,
             "state_storage": "in_patch",
+            "state_quantization": quantization,
+            "state_codec": (
+                "dynamic_int8_v1" if quantization == "int8_dynamic" else
+                "fp16_v1" if quantization == "fp16" else "fp32_v1"
+            ),
+            "state_codebook_id": (
+                "dynamic_signed_positive_v1" if quantization == "int8_dynamic" else ""
+            ),
+            "state_quant_tile_size": int(
+                getattr(optimizer, "_state_quant_tile_size", 512)
+            ),
         }
     export = getattr(optimizer, "export_persistent_state", None)
     if not callable(export):
@@ -239,8 +252,18 @@ def _optimizer_state_checkpoint_fields(
             optimizer_state_manifest.get("optimizer_state_format_version", 2)
         ),
     }
-    if optimizer_state_manifest.get("state_storage"):
-        fields["state_storage"] = str(optimizer_state_manifest["state_storage"])
+    for key in (
+        "state_storage",
+        "state_quantization",
+        "state_codec",
+        "state_codebook_id",
+    ):
+        if key in optimizer_state_manifest and optimizer_state_manifest.get(key) is not None:
+            fields[key] = str(optimizer_state_manifest[key])
+    if optimizer_state_manifest.get("state_quant_tile_size") is not None:
+        fields["state_quant_tile_size"] = int(
+            optimizer_state_manifest["state_quant_tile_size"]
+        )
     manifest_path = optimizer_state_manifest.get(
         "optimizer_state_manifest",
         optimizer_state_manifest.get("manifest"),
@@ -266,6 +289,8 @@ def _optimizer_manifest_args(args) -> Dict[str, Any]:
     names = (
         "paper_optimizer_backend",
         "paper_optimizer_state_mode",
+        "paper_optimizer_state_quantization",
+        "paper_optimizer_state_quant_tile_size",
         "paper_optimizer_algorithm",
         "paper_sophia_beta1",
         "paper_sophia_beta2",
@@ -313,6 +338,15 @@ def write_pure_ssd_snapshot_checkpoint(
         raise RuntimeError("Pure SSD checkpoint requires an initialized storage_adapter")
     if getattr(gaussians, "_unified_params", None) is not None:
         raise RuntimeError("Pure SSD checkpoint refuses to serialize a full _unified_params table")
+    snapshot_optimizer = getattr(gaussians, "_paper_gpu_resident_optimizer", None)
+    if (
+        getattr(snapshot_optimizer, "_state_extent_enabled", False)
+        and str(getattr(snapshot_optimizer, "_state_quantization", "off")) != "off"
+    ):
+        raise RuntimeError(
+            "Pure SSD snapshot checkpoints cannot represent quantized paired "
+            "optimizer-state extents; use the incremental checkpoint mode"
+        )
 
     chunk_blocks = int(chunk_blocks)
     if chunk_blocks <= 0:
@@ -559,6 +593,8 @@ def write_pure_ssd_incremental_checkpoint(
         "patch_bytes_copied": copied_patch_bytes,
         "patch_files_linked": linked_patch_files,
         "patch_bytes_linked": linked_patch_bytes,
+        "state_bytes": int(index_manifest.get("state_bytes", 0)),
+        "state_raw_bytes": int(index_manifest.get("state_raw_bytes", 0)),
         "compacted_before_checkpoint": bool(compacted_before_checkpoint),
         "checkpoint_compaction_rounds": int(checkpoint_compaction_rounds),
         "training_state": str(training_state_file.resolve()),

@@ -93,7 +93,23 @@ def get_gpu_resident_optimizer(gaussians, batch_size):
                 getattr(optimizer_args, "paper_optimizer_state_extent", True)
             )
             if use_extent and cache_manager is not None:
-                resident_optimizer.enable_state_extent(cache_manager)
+                resident_optimizer.enable_state_extent(
+                    cache_manager,
+                    quantization=str(
+                        getattr(
+                            optimizer_args,
+                            "paper_optimizer_state_quantization",
+                            "off",
+                        )
+                    ).lower(),
+                    qtile_size=int(
+                        getattr(
+                            optimizer_args,
+                            "paper_optimizer_state_quant_tile_size",
+                            512,
+                        )
+                    ),
+                )
             else:
                 state_dir = getattr(gaussians, "_paper_optimizer_state_dir", None)
                 if not state_dir:

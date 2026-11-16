@@ -3,6 +3,7 @@ import unittest
 
 import torch
 
+from storage.state_quantization import StatePayload
 from strategies.tide_engine.gpu_resident_optimizer import GPUResidentAdam
 
 
@@ -12,10 +13,13 @@ class FakeExtentCache:
         self.state_payloads_lock = threading.RLock()
 
     def attach_block_state(self, block_id, payload, *, step=0, state_version=None):
-        tensor = payload.detach().to("cpu").contiguous()
+        if isinstance(payload, StatePayload):
+            cached_value = payload
+        else:
+            cached_value = payload.detach().to("cpu").contiguous()
         version = int(state_version) if state_version is not None else 0
         with self.state_payloads_lock:
-            self.state_payloads[int(block_id)] = (tensor, int(step), version)
+            self.state_payloads[int(block_id)] = (cached_value, int(step), version)
 
     def state_prefetch(self, block_ids, *, allow_storage=True):
         result = {}
@@ -23,10 +27,14 @@ class FakeExtentCache:
             for block_id in block_ids:
                 entry = self.state_payloads.get(int(block_id))
                 if entry is not None:
-                    tensor, step, version = entry
+                    state_value, step, version = entry
                     result[int(block_id)] = {
-                        "tensor": tensor,
-                        "row_count": int(tensor.shape[0]),
+                        "payload": state_value,
+                        "row_count": int(
+                            state_value.row_count
+                            if isinstance(state_value, StatePayload)
+                            else state_value.shape[0]
+                        ),
                         "step": int(step),
                         "version": int(version),
                     }
@@ -37,8 +45,11 @@ class FakeExtentCache:
             entry = self.state_payloads.pop(int(block_id), None)
         if entry is None:
             return None
-        tensor, step, version = entry
-        return {"tensor": tensor, "step": int(step), "version": int(version)}
+        state_value, step, version = entry
+        result = {"payload": state_value, "step": int(step), "version": int(version)}
+        if torch.is_tensor(state_value):
+            result["tensor"] = state_value
+        return result
 
 
 class StateExtentOptimizerTest(unittest.TestCase):
@@ -145,6 +156,37 @@ class StateExtentOptimizerTest(unittest.TestCase):
             )[slot, :4]
             self.assertTrue(torch.equal(restored_avg, snapshot[name][0]))
             self.assertTrue(torch.equal(restored_sq, snapshot[name][1]))
+
+    def test_quantized_resident_cycle_keeps_payload_opaque_until_restore(self):
+        self.optimizer.enable_state_extent(
+            self.cache,
+            quantization="int8_dynamic",
+            qtile_size=8,
+        )
+        self.optimizer.set_resident_blocks([0])
+        slot = self.optimizer._block_to_slot[0]
+        self.optimizer._slot_row_counts[slot] = 4
+        self.optimizer._slot_initialized[slot] = True
+        self.optimizer._slot_steps[slot] = 9
+        self._fill_slot(slot, 4, 2.0)
+
+        self.optimizer.set_resident_blocks([1])
+        cached = self.cache.state_payloads[0][0]
+        self.assertIsInstance(cached, StatePayload)
+        self.assertEqual(cached.codec, "dynamic_int8_v1")
+
+        self.optimizer.set_resident_blocks([0])
+        restored_slot = self.optimizer._block_to_slot[0]
+        self.assertEqual(self.optimizer._slot_row_counts[restored_slot], 4)
+        self.assertEqual(self.optimizer._slot_steps[restored_slot], 9)
+        self.assertTrue(
+            torch.isfinite(
+                self.optimizer._exp_avg["xyz"]
+                .view(self.optimizer._allocated_slots, self.optimizer.block_size, 3)[
+                    restored_slot, :4
+                ]
+            ).all()
+        )
 
 
 if __name__ == "__main__":

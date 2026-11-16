@@ -12,6 +12,7 @@ import torch
 
 from storage.log_storage_manager import LogStorageManager
 from storage.pure_ssd_checkpoint import prune_checkpoint_history
+from storage.state_quantization import CODEC_INT8, decode_state, encode_state
 
 
 class LogStorageLifecycleTest(unittest.TestCase):
@@ -462,6 +463,52 @@ class LogStorageLifecycleTest(unittest.TestCase):
             states = reloaded.read_block_states([0])
             self.assertTrue(torch.equal(states[0]["tensor"], torch.full((2, 118), 3.0)))
             self.assertEqual(states[0]["step"], 11)
+        finally:
+            reloaded.close()
+
+    def test_quantized_state_extent_round_trip_and_compaction(self):
+        state = torch.zeros((2, 118), dtype=torch.float32)
+        state[:, 0] = torch.tensor([-0.2, 0.3])
+        encoded = encode_state(state, quantization="int8_dynamic", qtile_size=16)
+        self.storage.write_patch(
+            {0: self.block(10)}, block_states={0: (encoded, 12)}
+        )
+        location = self.storage.index[0]
+        self.assertEqual(location.state.encoding, CODEC_INT8)
+        self.assertLess(location.state.size, location.state.raw_size)
+        states = self.storage.read_block_states([0])
+        self.assertEqual(states[0]["payload"].codec, CODEC_INT8)
+        self.assertNotIn("tensor", states[0])
+        restored = decode_state(states[0]["payload"])
+        self.assertEqual(tuple(restored.shape), tuple(state.shape))
+        self.assertTrue(torch.equal(restored[state == 0], torch.zeros_like(restored[state == 0])))
+
+        self.storage.write_patch({1: self.block(11)})
+        self.assertTrue(self.storage.compact_patches(force=True))
+        compacted = self.storage.read_block_states([0])[0]["payload"]
+        self.assertEqual(compacted.payload, states[0]["payload"].payload)
+
+        manifest_path = self.root / "quantized" / "storage_index.json"
+        manifest = self.storage.export_index_manifest(
+            manifest_path,
+            self.root / "quantized" / "patches",
+        )
+        self.assertEqual(manifest["version"], 3)
+        self.assertEqual(manifest["state_extent"], "paired_v2")
+        self.assertEqual(manifest["state_raw_bytes"], state.numel() * 4)
+        reloaded = LogStorageManager(
+            storage_dir=str(self.root / "quantized-reload"),
+            block_size=2,
+            num_blocks=4,
+            point_dim=3,
+            verbose=False,
+            idle_compaction_seconds=0,
+        )
+        try:
+            reloaded.load_index_manifest(manifest_path)
+            restored_payload = reloaded.read_block_states([0])[0]["payload"]
+            self.assertEqual(restored_payload.payload, compacted.payload)
+            self.assertTrue(torch.isfinite(decode_state(restored_payload)).all())
         finally:
             reloaded.close()
 

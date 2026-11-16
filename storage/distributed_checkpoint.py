@@ -293,11 +293,11 @@ def load_distributed_checkpoint_root(
                 raise RuntimeError(
                     "Distributed checkpoint v3 resident_ssd_cache* cannot claim curvature EMA state"
                 )
-            expected_format = 3 if optimizer_state_mode == "resident_ssd_cache_in_patch" else 2
-            if int(root.get("optimizer_state_format_version", -1)) != expected_format:
+            expected_formats = {3, 4} if optimizer_state_mode == "resident_ssd_cache_in_patch" else {2}
+            if int(root.get("optimizer_state_format_version", -1)) not in expected_formats:
                 raise RuntimeError(
                     f"Distributed checkpoint v3 {optimizer_state_mode} requires "
-                    f"optimizer_state_format_version={expected_format}"
+                    f"optimizer_state_format_version in {sorted(expected_formats)}"
                 )
             if optimizer_state_mode == "resident_ssd_cache_in_patch" and str(
                 root.get("state_storage", "")
@@ -306,6 +306,45 @@ def load_distributed_checkpoint_root(
                     "Distributed checkpoint v3 resident_ssd_cache_in_patch requires "
                     "state_storage=in_patch"
                 )
+            if (
+                optimizer_state_mode == "resident_ssd_cache_in_patch"
+                and int(root.get("optimizer_state_format_version", 3)) >= 4
+            ):
+                required_quantized = (
+                    "state_quantization",
+                    "state_codec",
+                    "state_codebook_id",
+                    "state_quant_tile_size",
+                )
+                missing_quantized = [
+                    field for field in required_quantized if field not in root
+                ]
+                if missing_quantized:
+                    raise RuntimeError(
+                        "Distributed quantized checkpoint is missing: "
+                        + ", ".join(missing_quantized)
+                    )
+                quantization = str(root["state_quantization"])
+                codec = str(root["state_codec"])
+                expected_codec = {
+                    "fp16": "fp16_v1",
+                    "int8_dynamic": "dynamic_int8_v1",
+                }.get(quantization)
+                if expected_codec is None or codec != expected_codec:
+                    raise RuntimeError(
+                        "Distributed quantized checkpoint has an invalid "
+                        f"quantization/codec pair: {quantization!r}/{codec!r}"
+                    )
+                if str(root.get("state_quantization", "")) == "int8_dynamic" and not str(
+                    root["state_codebook_id"]
+                ):
+                    raise RuntimeError(
+                        "Distributed INT8 checkpoint requires a codebook id"
+                    )
+                if int(root["state_quant_tile_size"]) <= 0:
+                    raise RuntimeError(
+                        "Distributed quantized checkpoint requires a positive tile size"
+                    )
         else:
             raise RuntimeError(
                 "Distributed checkpoint v3 optimizer_state_mode must be "
@@ -317,6 +356,24 @@ def load_distributed_checkpoint_root(
             raise RuntimeError(
                 "Distributed checkpoint has an invalid rank_manifest_sha256 list"
             )
+        for field in ("rank_state_bytes", "rank_state_raw_bytes"):
+            if field in root:
+                values = list(root[field])
+                if len(values) != world_size or any(int(value) < 0 for value in values):
+                    raise RuntimeError(
+                        f"Distributed checkpoint has an invalid {field} list"
+                    )
+        for field in ("state_bytes", "state_raw_bytes"):
+            if field in root and int(root[field]) < 0:
+                raise RuntimeError(
+                    f"Distributed checkpoint has a negative {field}"
+                )
+            list_field = f"rank_{field}"
+            if field in root and list_field in root:
+                if int(root[field]) != sum(int(value) for value in root[list_field]):
+                    raise RuntimeError(
+                        f"Distributed checkpoint {field} does not match {list_field}"
+                    )
         owner_file = _resolve_checkpoint_member(
             checkpoint_dir,
             root["block_owner"],
@@ -542,10 +599,10 @@ def load_distributed_checkpoint_root(
                     raise RuntimeError(
                         f"Distributed checkpoint rank {rank} did not save Adam moments"
                     )
-                if int(rank_manifest.get("optimizer_state_format_version", -1)) != 3:
+                if int(rank_manifest.get("optimizer_state_format_version", -1)) not in {3, 4}:
                     raise RuntimeError(
                         f"Distributed checkpoint rank {rank} requires "
-                        "optimizer_state_format_version=3 for in-patch state"
+                        "optimizer_state_format_version=3 or 4 for in-patch state"
                     )
                 if str(rank_manifest.get("state_storage", "")) != "in_patch":
                     raise RuntimeError(
@@ -557,6 +614,17 @@ def load_distributed_checkpoint_root(
                         f"Distributed checkpoint rank {rank} must not reference a "
                         "legacy optimizer_state_manifest in extent mode"
                     )
+                for field in (
+                    "state_quantization",
+                    "state_codec",
+                    "state_codebook_id",
+                    "state_quant_tile_size",
+                ):
+                    if field in root and field in rank_manifest and root[field] != rank_manifest[field]:
+                        raise RuntimeError(
+                            f"Distributed checkpoint rank {rank} {field} mismatch: "
+                            f"root={root[field]!r} rank={rank_manifest[field]!r}"
+                        )
             for field, expected in root_metadata.items():
                 actual = int(rank_manifest[field])
                 if actual != expected:
@@ -733,6 +801,12 @@ def write_distributed_incremental_checkpoint(
                 rank_manifest.get("optimizer_state_format_version", 0)
             ),
             "state_storage": str(rank_manifest.get("state_storage", "")),
+            "state_quantization": str(rank_manifest.get("state_quantization", "off")),
+            "state_codec": str(rank_manifest.get("state_codec", "fp32_v1")),
+            "state_codebook_id": str(rank_manifest.get("state_codebook_id", "")),
+            "state_quant_tile_size": int(rank_manifest.get("state_quant_tile_size", 0)),
+            "state_bytes": int(rank_manifest.get("state_bytes", 0)),
+            "state_raw_bytes": int(rank_manifest.get("state_raw_bytes", 0)),
         }
     except Exception as error:
         rank_result = {
@@ -802,12 +876,16 @@ def write_distributed_incremental_checkpoint(
             ).lower()
             root_optimizer_format_version = 2
             root_state_storage = ""
+            root_state_quantization = "off"
+            root_state_codec = "fp32_v1"
+            root_state_codebook_id = ""
+            root_state_quant_tile_size = 0
             if requested_state_mode == "resident_ssd_cache":
                 in_patch = all(
                     value["optimizer_state_mode"] == "resident_ssd_cache"
                     and value["optimizer_state_saved"]
                     and value["adam_moments_saved"]
-                    and int(value["optimizer_state_format_version"]) == 3
+                    and int(value["optimizer_state_format_version"]) in {3, 4}
                     and str(value.get("state_storage", "")) == "in_patch"
                     for value in ordered
                 )
@@ -819,11 +897,35 @@ def write_distributed_incremental_checkpoint(
                     for value in ordered
                 )
                 if in_patch:
+                    in_patch_formats = {int(value["optimizer_state_format_version"]) for value in ordered}
+                    in_patch_codecs = {str(value.get("state_codec", "fp32_v1")) for value in ordered}
+                    in_patch_codebook_ids = {str(value.get("state_codebook_id", "")) for value in ordered}
+                    in_patch_quantization = {str(value.get("state_quantization", "off")) for value in ordered}
+                    in_patch_tile_sizes = {int(value.get("state_quant_tile_size", 0)) for value in ordered}
+                    if (
+                        len(in_patch_formats) != 1
+                        or len(in_patch_codecs) != 1
+                        or len(in_patch_codebook_ids) != 1
+                        or len(in_patch_quantization) != 1
+                        or len(in_patch_tile_sizes) != 1
+                    ):
+                        raise RuntimeError(
+                            "Distributed in-patch state requires every rank to use "
+                            "the same format, codec, quantization and tile size"
+                        )
                     root_optimizer_state_mode = "resident_ssd_cache_in_patch"
-                    root_optimizer_format_version = 3
+                    root_optimizer_format_version = next(iter(in_patch_formats))
                     root_state_storage = "in_patch"
+                    root_state_quantization = next(iter(in_patch_quantization))
+                    root_state_codec = next(iter(in_patch_codecs))
+                    root_state_codebook_id = next(iter(in_patch_codebook_ids))
+                    root_state_quant_tile_size = next(iter(in_patch_tile_sizes))
                 elif legacy:
                     root_optimizer_state_mode = "resident_ssd_cache_per_rank"
+                    root_state_quantization = "off"
+                    root_state_codec = "fp32_v1"
+                    root_state_quant_tile_size = 0
+                    root_state_codebook_id = ""
                 else:
                     raise RuntimeError(
                         "Distributed resident_ssd_cache checkpoint requires every rank "
@@ -870,6 +972,14 @@ def write_distributed_incremental_checkpoint(
                 "optimizer_curvature_saved": root_optimizer_curvature_saved,
                 "optimizer_state_format_version": int(root_optimizer_format_version),
                 "state_storage": root_state_storage,
+                "state_quantization": root_state_quantization,
+                "state_codec": root_state_codec,
+                "state_codebook_id": root_state_codebook_id,
+                "state_quant_tile_size": int(root_state_quant_tile_size),
+                "rank_state_bytes": [int(value.get("state_bytes", 0)) for value in ordered],
+                "rank_state_raw_bytes": [int(value.get("state_raw_bytes", 0)) for value in ordered],
+                "state_bytes": int(sum(int(value.get("state_bytes", 0)) for value in ordered)),
+                "state_raw_bytes": int(sum(int(value.get("state_raw_bytes", 0)) for value in ordered)),
                 "planner_state": normalized_planner_state,
                 "total_points": int(storage_adapter.num_points),
                 "num_blocks": int(storage_adapter.num_blocks),

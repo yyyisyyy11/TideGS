@@ -8,7 +8,13 @@ This package provides a complete tiered storage system:
 - GaussianBlock: Data structures for Gaussian blocks
 """
 
-from .log_storage_manager import LogStorageManager, BlockLocation
+from .log_storage_manager import LogStorageManager, BlockLocation, StateExtent
+from .state_quantization import (
+    StatePayload,
+    decode_state,
+    encode_state,
+    validate_state_payload,
+)
 from .tiered_cache_manager import TieredCacheManager
 from .gaussian_block import GaussianBlock, BlockScheduleInfo, FrustumCuller, compute_morton_code, compute_block_bounds, get_morton_code_torch, get_hierarchical_morton_code_torch, compute_block_bounds_cpu
 from .async_pipeline import AsyncPipeline, TSPScheduler
@@ -25,6 +31,11 @@ from .streaming_ply_init import read_binary_ply_header, streaming_ply_to_ssd_bas
 __all__ = [
     'LogStorageManager',
     'BlockLocation',
+    'StateExtent',
+    'StatePayload',
+    'encode_state',
+    'decode_state',
+    'validate_state_payload',
     'TieredCacheManager',
     'GaussianBlock',
     'BlockScheduleInfo',

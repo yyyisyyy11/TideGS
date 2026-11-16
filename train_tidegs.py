@@ -1508,6 +1508,12 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         'last_persistent_state_ssd_writebacks_total': 0,
         'last_persistent_state_index_writes_total': 0,
         'last_owner_violations_total': 0,
+        'last_state_quantized_bytes_total': 0,
+        'last_state_raw_bytes_total': 0,
+        'last_state_zero_tiles_total': 0,
+        'last_state_sparse_tiles_total': 0,
+        'last_state_fp16_fallback_tiles_total': 0,
+        'last_state_fp32_fallback_tiles_total': 0,
     }
 
     def _snapshot_optimizer_churn_counters():
@@ -1537,6 +1543,12 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             'owner_violations_total': int(stats.get('owner_violations', 0)),
             'persistent_state_blocks': int(stats.get('persistent_state_blocks', 0)),
             'persistent_state_bytes': int(stats.get('persistent_state_bytes', 0)),
+            'state_quantized_bytes_total': int(stats.get('state_quantized_bytes', 0)),
+            'state_raw_bytes_total': int(stats.get('state_raw_bytes', 0)),
+            'state_zero_tiles_total': int(stats.get('state_zero_tiles', 0)),
+            'state_sparse_tiles_total': int(stats.get('state_sparse_tiles', 0)),
+            'state_fp16_fallback_tiles_total': int(stats.get('state_fp16_fallback_tiles', 0)),
+            'state_fp32_fallback_tiles_total': int(stats.get('state_fp32_fallback_tiles', 0)),
         }
 
     def _write_optimizer_churn_epoch(epoch_zero_based: int, iteration_end: int):
@@ -1558,6 +1570,12 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         epoch_writebacks = max(0, stats['persistent_state_ssd_writebacks_total'] - optimizer_churn_state['last_persistent_state_ssd_writebacks_total'])
         epoch_index_writes = max(0, stats['persistent_state_index_writes_total'] - optimizer_churn_state['last_persistent_state_index_writes_total'])
         epoch_owner_violations = max(0, stats['owner_violations_total'] - optimizer_churn_state['last_owner_violations_total'])
+        epoch_state_quantized_bytes = max(0, stats['state_quantized_bytes_total'] - optimizer_churn_state['last_state_quantized_bytes_total'])
+        epoch_state_raw_bytes = max(0, stats['state_raw_bytes_total'] - optimizer_churn_state['last_state_raw_bytes_total'])
+        epoch_state_zero_tiles = max(0, stats['state_zero_tiles_total'] - optimizer_churn_state['last_state_zero_tiles_total'])
+        epoch_state_sparse_tiles = max(0, stats['state_sparse_tiles_total'] - optimizer_churn_state['last_state_sparse_tiles_total'])
+        epoch_state_fp16_fallback_tiles = max(0, stats['state_fp16_fallback_tiles_total'] - optimizer_churn_state['last_state_fp16_fallback_tiles_total'])
+        epoch_state_fp32_fallback_tiles = max(0, stats['state_fp32_fallback_tiles_total'] - optimizer_churn_state['last_state_fp32_fallback_tiles_total'])
         epoch_cold_ratio_pct = 100.0 * epoch_cold_rows / max(1, epoch_optimizer_rows)
 
         optimizer_churn_tsv.write(
@@ -1566,7 +1584,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             f"{stats['mean_resident_streak']:.6f}\t{epoch_state_hits}\t{epoch_state_misses}\t"
             f"{epoch_state_saves}\t{epoch_cpu_hits}\t{epoch_ssd_hits}\t{epoch_writebacks}\t"
             f"{epoch_index_writes}\t{epoch_owner_violations}\t{stats['persistent_state_blocks']}\t"
-            f"{stats['persistent_state_bytes']}\n"
+            f"{stats['persistent_state_bytes']}\t{epoch_state_quantized_bytes}\t"
+            f"{epoch_state_raw_bytes}\t{epoch_state_zero_tiles}\t{epoch_state_sparse_tiles}\t"
+            f"{epoch_state_fp16_fallback_tiles}\t{epoch_state_fp32_fallback_tiles}\n"
         )
         log_file.write(
             f"[OPTIMIZER CHURN] Epoch {epoch_zero_based + 1}: rows={epoch_optimizer_rows}, "
@@ -1589,6 +1609,12 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         optimizer_churn_state['last_persistent_state_ssd_writebacks_total'] = stats['persistent_state_ssd_writebacks_total']
         optimizer_churn_state['last_persistent_state_index_writes_total'] = stats['persistent_state_index_writes_total']
         optimizer_churn_state['last_owner_violations_total'] = stats['owner_violations_total']
+        optimizer_churn_state['last_state_quantized_bytes_total'] = stats['state_quantized_bytes_total']
+        optimizer_churn_state['last_state_raw_bytes_total'] = stats['state_raw_bytes_total']
+        optimizer_churn_state['last_state_zero_tiles_total'] = stats['state_zero_tiles_total']
+        optimizer_churn_state['last_state_sparse_tiles_total'] = stats['state_sparse_tiles_total']
+        optimizer_churn_state['last_state_fp16_fallback_tiles_total'] = stats['state_fp16_fallback_tiles_total']
+        optimizer_churn_state['last_state_fp32_fallback_tiles_total'] = stats['state_fp32_fallback_tiles_total']
 
     def _enable_optimizer_churn_logging(reason: str):
         nonlocal optimizer_churn_tsv
@@ -1601,7 +1627,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             'cold_restarted_row_ratio_pct\tcold_restarts\tstate_evictions\tmean_resident_streak\t'
             'persistent_state_hits\tpersistent_state_misses\tpersistent_state_saves\t'
             'persistent_state_cpu_hits\tpersistent_state_ssd_hits\tssd_writebacks\t'
-            'index_writes\towner_violations\tpersistent_state_blocks\tpersistent_state_bytes\n'
+            'index_writes\towner_violations\tpersistent_state_blocks\tpersistent_state_bytes\t'
+            'state_quantized_bytes\tstate_raw_bytes\tstate_zero_tiles\tstate_sparse_tiles\t'
+            'state_fp16_fallback_tiles\tstate_fp32_fallback_tiles\n'
         )
         log_file.write(f"[OPTIMIZER CHURN] Per-epoch churn logging enabled: {churn_tsv_path} ({reason})\n")
         log_file.flush()

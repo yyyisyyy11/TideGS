@@ -2072,6 +2072,18 @@ def train_distributed_tide_batch(
         "persistent_state_index_writes": int(optimizer_state_stats.get("persistent_state_index_writes", 0)),
         "persistent_state_blocks": int(optimizer_state_stats.get("persistent_state_blocks", 0)),
         "persistent_state_bytes": int(optimizer_state_stats.get("persistent_state_bytes", 0)),
+        "state_quantized_bytes": int(optimizer_state_stats.get("state_quantized_bytes", 0)),
+        "state_raw_bytes": int(optimizer_state_stats.get("state_raw_bytes", 0)),
+        "state_zero_tiles": int(optimizer_state_stats.get("state_zero_tiles", 0)),
+        "state_sparse_tiles": int(optimizer_state_stats.get("state_sparse_tiles", 0)),
+        "state_fp16_fallback_tiles": int(
+            optimizer_state_stats.get("state_fp16_fallback_tiles", 0)
+        ),
+        "state_fp32_fallback_tiles": int(
+            optimizer_state_stats.get("state_fp32_fallback_tiles", 0)
+        ),
+        "state_encode_ms": float(optimizer_state_stats.get("state_encode_ms", 0.0)),
+        "state_decode_ms": float(optimizer_state_stats.get("state_decode_ms", 0.0)),
         "state_owner_rank": int(optimizer_state_stats.get("state_owner_rank", -1)),
         "owner_violations": int(optimizer_state_stats.get("owner_violations", 0)),
         "curvature_blocks": len(step_stats.get("curvature_block_ids", [])),

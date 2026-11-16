@@ -19,6 +19,16 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 import torch
 
+from .state_quantization import (
+    CODEC_FP16,
+    CODEC_FP32,
+    CODEC_INT8,
+    CODEBOOK_ID,
+    StatePayload,
+    state_payload_from_tensor,
+    validate_state_payload,
+)
+
 
 @dataclass(frozen=True)
 class StateExtent:
@@ -29,6 +39,8 @@ class StateExtent:
     size: int
     row_count: int
     step: int
+    raw_size: int = 0
+    encoding: str = CODEC_FP32
 
 
 @dataclass
@@ -445,21 +457,33 @@ class LogStorageManager:
                             f"Short state read for block {block_id}: "
                             f"{len(data)} of {extent.size} bytes from {file_path}"
                         )
-                    array = np.frombuffer(data, dtype=np.float32).copy()
-                    expected = int(extent.row_count) * STATE_PARAM_DIM
-                    if array.size != expected:
-                        raise ValueError(
-                            f"State extent for block {block_id} has {array.size} floats; "
-                            f"expected {expected}"
+                    raw_size = int(extent.raw_size or extent.row_count * STATE_PARAM_DIM * 4)
+                    encoding = str(extent.encoding or CODEC_FP32)
+                    payload = StatePayload(
+                        codec=encoding,
+                        row_count=int(extent.row_count),
+                        raw_size=raw_size,
+                        payload=data,
+                        codebook_id=CODEBOOK_ID if encoding == CODEC_INT8 else "",
+                    )
+                    validate_state_payload(payload)
+                    legacy_tensor = None
+                    if encoding == CODEC_FP32:
+                        array = np.frombuffer(data, dtype=np.float32).copy()
+                        legacy_tensor = torch.from_numpy(array).reshape(
+                            int(extent.row_count), STATE_PARAM_DIM
                         )
                     result[block_id] = {
-                        "tensor": torch.from_numpy(array).reshape(
-                            int(extent.row_count), STATE_PARAM_DIM
-                        ),
+                        "payload": payload,
                         "row_count": int(extent.row_count),
                         "step": int(extent.step),
                         "version": int(selected[block_id].version),
                     }
+                    # Keep the old tensor key for FP32 extents so old callers
+                    # can migrate without forcing compressed payloads through
+                    # an eager SSD->RAM decode.
+                    if legacy_tensor is not None:
+                        result[block_id]["tensor"] = legacy_tensor
         return result
 
     def _read_base_block(self, block_id: int) -> torch.Tensor:
@@ -479,7 +503,7 @@ class LogStorageManager:
         self,
         block_dict: Dict[int, torch.Tensor],
         block_versions: Optional[Dict[int, int]] = None,
-        block_states: Optional[Dict[int, Tuple[torch.Tensor, int]]] = None,
+        block_states: Optional[Dict[int, Tuple[object, int]]] = None,
     ) -> int:
         if not block_dict:
             return -1
@@ -530,7 +554,7 @@ class LogStorageManager:
         self,
         block_dict: Dict[int, torch.Tensor],
         block_versions: Optional[Dict[int, int]] = None,
-        block_states: Optional[Dict[int, Tuple[torch.Tensor, int]]] = None,
+        block_states: Optional[Dict[int, Tuple[object, int]]] = None,
     ) -> int:
         """
         Write updated blocks to a new patch file (append-only).
@@ -568,7 +592,7 @@ class LogStorageManager:
             print("[LogStorage] Skipped patch creation: no non-empty dirty blocks")
             return -1
 
-        valid_states: Dict[int, Tuple[torch.Tensor, int]] = {}
+        valid_states: Dict[int, Tuple[StatePayload, int]] = {}
         for raw_block_id, payload in (block_states or {}).items():
             block_id = int(raw_block_id)
             if block_id not in valid_blocks:
@@ -577,25 +601,33 @@ class LogStorageManager:
                 )
             if not isinstance(payload, (tuple, list)) or len(payload) != 2:
                 raise ValueError(
-                    f"State payload for block {block_id} must be (tensor, step)"
+                    f"State payload for block {block_id} must be (payload, step)"
                 )
-            tensor, step = payload
-            if tensor is None:
+            state_value, step = payload
+            if state_value is None:
                 continue
-            if tensor.is_cuda:
-                tensor = tensor.cpu()
-            tensor = tensor.contiguous()
-            if tensor.dim() != 2 or tensor.shape[1] != STATE_PARAM_DIM:
-                raise ValueError(
-                    f"Invalid state payload for block {block_id} shape "
-                    f"{tuple(tensor.shape)}; expected (*, {STATE_PARAM_DIM})"
-                )
-            if int(tensor.shape[0]) != int(valid_blocks[block_id].shape[0]):
+            if isinstance(state_value, StatePayload):
+                encoded = state_value
+                validate_state_payload(encoded)
+            else:
+                tensor = state_value
+                if not torch.is_tensor(tensor):
+                    tensor = torch.as_tensor(tensor, dtype=torch.float32)
+                if tensor.is_cuda:
+                    tensor = tensor.cpu()
+                tensor = tensor.contiguous()
+                if tensor.dim() != 2 or tensor.shape[1] != STATE_PARAM_DIM:
+                    raise ValueError(
+                        f"Invalid state payload for block {block_id} shape "
+                        f"{tuple(tensor.shape)}; expected (*, {STATE_PARAM_DIM})"
+                    )
+                encoded = state_payload_from_tensor(tensor, codec=CODEC_FP32)
+            if int(encoded.row_count) != int(valid_blocks[block_id].shape[0]):
                 raise ValueError(
                     f"State rows for block {block_id} do not match Gaussian rows: "
-                    f"{int(tensor.shape[0])} vs {int(valid_blocks[block_id].shape[0])}"
+                    f"{int(encoded.row_count)} vs {int(valid_blocks[block_id].shape[0])}"
                 )
-            valid_states[block_id] = (tensor, int(step))
+            valid_states[block_id] = (encoded, int(step))
 
         # Allocate new patch file ID
         with self.patch_counter_lock:
@@ -635,15 +667,17 @@ class LogStorageManager:
                     current_offset += len(data_bytes)
 
                 for block_id in sorted(valid_states.keys()):
-                    tensor, step = valid_states[block_id]
-                    data_bytes = tensor.numpy().astype(np.float32, copy=False).tobytes()
+                    encoded, step = valid_states[block_id]
+                    data_bytes = encoded.as_bytes()
                     f.write(data_bytes)
                     placements[block_id]["state"] = StateExtent(
                         file_id=patch_id,
                         offset=current_offset,
                         size=len(data_bytes),
-                        row_count=int(tensor.shape[0]),
+                        row_count=int(encoded.row_count),
                         step=int(step),
+                        raw_size=int(encoded.raw_size),
+                        encoding=str(encoded.codec),
                     )
                     current_offset += len(data_bytes)
                 f.flush()
@@ -803,6 +837,12 @@ class LogStorageManager:
                     "row_count": int(location.state.row_count),
                     "step": int(location.state.step),
                 }
+                if str(location.state.encoding) != CODEC_FP32 or int(location.state.raw_size):
+                    entry["state"]["raw_size"] = int(
+                        location.state.raw_size
+                        or location.state.row_count * STATE_PARAM_DIM * 4
+                    )
+                    entry["state"]["encoding"] = str(location.state.encoding)
             return entry
 
         index_payload = {
@@ -814,10 +854,27 @@ class LogStorageManager:
             for location in index_snapshot.values()
             if location.state is not None
         )
+        has_encoded_state = any(
+            location.state is not None
+            and str(location.state.encoding) != CODEC_FP32
+            for location in index_snapshot.values()
+        )
+        state_codecs = sorted(
+            {
+                str(location.state.encoding)
+                for location in index_snapshot.values()
+                if location.state is not None
+            }
+        )
+        state_raw_bytes = sum(
+            int(location.state.raw_size or location.state.row_count * STATE_PARAM_DIM * 4)
+            for location in index_snapshot.values()
+            if location.state is not None
+        )
         manifest = {
-            "version": 2,
+            "version": 3 if has_encoded_state else 2,
             "storage_type": "log_structured_blocks",
-            "state_extent": "paired_v1",
+            "state_extent": "paired_v2" if has_encoded_state else "paired_v1",
             "block_size": int(self.block_size),
             "num_blocks": int(self.num_blocks),
             "point_dim": int(self.point_dim),
@@ -827,6 +884,8 @@ class LogStorageManager:
             "files": files,
             "index": index_payload,
             "state_bytes": int(live_state_bytes),
+            "state_raw_bytes": int(state_raw_bytes),
+            "state_codec": state_codecs[0] if len(state_codecs) == 1 else ("mixed" if state_codecs else ""),
             "patch_file_mode": patch_file_mode,
             "patch_files": int(patch_files),
             "patch_bytes": int(patch_bytes),
@@ -863,11 +922,12 @@ class LogStorageManager:
             )
 
         index_version = int(manifest.get("version", 1))
-        if index_version not in {1, 2}:
+        if index_version not in {1, 2, 3}:
             raise ValueError(
-                f"Unsupported storage index version: {index_version}; expected 1 or 2"
+                f"Unsupported storage index version: {index_version}; expected 1, 2 or 3"
             )
-        if index_version >= 2 and manifest.get("state_extent") != "paired_v1":
+        expected_extent = "paired_v2" if index_version >= 3 else "paired_v1"
+        if index_version >= 2 and manifest.get("state_extent") != expected_extent:
             raise ValueError(
                 "Storage index declares state extents with unsupported layout "
                 f"{manifest.get('state_extent')!r}"
@@ -906,10 +966,29 @@ class LogStorageManager:
                 state_offset = int(state_payload["offset"])
                 if row_count <= 0 or state_size <= 0:
                     raise ValueError(f"Block {block_id} has an empty state extent")
-                if state_size != row_count * STATE_PARAM_DIM * 4:
+                encoding = str(state_payload.get("encoding", CODEC_FP32))
+                if encoding not in {CODEC_FP32, CODEC_FP16, CODEC_INT8}:
                     raise ValueError(
-                        f"Block {block_id} state extent size {state_size} does not match "
+                        f"Block {block_id} has unsupported state encoding {encoding!r}"
+                    )
+                raw_size = int(
+                    state_payload.get(
+                        "raw_size", row_count * STATE_PARAM_DIM * 4
+                    )
+                )
+                if raw_size != row_count * STATE_PARAM_DIM * 4:
+                    raise ValueError(
+                        f"Block {block_id} state raw_size {raw_size} does not match "
                         f"row_count {row_count} x {STATE_PARAM_DIM} float32"
+                    )
+                if index_version < 3 and encoding != CODEC_FP32:
+                    raise ValueError(
+                        f"Block {block_id} version-2 state extent cannot use {encoding!r}"
+                    )
+                if index_version < 3 and state_size != raw_size:
+                    raise ValueError(
+                        f"Block {block_id} FP32 state extent size {state_size} does not match "
+                        f"raw_size {raw_size}"
                     )
                 if state_offset < 0 or state_offset + state_size > loaded_file_sizes[state_file_id]:
                     raise ValueError(
@@ -921,6 +1000,8 @@ class LogStorageManager:
                     size=state_size,
                     row_count=row_count,
                     step=int(state_payload.get("step", 0)),
+                    raw_size=raw_size,
+                    encoding=encoding,
                 )
             loaded_index[block_id] = BlockLocation(
                 file_id=file_id,
@@ -1106,10 +1187,12 @@ class LogStorageManager:
                                             raise RuntimeError(
                                                 f"Missing state extent while compacting block {block_id}"
                                             )
-                                        state_bytes = payload["tensor"].numpy().astype(
-                                            np.float32,
-                                            copy=False,
-                                        ).tobytes()
+                                        state_payload = payload["payload"]
+                                        if not isinstance(state_payload, StatePayload):
+                                            raise RuntimeError(
+                                                f"Invalid state payload while compacting block {block_id}"
+                                            )
+                                        state_bytes = state_payload.as_bytes()
                                         output.write(state_bytes)
                                         state_extent = StateExtent(
                                             file_id=compacted_file_id,
@@ -1117,6 +1200,8 @@ class LogStorageManager:
                                             size=len(state_bytes),
                                             row_count=int(previous.state.row_count),
                                             step=int(previous.state.step),
+                                            raw_size=int(state_payload.raw_size),
+                                            encoding=str(state_payload.codec),
                                         )
                                         output_bytes += len(state_bytes)
                                     new_locations[block_id] = BlockLocation(
